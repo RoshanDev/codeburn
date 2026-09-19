@@ -762,8 +762,15 @@ class ServeClient {
       }
       const line = rawLine.trim()
       if (!line) continue
-      let msg: { id?: number; ready?: boolean; progress?: string; ok?: boolean; refused?: boolean; output?: string; error?: string }
+      let msg: { id?: number; ready?: boolean; progress?: string; ok?: boolean; refused?: boolean; output?: string; error?: string; usage?: { cpuSec?: number; rssMb?: number } }
       try { msg = JSON.parse(line) } catch { continue }
+      if (msg.usage) {
+        // Kept as a running max: a replaced child's counters restart at zero.
+        serveUsagePeak = {
+          cpuSec: Math.max(serveUsagePeak?.cpuSec ?? 0, Number(msg.usage.cpuSec) || 0),
+          rssMb: Math.max(serveUsagePeak?.rssMb ?? 0, Number(msg.usage.rssMb) || 0),
+        }
+      }
       if (msg.ready) continue
       if (typeof msg.id !== 'number') continue
       const waiter = this.pending.get(msg.id)
@@ -918,6 +925,15 @@ class ServeClient {
 }
 
 let serveClient: ServeClient | null = null
+
+/** What the resident serve child has reported about itself (src/serve.ts), or
+ *  null when it never answered. Serve does the heavy parsing but is invisible to
+ *  Electron's app.getAppMetrics(), so the desktop's app_close event reads it here. */
+let serveUsagePeak: { cpuSec: number; rssMb: number } | null = null
+
+export function serveUsage(): { cpuSec: number; rssMb: number } | null {
+  return serveUsagePeak
+}
 
 /** Start the resident serve child without issuing a query. The first real panel
  *  request is accepted immediately (even before the ready frame) and performs

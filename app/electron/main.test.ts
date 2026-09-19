@@ -1114,15 +1114,27 @@ describe('project filter', () => {
       const handlers = createBridgeHandlers(deps({ spawnCli: vi.fn(), spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
       const res = await handlers['codeburn:exportData']!('csv', 'all', '/tmp/out')
       expect(res).toMatchObject({ ok: true, value: { ok: false, stderr: expect.stringMatching(/Nothing to export/) } })
+      expect((res as { value: { savedPath?: string } }).value.savedPath).toBeUndefined()
     })
   })
 
-  it('keeps an export that named a saved path successful', async () => {
+  it('keeps an export that named a saved path successful, and reports where it landed', async () => {
     await withFilterFile(async () => {
-      const spawnCliAction = vi.fn(async () => ({ ok: true, stdout: '\n  Exported (Today + 7 Days + 30 Days) to: /tmp/out\n', stderr: '', code: 0 }))
+      // CSV nests a dated folder inside the picked destination, so the toast
+      // must name the CLI's path, not the argument it was given.
+      const spawnCliAction = vi.fn(async () => ({ ok: true, stdout: '\n  Exported (Today + 7 Days + 30 Days) to: /tmp/out/codeburn-export-2026-09-19\n', stderr: '', code: 0 }))
       const handlers = createBridgeHandlers(deps({ spawnCli: vi.fn(), spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
       const res = await handlers['codeburn:exportData']!('csv', 'all', '/tmp/out')
-      expect(res).toMatchObject({ ok: true, value: { ok: true } })
+      expect(res).toMatchObject({ ok: true, value: { ok: true, savedPath: '/tmp/out/codeburn-export-2026-09-19' } })
+    })
+  })
+
+  it('reports the JSON export path the CLI chose, extension and all', async () => {
+    await withFilterFile(async () => {
+      const spawnCliAction = vi.fn(async () => ({ ok: true, stdout: '\n  Exported (Today + 7 Days + 30 Days) to: /tmp/out.json\n', stderr: '', code: 0 }))
+      const handlers = createBridgeHandlers(deps({ spawnCli: vi.fn(), spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
+      const res = await handlers['codeburn:exportData']!('json', 'all', '/tmp/out')
+      expect(res).toMatchObject({ ok: true, value: { ok: true, savedPath: '/tmp/out.json' } })
     })
   })
 

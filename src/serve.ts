@@ -639,6 +639,19 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
   const write = (value: unknown): void => { protocolWrite(JSON.stringify(value) + '\n') }
   write({ ready: true, pid: process.pid })
 
+  // What this resident child costs, riding along on the answers it already
+  // sends. The desktop app cannot measure it: serve is a plain CLI child, so it
+  // is absent from Electron's app.getAppMetrics(). The parent turns these into
+  // bucket labels for its consent-gated app_close event; the numbers themselves
+  // go no further than the pipe.
+  let peakRss = 0
+  const serveUsage = (): { cpuSec: number; rssMb: number } => {
+    const rss = process.memoryUsage().rss
+    if (rss > peakRss) peakRss = rss
+    const cpu = process.cpuUsage()
+    return { cpuSec: (cpu.user + cpu.system) / 1e6, rssMb: Math.round(peakRss / (1024 * 1024)) }
+  }
+
   // Strict serialization: each request chains on the previous one.
   let queue: Promise<void> = Promise.resolve()
 
@@ -732,7 +745,7 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
         && Date.now() - memoHit.createdAt < OUTPUT_MEMO_CAP_MS
         && rootReuseValidation?.(memoHit.validatedFrom) === 'clean'
       ) {
-        write({ id: request.id, ok: true, output: memoHit.output, generation: memoHit.generation })
+        write({ id: request.id, ok: true, output: memoHit.output, generation: memoHit.generation, usage: serveUsage() })
         return
       }
       // Progressive cold start (#1110): on a cold cache the menubar payload is
@@ -783,7 +796,7 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
             const oldest = [...outputMemo.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0]
             if (oldest) outputMemo.delete(oldest[0])
           }
-          write({ id: request.id, ok: true, output, generation })
+          write({ id: request.id, ok: true, output, generation, usage: serveUsage() })
           if (deferredFiles > 0) scheduleBackgroundFill(request.args)
         }
         else write({ id: request.id, ok: false, error: `exit ${code}`, output })
@@ -799,6 +812,7 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
       // once (seconds), which beats an ever-growing child. The child itself
       // never exits here, so the client's death counter is untouched.
       const rss = process.memoryUsage().rss
+      if (rss > peakRss) peakRss = rss
       if (rss > SERVE_MAX_RSS_BYTES) {
         // Hysteresis: only clear when RSS has grown past the last clear by a
         // margin, so a warm cache sitting above the ceiling is not dropped on

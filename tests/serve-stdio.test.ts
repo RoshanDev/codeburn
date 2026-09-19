@@ -186,6 +186,15 @@ describe('codeburn serve --stdio', () => {
     expect(repeatGen.n).toBeGreaterThan(0)
   }, 60_000)
 
+  // The desktop app buckets these into its consent-gated app_close event: serve
+  // is a plain CLI child, so Electron's own metrics cannot see this cost.
+  it('reports its own CPU seconds and peak RSS on an answer', async () => {
+    const res = await request(43, ['status', '--format', 'menubar-json', '--period', 'today'])
+    const usage = res['usage'] as { cpuSec: number; rssMb: number }
+    expect(usage.cpuSec).toBeGreaterThan(0)
+    expect(usage.rssMb).toBeGreaterThan(0)
+  }, 60_000)
+
   it('refuses commands outside the read allowlist', async () => {
     const res = await request(4, ['currency', 'EUR'])
     expect(res['ok']).toBe(false)

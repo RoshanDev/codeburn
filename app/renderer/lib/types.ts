@@ -27,6 +27,9 @@ export interface CliError {
 
 export type AliasRow = { from: string; to: string }
 export type ActionResult = { ok: boolean; stdout: string; stderr: string; code: number | null }
+/** `savedPath` is where the CLI actually wrote, which is not the chosen folder:
+ *  CSV nests a dated subfolder, JSON appends the extension. */
+export type ExportResult = ActionResult & { savedPath?: string }
 
 export type QuotaWindow = {
   label: string
@@ -1173,7 +1176,7 @@ export interface CodeburnBridge {
   removeDevice(name: string): Promise<ActionResult>
   setPlan(id: string, provider: string): Promise<ActionResult>
   resetPlan(provider: string): Promise<ActionResult>
-  exportData(format: string, provider: string, outPath: string): Promise<ActionResult>
+  exportData(format: string, provider: string, outPath: string): Promise<ExportResult>
   chooseDirectory(): Promise<string | null>
   cliStatus(): Promise<{ found: boolean; path: string | null; error?: string }>
   telemetryStatus(): Promise<TelemetryStatus | null>

@@ -623,7 +623,7 @@ function ExportPane({ period, refreshToken }: { period: Period; refreshToken: nu
       // machine and never leaves it.
       trackEvent('export', { format, provider })
       const result = await codeburn.exportData(format, provider, destination)
-      showToast(result.ok ? t('settings.export.exported', { destination }) : (result.stderr || t('settings.export.failed')), result.ok ? 'ok' : 'error')
+      showToast(result.ok ? t('settings.export.exported', { destination: result.savedPath ?? destination }) : (result.stderr || t('settings.export.failed')), result.ok ? 'ok' : 'error')
     } finally {
       setExporting(false)
     }

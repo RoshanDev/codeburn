@@ -3,7 +3,7 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { ActionResult, AliasRow, CombinedUsage, DeviceScanResult, Identity, MenubarPayload, PriceOverrideList, PriceRates, ProjectFilter, ProjectsReport, QuotaProvider, ShareStatus, StatusJson, TelemetryStatus } from '../lib/types'
+import type { ActionResult, AliasRow, CombinedUsage, DeviceScanResult, ExportResult, Identity, MenubarPayload, PriceOverrideList, PriceRates, ProjectFilter, ProjectsReport, QuotaProvider, ShareStatus, StatusJson, TelemetryStatus } from '../lib/types'
 import { Settings } from './Settings'
 
 const mocks = vi.hoisted(() => ({
@@ -29,7 +29,7 @@ const mocks = vi.hoisted(() => ({
   setPlan: vi.fn<(id: string, provider: string) => Promise<ActionResult>>(),
   resetPlan: vi.fn<(provider: string) => Promise<ActionResult>>(),
   chooseDirectory: vi.fn<() => Promise<string | null>>(),
-  exportData: vi.fn<(format: string, provider: string, path: string) => Promise<ActionResult>>(),
+  exportData: vi.fn<(format: string, provider: string, path: string) => Promise<ExportResult>>(),
   companionStatus: vi.fn(),
   trayPrefs: vi.fn(),
   setTrayAppPref: vi.fn(),
@@ -109,7 +109,7 @@ describe('Settings', () => {
     mocks.setPlan.mockResolvedValue(actionOk)
     mocks.resetPlan.mockResolvedValue(actionOk)
     mocks.chooseDirectory.mockResolvedValue('/Users/x/Exports')
-    mocks.exportData.mockResolvedValue(actionOk)
+    mocks.exportData.mockResolvedValue({ ...actionOk, savedPath: '/Users/x/Exports/codeburn-export-2026-09-19' })
     mocks.telemetryTrack.mockResolvedValue(true)
     mocks.telemetryStatus.mockResolvedValue(telemetryOff)
     mocks.setTelemetryEnabled.mockImplementation(async enabled => ({ ...telemetryOff, enabled }))
@@ -559,7 +559,9 @@ describe('Settings', () => {
     await user.click(screen.getByRole('option', { name: 'Claude' }))
     await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
     expect(mocks.exportData).toHaveBeenCalledWith('json', 'claude', '/Users/x/Exports')
-    expect(await screen.findByText('Exported to /Users/x/Exports')).toBeInTheDocument()
+    // The toast names what the CLI wrote, not the folder that was picked: the
+    // CLI nests a dated folder (CSV) or appends the extension (JSON).
+    expect(await screen.findByText('Exported to /Users/x/Exports/codeburn-export-2026-09-19')).toBeInTheDocument()
   })
 
   it('renders real device status and removes paired devices without fake pairing controls', async () => {

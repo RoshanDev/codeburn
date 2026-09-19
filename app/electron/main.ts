@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { CliError, DESKTOP_COLD_TIMEOUT_MS, PROGRESS_LINE_PREFIX, reapOrphanServe, resolveCodeburnPath, shutdownAll, spawnCli, spawnCliAction, startServe, type ActionResult, type SpawnPriority } from './cli'
+import { CliError, DESKTOP_COLD_TIMEOUT_MS, PROGRESS_LINE_PREFIX, reapOrphanServe, resolveCodeburnPath, serveUsage, shutdownAll, spawnCli, spawnCliAction, startServe, type ActionResult, type SpawnPriority } from './cli'
 import { MenubarCompanion, readDockEnabled, STARTUP_APPS_SETTINGS_URL, type CompanionStatus } from './menubar'
 import { MacMenubar, NO_MAC_MENUBAR, type InstallPhase } from './mac-menubar'
 import { getQuota, sanitizeError } from './quota'
@@ -498,7 +498,22 @@ type Handler = (...args: any[]) => Promise<Envelope>
  * cannot tell the two apart.
  */
 const EXPORT_SAVED_MARKER = 'Exported ('
+const EXPORT_PATH_SEPARATOR = ') to: '
 const EXPORT_NOTHING_WRITTEN = 'Nothing to export: no usage in the export window, or the project filter hides all of it.'
+
+/** The path the CLI actually wrote, which is not the destination the user picked:
+ *  a CSV export nests a dated folder inside it, JSON appends the extension. */
+export function exportedPath(stdout: string): string | null {
+  for (const line of stdout.split('\n')) {
+    const marker = line.indexOf(EXPORT_SAVED_MARKER)
+    if (marker < 0) continue
+    const sep = line.indexOf(EXPORT_PATH_SEPARATOR, marker)
+    if (sep < 0) continue
+    const saved = line.slice(sep + EXPORT_PATH_SEPARATOR.length).trim()
+    if (saved) return saved
+  }
+  return null
+}
 
 export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, resolveCodeburnPath, getQuota, emitProgress: broadcastProgress, telemetry: telemetryInstance, getUpdateStatus: () => updateChecker ? updateChecker.getStatus() : Promise.resolve(NO_UPDATE_STATUS), companion: companion, macMenubar: macMenubar }): Record<string, Handler> {
   const emitProgress = deps.emitProgress ?? (() => {})
@@ -798,10 +813,11 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
           'export', '-f', vToken(format), '-o', vOutPath(outPath), '--provider', vProvider(provider),
           ...projectArgs(),
         ])
-        if (result.ok && !result.stdout.includes(EXPORT_SAVED_MARKER)) {
+        const savedPath = exportedPath(result.stdout)
+        if (result.ok && savedPath === null) {
           return { ok: true, value: { ...result, ok: false, stderr: EXPORT_NOTHING_WRITTEN } }
         }
-        return { ok: true, value: { ...result, stderr: sanitizeError(result.stderr) } }
+        return { ok: true, value: { ...result, stderr: sanitizeError(result.stderr), ...(savedPath ? { savedPath } : {}) } }
       } catch (err) {
         return { ok: false, error: toEnvelopeError(err) }
       }
@@ -1092,6 +1108,8 @@ function bootstrap(): void {
         country: app.getLocaleCountryCode() || null,
         isPackaged: app.isPackaged,
         appVersion: app.getVersion(),
+        getAppMetrics: () => app.getAppMetrics(),
+        getServeUsage: serveUsage,
       })
       // completeOnboarding tracks the first app_open itself; only already-
       // onboarded installs record subsequent opens here. app_open carries the
@@ -1100,7 +1118,10 @@ function bootstrap(): void {
         const dockPref = readDockEnabled()
         telemetryInstance.track('app_open', { dock: dockPref === undefined ? 'none' : dockPref ? 'on' : 'off' })
       }
-      setInterval(() => { void telemetryInstance?.flush() }, 5 * 60_000)
+      setInterval(() => {
+        telemetryInstance?.sampleResources()
+        void telemetryInstance?.flush()
+      }, 5 * 60_000)
     } catch (err) {
       console.error('telemetry init failed (continuing without):', err)
     }
