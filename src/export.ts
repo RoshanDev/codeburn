@@ -454,7 +454,15 @@ export async function exportJson(periods: PeriodExport[], outputPath: string): P
     shellCommands: buildBashRows(thirtyDayProjects),
   }
 
-  const target = resolve(outputPath.toLowerCase().endsWith('.json') ? outputPath : `${outputPath}.json`)
+  // The desktop app (and any `-o <existing dir>`) hands us a real folder, not a slot to
+  // fill: appending `.json` to it wrote a sibling *of* the folder. Name a dated file
+  // inside it instead, the same name exportCsv gives its dated subfolder.
+  let target = resolve(outputPath)
+  if ((await stat(target).catch(() => null))?.isDirectory()) {
+    target = join(target, `codeburn-export-${new Date().toISOString().slice(0, 10)}.json`)
+  } else if (!target.toLowerCase().endsWith('.json')) {
+    target = `${target}.json`
+  }
   // Refuse to overwrite an existing file that wasn't produced by codeburn
   // export. CSV path has the same guard via the .codeburn-export marker; JSON
   // was missing it, so a stray `-o ~/important.json` would silently clobber.

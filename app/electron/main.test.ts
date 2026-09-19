@@ -1131,10 +1131,11 @@ describe('project filter', () => {
 
   it('reports the JSON export path the CLI chose, extension and all', async () => {
     await withFilterFile(async () => {
-      const spawnCliAction = vi.fn(async () => ({ ok: true, stdout: '\n  Exported (Today + 7 Days + 30 Days) to: /tmp/out.json\n', stderr: '', code: 0 }))
+      // JSON lands inside the picked folder too, as a dated file.
+      const spawnCliAction = vi.fn(async () => ({ ok: true, stdout: '\n  Exported (Today + 7 Days + 30 Days) to: /tmp/out/codeburn-export-2026-09-19.json\n', stderr: '', code: 0 }))
       const handlers = createBridgeHandlers(deps({ spawnCli: vi.fn(), spawnCliAction, resolveCodeburnPath: () => '/bin/codeburn' }))
       const res = await handlers['codeburn:exportData']!('json', 'all', '/tmp/out')
-      expect(res).toMatchObject({ ok: true, value: { ok: true, savedPath: '/tmp/out.json' } })
+      expect(res).toMatchObject({ ok: true, value: { ok: true, savedPath: '/tmp/out/codeburn-export-2026-09-19.json' } })
     })
   })
 

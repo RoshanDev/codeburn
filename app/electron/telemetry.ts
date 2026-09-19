@@ -76,6 +76,11 @@ export const EVENT_NAMES = new Set([
   'settings_change',
 ])
 
+/// CPU seconds accumulate from process start while the wall clock below runs from telemetry
+/// init, so a session shorter than this divides a whole launch's CPU by a few seconds and
+/// always reads '40+'. Under the floor the figure is omitted rather than sent wrong.
+const MIN_CPU_WALL_SECONDS = 30
+
 const MAX_QUEUE = 200
 const MAX_CLI_ERRORS_PER_KIND_PER_DAY = 20
 const MAX_STRING = 64
@@ -350,7 +355,8 @@ export class Telemetry {
     try {
       this.sampleResources()
       const wallSeconds = (Date.now() - this.openedAt) / 1000
-      if (wallSeconds > 0) {
+      const cpuMeasurable = wallSeconds >= MIN_CPU_WALL_SECONDS
+      if (cpuMeasurable) {
         if (this.cpuSeconds !== null) props.cpu = cpuBucket((this.cpuSeconds / wallSeconds) * 100)
         else if (this.cpuPercentSamples.length > 0) {
           props.cpu = cpuBucket(this.cpuPercentSamples.reduce((a, b) => a + b, 0) / this.cpuPercentSamples.length)
@@ -359,7 +365,7 @@ export class Telemetry {
       if (this.peakMemMb > 0) props.mem = memBucket(this.peakMemMb)
       const serve = this.deps.getServeUsage?.() ?? null
       if (serve) {
-        if (wallSeconds > 0 && Number.isFinite(serve.cpuSec)) props.serveCpu = cpuBucket((serve.cpuSec / wallSeconds) * 100)
+        if (cpuMeasurable && Number.isFinite(serve.cpuSec)) props.serveCpu = cpuBucket((serve.cpuSec / wallSeconds) * 100)
         if (serve.rssMb > 0) props.serveMem = memBucket(serve.rssMb)
       }
     } catch { /* best effort: a partial answer beats none, and none beats a throw */ }

@@ -25,6 +25,8 @@ function harness(opts: {
   honoursRemoteCommand?: boolean
   /** How many `open` calls no-op before one actually brings the process up. */
   flakyOpen?: number
+  /** A menubar that takes the relaunch command, goes down, and never starts itself again. */
+  relaunchDies?: boolean
 } = {}) {
   const present = new Set(opts.present ?? [])
   let running = Boolean(opts.running)
@@ -48,6 +50,7 @@ function harness(opts: {
         // `relaunch` and `settings` leave the process up: the first restarts itself.
         if (opts.honoursRemoteCommand === false) pendingCommand = args[4]
         else if (args[4] === 'quit' || args[4] === 'uninstall') running = false
+        else if (opts.relaunchDies && args[4] === 'relaunch') running = false
       }
       return ''
     }
@@ -328,6 +331,15 @@ describe('MacMenubar.settings', () => {
     expect(openIdx).toBeGreaterThan(quitIdx)
     // Left behind, the command would relaunch the next launch instead.
     expect(calls.some(([cmd, args]) => cmd.endsWith('defaults') && args[0] === 'delete' && args[2] === REMOTE_COMMAND_KEY)).toBe(true)
+  })
+
+  // The command was taken, so the fallback below never runs; without a check on the
+  // relaunch actually landing, a menubar that goes down and stays down is left gone.
+  it('opens the menu bar itself when a consumed relaunch never brings it back', async () => {
+    const { menubar, calls, isRunning } = harness({ present: [USER_APP], running: true, relaunchDies: true })
+    await menubar.setLanguage('ja')
+    expect(calls.some(([cmd, args]) => cmd.endsWith('open') && args[0] === USER_APP)).toBe(true)
+    expect(isRunning()).toBe(true)
   })
 
   it('clears the override for System and never quits a menu bar that is down', async () => {

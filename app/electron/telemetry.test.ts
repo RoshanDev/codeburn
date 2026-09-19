@@ -335,12 +335,12 @@ describe('app_close resource usage', () => {
 
   afterEach(() => { vi.useRealTimers() })
 
-  async function closeWith(over: Partial<ConstructorParameters<typeof Telemetry>[0]>, sample = false) {
+  async function closeWith(over: Partial<ConstructorParameters<typeof Telemetry>[0]>, sample = false, sessionMs = SESSION_MS) {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-09-19T09:00:00Z'))
     const { telemetry, posts } = make(over)
     telemetry.completeOnboarding(true)
-    vi.setSystemTime(new Date(Date.now() + SESSION_MS))
+    vi.setSystemTime(new Date(Date.now() + sessionMs))
     if (sample) telemetry.sampleResources()
     telemetry.trackClose()
     await telemetry.flush()
@@ -368,6 +368,16 @@ describe('app_close resource usage', () => {
     expect(props).toMatchObject({ cpu: '5-15', mem: '250-500' })
     expect(props.serveCpu).toBeUndefined()
     expect(props.serveMem).toBeUndefined()
+  })
+
+  // CPU seconds count from process start, the wall clock from telemetry init, so a
+  // ten-second session read '40+' however idle the app was. Memory is unaffected.
+  it('omits both CPU figures on a session too short to divide by', async () => {
+    const props = await closeWith({
+      getAppMetrics: () => [{ cpu: { cumulativeCPUUsage: 20, percentCPUUsage: 0 }, memory: { workingSetSize: 400 * 1024 } }],
+      getServeUsage: () => ({ cpuSec: 120, rssMb: 1200 }),
+    }, false, 10_000)
+    expect(props).toEqual({ sessionMinutes: 0, mem: '250-500', serveMem: '1-3k' })
   })
 
   it('omits every field it could not measure rather than sending zeros', async () => {

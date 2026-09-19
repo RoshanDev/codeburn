@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   buildPersistentCodeburnLookupPath,
@@ -10,6 +10,8 @@ import {
   hasRunnableRecordedCli,
   isMissingDirectAssetError,
   resolveLatestMenubarReleaseAssets,
+  placeMenubarBundle,
+  resolveMacInstallTarget,
   resolveMenubarReleaseAssets,
   resolvePersistentCodeburnPathFromWhichOutput,
   resolveProxyUrlForUrl,
@@ -487,5 +489,142 @@ describe('hasRunnableRecordedCli', () => {
     const record = join(dir, 'record.v1')
     await writeFile(record, `${launcher}\n`)
     expect(await hasRunnableRecordedCli(record)).toBe(true)
+  })
+})
+
+// The desktop card and `codeburn menubar` have to agree on which bundle is "the" install,
+// or a user with a copy in /Applications gets a second one, and a second login item, in
+// ~/Applications.
+describe.skipIf(process.platform === 'win32')('resolveMacInstallTarget', () => {
+  let root: string
+  let userApps: string
+  let systemApps: string
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'codeburn-menubar-target-'))
+    userApps = join(root, 'user-applications')
+    systemApps = join(root, 'system-applications')
+    await mkdir(userApps, { recursive: true })
+    await mkdir(systemApps, { recursive: true })
+  })
+  afterEach(async () => {
+    await chmod(systemApps, 0o755).catch(() => {})
+    await rm(root, { recursive: true, force: true })
+  })
+
+  const bundle = (dir: string) => join(dir, 'CodeBurnMenubar.app')
+  const install = async (dir: string) => { await mkdir(bundle(dir), { recursive: true }) }
+
+  it('installs into ~/Applications when nothing is installed anywhere', async () => {
+    expect(await resolveMacInstallTarget([userApps, systemApps])).toEqual({
+      targetPath: bundle(userApps), existed: false, leftovers: [],
+    })
+  })
+
+  it('replaces a writable copy in /Applications where it already is', async () => {
+    await install(systemApps)
+    expect(await resolveMacInstallTarget([userApps, systemApps])).toEqual({
+      targetPath: bundle(systemApps), existed: true, leftovers: [],
+    })
+  })
+
+  // No sudo, ever: fall back to ~/Applications and name the copy left behind.
+  it('falls back to ~/Applications when /Applications cannot be written', async () => {
+    await install(systemApps)
+    await chmod(systemApps, 0o555)
+    expect(await resolveMacInstallTarget([userApps, systemApps])).toEqual({
+      targetPath: bundle(userApps), existed: true, leftovers: [bundle(systemApps)],
+    })
+  })
+
+  it('replaces the copy the desktop card would find and reports the other', async () => {
+    await install(userApps)
+    await install(systemApps)
+    expect(await resolveMacInstallTarget([userApps, systemApps])).toEqual({
+      targetPath: bundle(userApps), existed: true, leftovers: [bundle(systemApps)],
+    })
+  })
+})
+
+// Replacing a bundle used to be rm(old) then rename(new): a rename that fails — EXDEV when
+// staging and Applications are on different volumes, EPERM, a full disk — left the user with
+// no menu bar app at all.
+describe.skipIf(process.platform === 'win32')('placeMenubarBundle', () => {
+  let root: string
+  let staged: string
+  let target: string
+
+  const marker = (app: string) => join(app, 'Contents', 'marker')
+  const readMarker = (app: string) => readFile(marker(app), 'utf-8')
+  const makeBundle = async (app: string, text: string) => {
+    await mkdir(join(app, 'Contents'), { recursive: true })
+    await writeFile(marker(app), text, 'utf-8')
+  }
+  const exdev = () => Object.assign(new Error('EXDEV: cross-device link not permitted'), { code: 'EXDEV' })
+  const siblings = async () => (await readdir(dirname(target))).sort()
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'codeburn-menubar-place-'))
+    staged = join(root, 'staging', 'CodeBurnMenubar.app')
+    target = join(root, 'Applications', 'CodeBurnMenubar.app')
+    await mkdir(dirname(target), { recursive: true })
+    await makeBundle(staged, 'new')
+  })
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true })
+  })
+
+  it('renames the staged bundle into place and removes the copy it replaced', async () => {
+    await makeBundle(target, 'old')
+    await placeMenubarBundle(staged, target)
+    expect(await readMarker(target)).toBe('new')
+    expect(await siblings()).toEqual(['CodeBurnMenubar.app'])
+  })
+
+  it('copies into a sibling and renames that into place when the move crosses a volume', async () => {
+    await makeBundle(target, 'old')
+    const verified: string[] = []
+    await placeMenubarBundle(staged, target, {
+      rename: async (from, to) => { if (from === staged) throw exdev(); await rename(from, to) },
+      verify: async (app) => { verified.push(app) },
+    })
+    expect(await readMarker(target)).toBe('new')
+    // The staged source is gone, the aside copy is gone, and the final bundle was verified.
+    expect(await stat(staged).catch(() => null)).toBeNull()
+    expect(await siblings()).toEqual(['CodeBurnMenubar.app'])
+    expect(verified).toEqual([target])
+  })
+
+  it('puts the bundle it replaced back, untouched, when the placement fails', async () => {
+    await makeBundle(target, 'old')
+    const boom = Object.assign(new Error('read-only file system'), { code: 'EPERM' })
+    await expect(placeMenubarBundle(staged, target, {
+      rename: async (from, to) => { if (from === staged) throw boom; await rename(from, to) },
+    })).rejects.toThrow(boom)
+    expect(await readMarker(target)).toBe('old')
+    expect(await siblings()).toEqual(['CodeBurnMenubar.app'])
+  })
+
+  // The copy is where a signature breaks, so a bundle that no longer verifies is not an install.
+  it('restores the old bundle when the copied one fails verification', async () => {
+    await makeBundle(target, 'old')
+    await expect(placeMenubarBundle(staged, target, {
+      rename: async (from, to) => { if (from === staged) throw exdev(); await rename(from, to) },
+      verify: async () => { throw new Error('code object is not signed at all') },
+    })).rejects.toThrow(/not signed/)
+    expect(await readMarker(target)).toBe('old')
+    expect(await siblings()).toEqual(['CodeBurnMenubar.app'])
+  })
+
+  it('installs onto an empty Applications folder and leaves nothing behind on failure', async () => {
+    await placeMenubarBundle(staged, target)
+    expect(await readMarker(target)).toBe('new')
+
+    await makeBundle(staged, 'newer')
+    await rm(target, { recursive: true, force: true })
+    await expect(placeMenubarBundle(staged, target, {
+      rename: async () => { throw new Error('nope') },
+    })).rejects.toThrow('nope')
+    expect(await siblings()).toEqual([])
   })
 })

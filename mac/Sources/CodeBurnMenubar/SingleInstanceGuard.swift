@@ -37,11 +37,19 @@ enum SingleInstanceGuard {
     static func decide(
         running: [(pid: pid_t, launchDate: Date?)],
         ownPID: pid_t,
-        ownLaunchDate: Date
+        ownLaunchDate: Date?
     ) -> Decision {
-        let others = running.filter { $0.pid != ownPID }
-        // No launch date reported is treated as oldest: a copy that predates
-        // ours is the only way to lose that field in practice.
+        // A peer whose launch date macOS does not report only counts — to be retired
+        // as much as to outrank us — when its pid is lower than ours. Ranking it as
+        // oldest unconditionally let two copies that each read the other's date as nil
+        // both call themselves newest, and each retired the other: zero left.
+        let others = running.filter { $0.pid != ownPID && ($0.launchDate != nil || $0.pid < ownPID) }
+        // Our own date unreadable means we cannot claim to be newest at all, so retire
+        // lower pids only and stand down for nobody: the side with the higher pid keeps
+        // the field, and a disagreement leaves one copy up rather than none.
+        guard let ownLaunchDate else {
+            return .retire(running.filter { $0.pid < ownPID }.map(\.pid))
+        }
         let outranked = others.contains { ($0.launchDate ?? .distantPast, $0.pid) > (ownLaunchDate, ownPID) }
         return outranked ? .yieldToNewer : .retire(others.map(\.pid))
     }
@@ -55,7 +63,7 @@ enum SingleInstanceGuard {
         let decision = decide(
             running: peers.map { (pid: $0.processIdentifier, launchDate: $0.launchDate) },
             ownPID: ProcessInfo.processInfo.processIdentifier,
-            ownLaunchDate: NSRunningApplication.current.launchDate ?? Date()
+            ownLaunchDate: NSRunningApplication.current.launchDate
         )
         guard case .retire(let doomed) = decision else {
             NSLog("CodeBurn: a newer instance is already running - quitting this one")

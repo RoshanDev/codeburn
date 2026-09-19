@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createWriteStream, constants as fsConstants } from 'node:fs'
-import { access, chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir, platform, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
@@ -224,6 +224,110 @@ export {
 
 function userApplicationsDir(): string {
   return join(homedir(), 'Applications')
+}
+
+/// Where a bundle may already live, in the order the desktop app's Menu bar card looks
+/// (app/electron/mac-menubar.ts, locate()). Its Spotlight fallback is deliberately not
+/// mirrored: replacing a bundle is destructive, and a Spotlight hit can name anything.
+function macApplicationsDirs(): string[] {
+  return [userApplicationsDir(), '/Applications']
+}
+
+export type MacInstallTarget = {
+  /// The bundle path the install writes.
+  targetPath: string
+  /// True when a copy was already installed somewhere, whether or not it is the target.
+  existed: boolean
+  /// Copies that will still be there afterwards, for the user to move to the Trash.
+  leftovers: string[]
+}
+
+/// Replace a copy where it already lives, so a user with CodeBurnMenubar.app in
+/// /Applications does not end up with a second bundle, and a second login item, under
+/// ~/Applications. A directory we cannot write to is never escalated into: the install
+/// falls back to ~/Applications and the copy left behind is reported instead.
+export async function resolveMacInstallTarget(dirs: string[] = macApplicationsDirs()): Promise<MacInstallTarget> {
+  const present: string[] = []
+  for (const dir of dirs) {
+    const candidate = join(dir, APP_BUNDLE_NAME)
+    if (await exists(candidate)) present.push(candidate)
+  }
+  const chosen = present[0]
+  const writable = chosen ? await access(dirname(chosen), fsConstants.W_OK).then(() => true, () => false) : false
+  const targetPath = chosen && writable ? chosen : join(dirs[0]!, APP_BUNDLE_NAME)
+  return { targetPath, existed: present.length > 0, leftovers: present.filter(path => path !== targetPath) }
+}
+
+/// Injected by the tests: the placement below has to be driven through failures a real
+/// filesystem will not produce on demand.
+export type BundlePlacementHooks = {
+  rename?: (from: string, to: string) => Promise<void>
+  copy?: (from: string, to: string) => Promise<void>
+  verify?: (appPath: string) => Promise<void>
+  log?: (line: string) => void
+}
+
+/// Put the staged bundle at targetPath, leaving the user with a working app whatever fails.
+/// The copy that is there is renamed aside first, never deleted, so a failed placement can
+/// put it back; only a placement that worked removes it. The aside name is dot-prefixed:
+/// one we cannot remove is still not a second launchable .app sitting in Applications.
+export async function placeMenubarBundle(
+  stagedApp: string,
+  targetPath: string,
+  hooks: BundlePlacementHooks = {},
+): Promise<void> {
+  const move = hooks.rename ?? rename
+  // verbatimSymlinks keeps the framework symlinks inside the bundle as links rather than
+  // resolving them into copies, which is one of the ways a copied bundle stops verifying.
+  const copy = hooks.copy ?? ((from: string, to: string) => cp(from, to, {
+    recursive: true, verbatimSymlinks: true, preserveTimestamps: true,
+  }))
+  const verify = hooks.verify ?? verifyBundleSignature
+  const log = hooks.log ?? console.log
+
+  const dir = dirname(targetPath)
+  const aside = join(dir, `.${basename(targetPath)}.old-${process.pid}`)
+  const replacing = await exists(targetPath)
+  if (replacing) await move(targetPath, aside)
+
+  try {
+    try {
+      await move(stagedApp, targetPath)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EXDEV') throw err
+      // Staging is on another volume, so the move has to be a copy. Copy into a sibling of
+      // the target and rename that into place: a rename within one directory is atomic, and
+      // nothing half-copied is ever visible under the real name.
+      const sibling = join(dir, `.${basename(targetPath)}.new-${process.pid}`)
+      try {
+        await rm(sibling, { recursive: true, force: true })
+        await copy(stagedApp, sibling)
+        await move(sibling, targetPath)
+        // A copy is where a signature breaks, and what the stager verified was the staged
+        // bundle, not this one.
+        await verify(targetPath)
+        await rm(stagedApp, { recursive: true, force: true })
+      } finally {
+        await rm(sibling, { recursive: true, force: true }).catch(() => {})
+      }
+    }
+  } catch (err) {
+    await rm(targetPath, { recursive: true, force: true }).catch(() => {})
+    if (replacing) await move(aside, targetPath).catch(() => {})
+    throw err
+  }
+
+  if (replacing) {
+    await rm(aside, { recursive: true, force: true }).catch(() => {
+      log(`The previous bundle is still at ${aside}; it is hidden and not running, delete it when you can.`)
+    })
+  }
+}
+
+function reportLeftoverBundles(leftovers: string[]): void {
+  for (const path of leftovers) {
+    console.log(`An older copy is still at ${path}. Move it to the Trash; CodeBurn will not delete it for you.`)
+  }
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -498,6 +602,10 @@ async function verifyBundleIdentity(appPath: string): Promise<void> {
   if (bundleID !== EXPECTED_BUNDLE_ID) {
     throw new Error(`Unexpected menubar bundle id ${bundleID}; expected ${EXPECTED_BUNDLE_ID}.`)
   }
+  await verifyBundleSignature(appPath)
+}
+
+async function verifyBundleSignature(appPath: string): Promise<void> {
   await runCommand('/usr/bin/codesign', ['--verify', '--deep', '--strict', appPath])
 }
 
@@ -1315,14 +1423,13 @@ export async function installMenubarApp(options: InstallOptions = {}): Promise<I
   await ensureSupportedPlatform()
   await persistCodeburnPath()
 
-  const appsDir = userApplicationsDir()
-  const targetPath = join(appsDir, APP_BUNDLE_NAME)
-  const alreadyInstalled = await exists(targetPath)
+  const { targetPath, existed: alreadyInstalled, leftovers } = await resolveMacInstallTarget()
 
   if (alreadyInstalled && !options.force) {
     if (!(await isAppRunning())) {
       await runCommand('/usr/bin/open', [targetPath])
     }
+    reportLeftoverBundles(leftovers)
     return { installedPath: targetPath, launched: true }
   }
 
@@ -1348,17 +1455,21 @@ export async function installMenubarApp(options: InstallOptions = {}): Promise<I
       unpackedApp = await stageMenubarApp(assets, stagingDir)
     }
 
-    await mkdir(appsDir, { recursive: true })
+    await mkdir(dirname(targetPath), { recursive: true })
     if (alreadyInstalled) {
       // Kill the running copy before replacing its bundle so `mv` can proceed cleanly and the
-      // user ends up on the new version.
+      // user ends up on the new version. pkill matches the process name, so a copy running
+      // from the other Applications folder is asked to go too.
       await killRunningApp()
-      await rm(targetPath, { recursive: true, force: true })
     }
-    await rename(unpackedApp, targetPath)
+    // Only now, with the new bundle downloaded, checksummed and its identity verified, is
+    // the installed copy touched at all — and it is moved aside, not deleted, until this
+    // returns.
+    await placeMenubarBundle(unpackedApp, targetPath)
 
     console.log('Launching CodeBurn Menubar...')
     await runCommand('/usr/bin/open', [targetPath])
+    reportLeftoverBundles(leftovers)
     return { installedPath: targetPath, launched: true }
   } finally {
     await rm(stagingDir, { recursive: true, force: true })

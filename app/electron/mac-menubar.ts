@@ -284,8 +284,11 @@ export class MacMenubar {
    * It restarts *itself*, asked through the remote-command key. Quitting it and
    * reopening it from here made the desktop app the new process's responsible
    * process, and macOS then re-asked for "access data from other apps" on every
-   * single language change. A menubar too old to answer the key falls back to the
-   * quit-and-open below, which is the behaviour it already had.
+   * single language change. An older menubar falls back to the quit-and-open below
+   * only because {@link OLDEST_ASKABLE} is the first version that watches the
+   * remote-command key at all. That is not a gate any later command inherits: a
+   * menubar that watches the key but does not know the command consumes it and
+   * drops it, so a command added here later needs a version floor of its own.
    */
   async setLanguage(appleLang: string | null): Promise<MacMenubarStatus> {
     if (appleLang) await this.run('/usr/bin/defaults', ['write', MENUBAR_BUNDLE_ID, 'AppleLanguages', '-array', appleLang])
@@ -296,7 +299,9 @@ export class MacMenubar {
     if ((await this.status()).running) {
       await this.run('/usr/bin/defaults', ['write', MENUBAR_BUNDLE_ID, REMOTE_COMMAND_KEY, '-string', 'relaunch'])
       if (await this.waitForConsumed(EXIT_TIMEOUT_MS)) {
-        await this.waitForRunning(executable, RELAUNCH_TIMEOUT_MS)
+        // It took the command and went down, but never came back: open it ourselves
+        // rather than leave the menu bar gone for the sake of the permission prompt.
+        if (!(await this.waitForRunning(executable, RELAUNCH_TIMEOUT_MS))) return this.open()
         return this.status()
       }
       // Nobody consumed it, so it would relaunch the next launch instead.

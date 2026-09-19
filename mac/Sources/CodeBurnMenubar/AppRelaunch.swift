@@ -18,7 +18,9 @@ enum AppRelaunch {
     static func now() {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/sh")
-        task.arguments = ["-c", "sleep 0.6; open -n \"\(Bundle.main.bundlePath)\""]
+        // The bundle path is an argument, not part of the script: a path with a quote or a
+        // `$` in it would otherwise be read as shell syntax.
+        task.arguments = ["-c", "sleep 0.6; open -n \"$1\"", "sh", Bundle.main.bundlePath]
         try? task.run()
         NSApp.terminate(nil)
     }

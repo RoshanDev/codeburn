@@ -658,9 +658,6 @@ private struct GeneralSettingsTab: View {
         .padding()
     }
 
-    /// Restarts through a detached shell so the new process is not a child of
-    /// the one being terminated. The delay lets this instance exit before `open`
-    /// looks for a running copy.
     private func applyCurrency(code: String) {
         let symbol = CurrencyState.symbolForCode(code)
         Task {

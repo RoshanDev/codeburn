@@ -501,8 +501,8 @@ const EXPORT_SAVED_MARKER = 'Exported ('
 const EXPORT_PATH_SEPARATOR = ') to: '
 const EXPORT_NOTHING_WRITTEN = 'Nothing to export: no usage in the export window, or the project filter hides all of it.'
 
-/** The path the CLI actually wrote, which is not the destination the user picked:
- *  a CSV export nests a dated folder inside it, JSON appends the extension. */
+/** The path the CLI actually wrote, which is not the destination the user picked: inside
+ *  the chosen folder an export is a dated folder (CSV) or a dated file (JSON). */
 export function exportedPath(stdout: string): string | null {
   for (const line of stdout.split('\n')) {
     const marker = line.indexOf(EXPORT_SAVED_MARKER)
