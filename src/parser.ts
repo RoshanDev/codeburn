@@ -1226,7 +1226,7 @@ function applyLocalModelSavings(call: ParsedApiCall): ParsedApiCall {
   const savings = calculateLocalModelSavings(
     call.model,
     u.inputTokens,
-    u.outputTokens,
+    billableOutputTokens(call.provider, u.outputTokens, u.reasoningTokens),
     u.cacheCreationInputTokens,
     u.cacheReadInputTokens,
     u.webSearchRequests,
@@ -3185,7 +3185,7 @@ function warnProviderParseFailure(providerName: string, sourcePath: string, err:
 // discovery errors are already isolated; this catches a provider-level throw so
 // one locked provider skips-and-continues instead of aborting the whole
 // hydration (which would empty the cache/daily backfill for every provider).
-function isPermissionError(err: unknown): boolean {
+export function isPermissionError(err: unknown): boolean {
   const code = (err as NodeJS.ErrnoException | undefined)?.code
   return code === 'EPERM' || code === 'EACCES'
 }
@@ -5741,6 +5741,12 @@ async function runParseInner(
   deferredRetryableSource = false
   firstPaintDeferredThisRun = 0
   dateFloorSkippedProviders.clear()
+  // Providers whose mid-scan read threw EPERM/EACCES: a recoverable permission
+  // error is "unknown", not "empty", so they are excluded from completeness
+  // marking (like a failed discovery) and block hydration-complete, so that
+  // restoring access later reopens the affected days instead of them staying
+  // sealed as fully scanned.
+  const permissionSkippedProviders = new Set<string>()
   const seenMsgIds = new Set<string>()
   const seenKeys = new Set<string>()
   const discovery = snapshotOnly
@@ -5808,6 +5814,7 @@ async function runParseInner(
       if (claudeSources.length > 0) emitScanProgress({ kind: 'provider', provider: 'claude', state: 'done', files: claudeSources.length })
     } catch (err) {
       if (!isPermissionError(err)) throw err
+      permissionSkippedProviders.add('claude')
       process.stderr.write(`codeburn: skipped claude data (permission denied; grant Full Disk Access to include it)\n`)
       emitScanProgress({ kind: 'provider', provider: 'claude', state: 'skipped' })
     }
@@ -5825,6 +5832,7 @@ async function runParseInner(
       // A permission-locked provider skips-and-continues; any other error is a
       // real bug and still aborts (per-file/DB-lock cases are handled deeper).
       if (!isPermissionError(err)) throw err
+      permissionSkippedProviders.add(providerName)
       process.stderr.write(`codeburn: skipped ${providerName} data (permission denied; grant Full Disk Access to include it)\n`)
       emitScanProgress({ kind: 'provider', provider: providerName, state: 'skipped' })
     }
@@ -5886,7 +5894,7 @@ async function runParseInner(
   const deferredForFirstPaint = firstPaintDeferredThisRun > 0
   const rangeStartMs = dateRange?.start.getTime()
   const scopedRun = !!providerFilter && providerFilter !== 'all'
-  const discoveryFailed = new Set(discovery.failedProviders)
+  const discoveryFailed = new Set([...discovery.failedProviders, ...permissionSkippedProviders])
   let completenessChanged = false
   if (!readOnly && !deferredForFirstPaint) {
     const walked = scopedRun ? [providerFilter!] : Object.keys(diskCache.providers)
@@ -5913,7 +5921,7 @@ async function runParseInner(
   // files, or a write run that deferred a changed source on a retryable
   // failure, reached the end of the scan without hydrating everything, and
   // the daily backfill must not finalize history off it.
-  sessionHydrationComplete = (!readOnly || !readOnlyServedStale) && !deferredRetryableSource && !deferredForFirstPaint
+  sessionHydrationComplete = (!readOnly || !readOnlyServedStale) && !deferredRetryableSource && !deferredForFirstPaint && permissionSkippedProviders.size === 0
   sessionFirstPaintDeferred = deferredForFirstPaint
 
   // Merge across providers by normalised project path so the same repository

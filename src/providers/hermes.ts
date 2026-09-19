@@ -533,7 +533,10 @@ async function discoverFromDb(dbPath: string, profile: string): Promise<SessionS
   let db: SqliteDatabase
   try {
     db = openDatabase(dbPath)
-  } catch {
+  } catch (err) {
+    // A busy/locked open is not an empty DB: escalate so discovery is marked
+    // failed rather than sealing an empty period (mirrors the query catch below).
+    if (isSqliteBusyError(err)) throw err
     return []
   }
 
@@ -600,6 +603,8 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
       try {
         db = openDatabase(decoded.dbPath)
       } catch (err) {
+        // A busy/locked open must reach the caller, not read as an empty session.
+        if (isSqliteBusyError(err)) throw err
         process.stderr.write(`codeburn: cannot open Hermes database: ${err instanceof Error ? err.message : err}\n`)
         return
       }

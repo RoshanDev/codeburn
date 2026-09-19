@@ -177,7 +177,7 @@ export function Settings({ period, refreshToken = 0, onNavigate, initialPane, cl
         </nav>
         <main className="set-pane">
           {pane === 'general' && <GeneralPane period={period} refreshToken={refreshToken} claudeConfigs={claudeConfigs} claudeConfigSource={claudeConfigSource} onConfigMutated={onConfigMutated} scope={scope} onScopeChange={onScopeChange} projectFiltered={projectFiltered} />}
-          {pane === 'providers' && <ProvidersPane period={period} refreshToken={refreshToken} />}
+          {pane === 'providers' && <ProvidersPane refreshToken={refreshToken} />}
           {pane === 'projects' && <ProjectsPane refreshToken={refreshToken} onConfigMutated={onConfigMutated} />}
           {pane === 'aliases' && <AliasesPane refreshToken={refreshToken} onConfigMutated={onConfigMutated} />}
           {pane === 'pricing' && <PricingPane refreshToken={refreshToken} onConfigMutated={onConfigMutated} />}
@@ -296,8 +296,11 @@ function GeneralPane({ period, refreshToken, claudeConfigs, claudeConfigSource, 
   )
 }
 
-function ProvidersPane({ period, refreshToken }: { period: Period; refreshToken: number }) {
-  const overview = usePolled<MenubarPayload>(() => codeburn.getOverview(period, 'all'), [period, refreshToken])
+function ProvidersPane({ refreshToken }: { refreshToken: number }) {
+  // Detection only needs to know which providers are live and a small headline, so it
+  // always uses a cheap 1-day window instead of the global period — a 6-month period
+  // would otherwise recompute every provider over 6 months just to render this list.
+  const overview = usePolled<MenubarPayload>(() => codeburn.getOverview('today', 'all'), [refreshToken])
   const providers = detectedProviders(overview.data?.current)
   return <section className="set-p on">
     <div><h3 className="set-h">{t('settings.providers.heading')}</h3><p className="set-sub">{t('settings.providers.subtitle')}</p></div>

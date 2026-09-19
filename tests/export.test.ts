@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, readFile, readdir, rm } from 'fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 
@@ -171,6 +171,18 @@ describe('exportCsv', () => {
     expect(models).toContain('Retries/Edit')
     expect(models).toContain('Cost/Edit')
     expect(models).toContain(',1,100,0,')
+  })
+
+  it('nests into a dated subfolder when the destination is an existing folder', async () => {
+    // The desktop app passes a real folder (e.g. Desktop) with unrelated files in it.
+    await writeFile(join(tmpDir, 'unrelated.txt'), 'keep me', 'utf-8')
+    const periods: PeriodExport[] = [{ label: '30 Days', projects: [makeProject('app')] }]
+
+    const folder = await exportCsv(periods, tmpDir)
+
+    expect(folder.startsWith(join(tmpDir, 'codeburn-export-'))).toBe(true)
+    expect(await readFile(join(tmpDir, 'unrelated.txt'), 'utf-8')).toBe('keep me')
+    expect(await readFile(join(folder, 'summary.csv'), 'utf-8')).toContain('Period')
   })
 
   it('does not crash when periods array is empty', async () => {

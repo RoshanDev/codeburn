@@ -37,9 +37,21 @@ import { isPathBlocked } from './sqlite.js'
 // ---------------------------------------------------------------------------
 
 // Past this resident-set size the serve loop drops its in-memory memos and
-// re-parses on the next request. 3GB leaves generous room for the largest
-// observed corpora while bounding a pathological one.
-const SERVE_MAX_RSS_BYTES = 3 * 1024 * 1024 * 1024
+// re-parses on the next request. 6GB default leaves generous room for the
+// largest observed corpora (a warm ~3GB cache survives) while bounding a
+// pathological one. CODEBURN_SERVE_MAX_RSS_MB (integer MB) overrides it.
+const DEFAULT_SERVE_MAX_RSS_MB = 6144
+const SERVE_MAX_RSS_BYTES = (() => {
+  const mb = Number(process.env['CODEBURN_SERVE_MAX_RSS_MB'])
+  return (Number.isInteger(mb) && mb > 0 ? mb : DEFAULT_SERVE_MAX_RSS_MB) * 1024 * 1024
+})()
+
+// A warm cache holds RSS above the ceiling as a steady state, so clearing on
+// every request would thrash the cache. Track the RSS at the last clear and
+// require meaningful growth before clearing again — clear once per growth
+// plateau, but still clear on real unbounded growth.
+const SERVE_RSS_CLEAR_MARGIN_BYTES = 256 * 1024 * 1024
+let lastClearRss = 0
 
 // How long a closing serve child waits for an already-accepted request before
 // giving up and exiting. CODEBURN_SERVE_DRAIN_MS overrides it so the e2e can
@@ -786,18 +798,27 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
       // threshold, drop the in-memory memos — the next request re-parses
       // once (seconds), which beats an ever-growing child. The child itself
       // never exits here, so the client's death counter is untouched.
-      if (process.memoryUsage().rss > SERVE_MAX_RSS_BYTES) {
-        const { clearSessionCache } = await import('./parser.js')
-        const { clearLoadCacheMemo } = await import('./session-cache.js')
-        const { clearCodexMemCaches } = await import('./codex-cache.js')
-        const { clearAntigravityCacheStates } = await import('./providers/antigravity.js')
-        const { clearScanFileMemo } = await import('./optimize.js')
-        clearSessionCache()
-        clearLoadCacheMemo()
-        clearCodexMemCaches()
-        clearAntigravityCacheStates()
-        clearScanFileMemo()
-        if (typeof globalThis.gc === 'function') globalThis.gc()
+      const rss = process.memoryUsage().rss
+      if (rss > SERVE_MAX_RSS_BYTES) {
+        // Hysteresis: only clear when RSS has grown past the last clear by a
+        // margin, so a warm cache sitting above the ceiling is not dropped on
+        // every request.
+        if (rss > lastClearRss + SERVE_RSS_CLEAR_MARGIN_BYTES) {
+          const { clearSessionCache } = await import('./parser.js')
+          const { clearLoadCacheMemo } = await import('./session-cache.js')
+          const { clearCodexMemCaches } = await import('./codex-cache.js')
+          const { clearAntigravityCacheStates } = await import('./providers/antigravity.js')
+          const { clearScanFileMemo } = await import('./optimize.js')
+          clearSessionCache()
+          clearLoadCacheMemo()
+          clearCodexMemCaches()
+          clearAntigravityCacheStates()
+          clearScanFileMemo()
+          if (typeof globalThis.gc === 'function') globalThis.gc()
+          lastClearRss = rss
+        }
+      } else {
+        lastClearRss = 0
       }
     }).finally(() => {
       if (waitingId !== null) awaiting.delete(waitingId)

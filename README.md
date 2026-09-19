@@ -37,7 +37,8 @@
       <a href="https://apps.microsoft.com/detail/9P0R4ZL5XMB8"><img src="https://img.shields.io/badge/Windows-Microsoft_Store-F97316?logo=microsoft&logoColor=white" alt="Get CodeBurn from the Microsoft Store" /></a>
       <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.24/codeburn-desktop_0.9.24_amd64.deb"><img src="https://img.shields.io/badge/Linux-.deb-F97316?logo=debian&logoColor=white" alt="Download for Linux (.deb)" /></a>
       <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.24/codeburn-desktop-0.9.24.x86_64.rpm"><img src="https://img.shields.io/badge/Linux-.rpm-F97316?logo=redhat&logoColor=white" alt="Download for Linux (.rpm)" /></a>
-      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.24/CodeBurn-0.9.24.AppImage"><img src="https://img.shields.io/badge/Linux-AppImage-F97316?logo=linux&logoColor=white" alt="Download for Linux (AppImage)" /></a>
+      <a href="https://github.com/getagentseal/codeburn/releases/download/desktop-v0.9.24/CodeBurn-0.9.24.AppImage"><img src="https://img.shields.io/badge/Linux-AppImage-F97316?logo=linux&logoColor=white" alt="Download for Linux (AppImage)" /></a><br/>
+      <sub>🍎 macOS builds are signed with a Developer ID and notarized by Apple — no security warning on open.</sub>
     </td>
     <td align="center" width="50%">
       <strong>Web</strong><br/>

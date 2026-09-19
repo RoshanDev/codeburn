@@ -416,7 +416,9 @@ describe('Settings', () => {
     expect(await screen.findByText('Claude')).toBeInTheDocument()
     expect(screen.getByText('Detected · $12.34')).toBeInTheDocument()
     expect(screen.getByText('Codex')).toBeInTheDocument()
-    expect(mocks.getOverview).toHaveBeenCalledWith('week', 'all')
+    // The providers pane detects live providers over a cheap fixed 1-day window,
+    // decoupled from the global period, so it never asks for 'week' here.
+    expect(mocks.getOverview).toHaveBeenCalledWith('today', 'all')
   })
 
   it('keys provider logos on the internal id from providerDetails', async () => {

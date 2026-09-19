@@ -1270,6 +1270,36 @@ export function getDaysInRange(cache: DailyCache, start: string, end: string): D
   return cache.days.filter(d => d.date >= start && d.date <= end)
 }
 
+function phantomAmountBucket(cost: number): string {
+  if (cost < 1) return '<$1'
+  if (cost < 10) return '$1-10'
+  if (cost < 100) return '$10-100'
+  if (cost < 1000) return '$100-1000'
+  return '>$1000'
+}
+
+/// DETECTION-ONLY tripwire for the "phantom spend" anomaly: a rare, non-repro
+/// over-count that attributed cost/calls to days with ZERO underlying source
+/// records. Pure observer — never changes a day, a total, or any output; it only
+/// warns (at most once per run). A non-carried day is expected to be backed by a
+/// fresh source record for its date; a carried/preserved day legitimately has
+/// spend with no live records (its session files expired), so it is never
+/// suspect. `datesWithSourceRecords` is the set of dates the fresh parse
+/// actually produced records for (a date is in it iff it had >=1 record).
+export function detectPhantomSpend(
+  days: DailyEntry[],
+  datesWithSourceRecords: ReadonlySet<string>,
+  warn: (message: string) => void = message => console.warn(message),
+): void {
+  for (const day of days) {
+    if (day.carried === true) continue
+    if (day.cost <= 0 && day.calls <= 0) continue
+    if (datesWithSourceRecords.has(day.date)) continue
+    warn(`codeburn: phantom-spend guard tripped — ${day.date} has spend without source records (${phantomAmountBucket(day.cost)}); totals unchanged, please report`)
+    return
+  }
+}
+
 let lockChain: Promise<unknown> = Promise.resolve()
 
 export function withDailyCacheLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -1472,6 +1502,14 @@ export async function ensureCacheHydrated(
       const merged = parseWasComplete
         ? mergeDayEntries(freshDays, baseline, true, tzSubtraction, true, pendingRederive)
         : mergeDayEntries(baseline, freshDays, false)
+      // Only the complete re-derive re-parses the whole window, so freshDays is
+      // the authoritative record set and every non-carried merged day should be
+      // one of them; the partial path only fills gaps and cannot vouch for
+      // record presence, so it is not checked. Observer only — wrapped so it can
+      // never affect hydration.
+      if (parseWasComplete) {
+        try { detectPhantomSpend(merged, new Set(freshDays.map(d => d.date))) } catch { /* detection must never break hydration */ }
+      }
       c = {
         version: DAILY_CACHE_VERSION,
         savingsConfigHash,

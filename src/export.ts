@@ -386,6 +386,15 @@ export async function exportCsv(periods: PeriodExport[], outputPath: string): Pr
     folder = folder.slice(0, -4)
   }
 
+  // The desktop app (and any `-o <existing dir>`) hands us a real folder like the
+  // Desktop, not a slot to fill: writing our ~11 files straight in would trip the
+  // reuse guard below. Nest the export in a dated subfolder of our own and let the
+  // guard apply to that. A folder we made earlier (marker present) is reused as-is.
+  const targetStat = await stat(folder).catch(() => null)
+  if (targetStat?.isDirectory() && !(await isCodeburnExportFolder(folder))) {
+    folder = join(folder, `codeburn-export-${new Date().toISOString().slice(0, 10)}`)
+  }
+
   const existingStat = await stat(folder).catch(() => null)
   if (existingStat?.isFile()) {
     throw new Error(`Refusing to overwrite existing file at ${folder}. Pass a directory path instead.`)

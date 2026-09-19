@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises'
+import { mkdtemp, mkdir, writeFile, rm, stat } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 
@@ -351,6 +351,30 @@ describe('pi provider - JSONL parsing', () => {
     expect(call.costUSD).toBeGreaterThan(0)
     expect(call.deduplicationKey).toContain('pi:')
     expect(call.deduplicationKey).toContain('resp-abc')
+  })
+
+  it('falls back to file mtime when a call has no usable timestamp', async () => {
+    const projectDir = join(tmpDir, '--Users-test-myproject--')
+    const filePath = await writeSession(projectDir, 'session.jsonl', [
+      JSON.stringify({ type: 'session', version: 3, id: 'sess-nots', cwd: '/Users/test/myproject' }),
+      JSON.stringify({
+        type: 'message', id: 'a1',
+        message: {
+          role: 'assistant', model: 'gpt-5.4', responseId: 'resp-nots',
+          usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0 },
+        },
+      }),
+    ])
+    const { mtime } = await stat(filePath)
+    const provider = createPiProvider(tmpDir)
+    const source = { path: filePath, project: 'myproject', provider: 'pi' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) {
+      calls.push(call)
+    }
+    // Real spend is kept, stamped with the file mtime instead of being dropped.
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.timestamp).toBe(mtime.toISOString())
   })
 
   it('does not crash when a user message content is a string instead of an array (issue #441)', async () => {

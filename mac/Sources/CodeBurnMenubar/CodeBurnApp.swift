@@ -1326,10 +1326,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         }
     }
 
-    /// Loads the bundled binary-flame PNG (Resources/ProviderIcons/flame.png) at the
-    /// menubar text point size. With no tint it stays a template image so the system
-    /// auto-adapts to the menu bar; a tint returns a recolored non-template copy for
-    /// the budget/quota warning states.
+    /// Loads the menubar flame at the menubar text point size. With no tint it stays a
+    /// template image so the system auto-adapts to the menu bar; a tint returns a
+    /// recolored non-template copy for the budget/quota warning states.
     private static func menubarFlameImage(
         tint: NSColor?,
         pointSize: CGFloat = menubarTitleFontSize
@@ -1838,19 +1837,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     }
 
     private func codeburnAlertIcon() -> NSImage? {
-        let config = NSImage.SymbolConfiguration(pointSize: 32, weight: .medium)
-        guard let symbol = NSImage(systemSymbolName: "flame.fill", accessibilityDescription: "CodeBurn")?
-            .withSymbolConfiguration(config) else { return nil }
-        let size = NSSize(width: 64, height: 64)
-        let img = NSImage(size: size, flipped: false) { rect in
-            let symbolSize = symbol.size
-            let x = (rect.width - symbolSize.width) / 2
-            let y = (rect.height - symbolSize.height) / 2
-            symbol.draw(in: NSRect(x: x, y: y, width: symbolSize.width, height: symbolSize.height))
-            return true
-        }
-        img.isTemplate = false
-        return img
+        guard let flame = AboutFlameImage.load(), let icon = flame.copy() as? NSImage else { return nil }
+        icon.size = NSSize(width: 64, height: 64 * flame.size.height / flame.size.width)
+        icon.isTemplate = false
+        return icon
     }
 
     @objc private func checkForUpdates() {
