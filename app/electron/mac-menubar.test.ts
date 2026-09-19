@@ -45,8 +45,9 @@ function harness(opts: {
     }
     if (command.endsWith('defaults') && args[0] === 'write') {
       if (args[2] === REMOTE_COMMAND_KEY) {
+        // `relaunch` and `settings` leave the process up: the first restarts itself.
         if (opts.honoursRemoteCommand === false) pendingCommand = args[4]
-        else if (args[4] !== 'settings') running = false
+        else if (args[4] === 'quit' || args[4] === 'uninstall') running = false
       }
       return ''
     }
@@ -302,17 +303,31 @@ describe('MacMenubar.settings', () => {
     expect(calls.some(([cmd, args]) => cmd.endsWith('defaults') && args[0] === 'delete' && args[2] === REMOTE_COMMAND_KEY)).toBe(true)
   })
 
-  // AppKit reads AppleLanguages only at launch, so a running menu bar must be quit and
-  // reopened for the switch to show — and the quit is AppleScript, which every version honors.
-  it('writes AppleLanguages and relaunches a running menu bar so it re-reads it', async () => {
-    const { menubar, calls } = harness({ present: [USER_APP], running: true })
+  // AppKit reads AppleLanguages only at launch, so a running menu bar has to come back
+  // up. Reopening it from here made the desktop app its responsible process and macOS
+  // re-asked for "access data from other apps" every time, so it is asked to do it itself.
+  it('writes AppleLanguages and asks a running menu bar to relaunch itself', async () => {
+    const { menubar, calls, isRunning } = harness({ present: [USER_APP], running: true })
     await menubar.setLanguage('zh-Hans')
     const write = calls.find(([cmd, args]) => cmd.endsWith('defaults') && args[0] === 'write' && args[2] === 'AppleLanguages')
     expect(write?.[1].at(-1)).toBe('zh-Hans')
+    const command = calls.find(([cmd, args]) => cmd.endsWith('defaults') && args[0] === 'write' && args[2] === REMOTE_COMMAND_KEY)
+    expect(command?.[1]).toEqual(['write', MENUBAR_BUNDLE_ID, REMOTE_COMMAND_KEY, '-string', 'relaunch'])
+    expect(calls.some(([cmd]) => cmd.endsWith('osascript'))).toBe(false)
+    expect(calls.some(([cmd, args]) => cmd.endsWith('open') && args[0] === USER_APP)).toBe(false)
+    expect(isRunning()).toBe(true)
+  })
+
+  // A menubar too old to watch the key never answers, and the switch has to keep working.
+  it('falls back to quitting and reopening a menu bar that does not answer', async () => {
+    const { menubar, calls } = harness({ present: [USER_APP], running: true, honoursRemoteCommand: false })
+    await menubar.setLanguage('ja')
     const quitIdx = calls.findIndex(([cmd]) => cmd.endsWith('osascript'))
     const openIdx = calls.findIndex(([cmd, args]) => cmd.endsWith('open') && args[0] === USER_APP)
     expect(quitIdx).toBeGreaterThanOrEqual(0)
     expect(openIdx).toBeGreaterThan(quitIdx)
+    // Left behind, the command would relaunch the next launch instead.
+    expect(calls.some(([cmd, args]) => cmd.endsWith('defaults') && args[0] === 'delete' && args[2] === REMOTE_COMMAND_KEY)).toBe(true)
   })
 
   it('clears the override for System and never quits a menu bar that is down', async () => {
@@ -325,7 +340,7 @@ describe('MacMenubar.settings', () => {
   // The `open` right after a quit can activate the dying instance and no-op,
   // leaving the switch with a dead menu bar; the relaunch must be confirmed.
   it('opens again when the first relaunch does not bring the menu bar up', async () => {
-    const { menubar, calls, isRunning } = harness({ present: [USER_APP], running: true, flakyOpen: 1 })
+    const { menubar, calls, isRunning } = harness({ present: [USER_APP], running: true, honoursRemoteCommand: false, flakyOpen: 1 })
     await menubar.setLanguage('ja')
     const opens = calls.filter(([cmd, args]) => cmd.endsWith('open') && args[0] === USER_APP)
     expect(opens.length).toBe(2)

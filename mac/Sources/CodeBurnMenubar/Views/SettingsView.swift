@@ -521,7 +521,7 @@ private struct GeneralSettingsTab: View {
                         Text(L("Relaunch to apply."))
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
-                        Button(L("Relaunch")) { relaunch() }
+                        Button(L("Relaunch")) { AppRelaunch.now() }
                     }
                 } else {
                     Text(L("Follows System Settings > Language & Region unless you pick one here."))
@@ -661,14 +661,6 @@ private struct GeneralSettingsTab: View {
     /// Restarts through a detached shell so the new process is not a child of
     /// the one being terminated. The delay lets this instance exit before `open`
     /// looks for a running copy.
-    private func relaunch() {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/sh")
-        task.arguments = ["-c", "sleep 0.6; open -n \"\(Bundle.main.bundlePath)\""]
-        try? task.run()
-        NSApp.terminate(nil)
-    }
-
     private func applyCurrency(code: String) {
         let symbol = CurrencyState.symbolForCode(code)
         Task {

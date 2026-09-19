@@ -131,7 +131,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        SingleInstanceGuard.retireOlderInstances()
+        guard SingleInstanceGuard.enforceSingleInstance() else { return }
         ProcessInfo.processInfo.automaticTerminationSupportEnabled = false
         ProcessInfo.processInfo.disableSuddenTermination()
         // Deliberately NO app-lifetime beginActivity here. A permanent
@@ -348,6 +348,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         }
         if command == .settings {
             openSettings()
+            return
+        }
+        if command == .relaunch {
+            AppRelaunch.now()
             return
         }
         guard command.terminates else { return }
