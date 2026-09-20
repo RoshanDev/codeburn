@@ -20,7 +20,7 @@ import { isBehavioralCall } from './behavioral-weight.js'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import type { AppliedFix } from './act/types.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
-import { buildPeriodData, buildMenubarPayloadForRange, buildDurablePeriod, getDailyCacheConfigHash, type DurablePeriod } from './usage-aggregator.js'
+import { buildPeriodData, buildMenubarPayloadForRange, buildDurablePeriod, getDailyCacheConfigHash, SERVE_HYDRATION_ENV, type DurablePeriod } from './usage-aggregator.js'
 import { aggregateProjectsIntoDays } from './day-aggregator.js'
 import { buildPeriodDiffReport, defaultSevenDayRanges, diffSessions, dayKeyToRange, historyBasis, localRangeInfo } from './period-diff.js'
 import { loadStatusSnapshot, saveStatusSnapshot } from './session-cache.js'
@@ -1255,7 +1255,17 @@ program
       // optimize path never reads or writes the disk snapshot at all, it
       // always recomputes fresh. One-shot and serve-child behavior are
       // identical for both optimize values.
-      const useSnapshot = !queryScope.optimize
+      // Inside the resident `serve` child (SERVE_HYDRATION_ENV is set for the
+      // life of that process) the snapshot is pure downside: the process
+      // already holds the incremental parse state and an output memo, so the
+      // snapshot buys no work back — it only adds `loadStatusSnapshot`'s
+      // settle window, which hands back the deliberately deferred PRE-change
+      // payload. serve then memoizes that answer, and with the roots quiet
+      // again the memo stays "clean", replaying the stale payload until the
+      // next filesystem event or the 5-minute memo cap. One-shot invocations
+      // (a terminal run, the menubar's spawn fallback) keep the snapshot and
+      // its debounce exactly as before.
+      const useSnapshot = !queryScope.optimize && process.env[SERVE_HYDRATION_ENV] !== '1'
       const corpus = useSnapshot ? await computeCorpusFingerprint(pf) : null
       const snapshot = corpus ? await loadStatusSnapshot(corpus.hash, queryKey, STATUS_SNAPSHOT_SEMANTIC_KEY) : null
       const payload = (snapshot ?? await buildMenubarPayloadForRange(periodInfo, {

@@ -789,6 +789,17 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
           // A partial answer is never memoized. The roots stay quiet while the
           // fill converges, so a memo hit would pin the client to the first
           // paint for the whole memo cap.
+          //
+          // Same invariant, stated generally: nothing DELIBERATELY DEFERRED
+          // may enter this memo. A deferred answer is stale by construction
+          // and the event that would retire it has already landed, so the
+          // reuse check below it stays 'clean' and replays the stale payload
+          // until the cap. The one deferral a served command had was the
+          // status snapshot's settle window; main.ts now bypasses the whole
+          // snapshot path in this process (SERVE_HYDRATION_ENV), so the only
+          // remaining deferral is the cold first paint, counted right here.
+          // Any future debounce must either be bypassed in serve too or
+          // surface a count like `deferredFiles` for this gate.
           if (configFingerprint !== null && deferredFiles === 0) {
             outputMemo.set(memoKey, createOutputMemoEntry(parseStartedAt, Date.now(), output, configFingerprint, generation))
           }
