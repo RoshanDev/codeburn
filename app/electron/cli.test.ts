@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync 
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, join, isAbsolute, relative, win32, posix } from 'node:path'
 
-import { spawnCli, spawnCliAction, spawnEnvFor, spawnSpecFor, startServe, killAll, shutdownAll, CliError, cmdShimArgs, escapeForCmd, nodeManagerDirs, notFoundStage, reapOrphanServe, resolveCodeburnPath, resolveTarget } from './cli'
+import { spawnCli, spawnCliAction, spawnEnvFor, spawnSpecFor, startServe, killAll, serveUsage, shutdownAll, CliError, cmdShimArgs, escapeForCmd, nodeManagerDirs, notFoundStage, reapOrphanServe, resolveCodeburnPath, resolveTarget } from './cli'
 
 let dir: string
 const originalBin = process.env.CODEBURN_BIN
@@ -14,6 +14,7 @@ const originalPathFile = process.env.CODEBURN_CLI_PATH_FILE
 const originalViteUrl = process.env.VITE_DEV_SERVER_URL
 const originalBundled = process.env.CODEBURN_BUNDLED_CLI
 const originalDevRepoRoot = process.env.CODEBURN_DEV_REPO_ROOT
+const originalServeIdle = process.env.CODEBURN_SERVE_IDLE_MS
 
 /**
  * Windows has no catchable SIGTERM: child.kill() is TerminateProcess, which ends the child
@@ -117,6 +118,8 @@ afterEach(() => {
   else process.env.CODEBURN_BUNDLED_CLI = originalBundled
   if (originalDevRepoRoot === undefined) delete process.env.CODEBURN_DEV_REPO_ROOT
   else process.env.CODEBURN_DEV_REPO_ROOT = originalDevRepoRoot
+  if (originalServeIdle === undefined) delete process.env.CODEBURN_SERVE_IDLE_MS
+  else process.env.CODEBURN_SERVE_IDLE_MS = originalServeIdle
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -1310,6 +1313,154 @@ describe('resident serve single-flight', { timeout: 30_000 }, () => {
     expect(after.generation).toBe(1)
     expect(readMaybe(files.startsFile)).toBe('s')
     expect(readMaybe(files.heavyFile)).toBe('hh')
+  })
+})
+
+/** A resident that reports its SIGTERM before exiting, so a retire is observable
+ * without probing pids (a signalled child is briefly a zombie, which answers
+ * `kill(pid, 0)`). `--slow` delays one answer; `lateExitMs` holds the exit open
+ * past the replacement's start. */
+function fakeRetiringBin(lateExitMs = 0): {
+  startsFile: string
+  deathsFile: string
+  oneShotsFile: string
+} {
+  const startsFile = join(dir, 'retire-starts')
+  const deathsFile = join(dir, 'retire-deaths')
+  const oneShotsFile = join(dir, 'retire-one-shots')
+  fakeBin(
+    'retiring-resident.js',
+    `const fs = require('node:fs'); const readline = require('node:readline');
+     const command = process.argv[2];
+     if (command === 'serve') {
+       fs.appendFileSync(${JSON.stringify(startsFile)}, 's');
+       const generation = fs.readFileSync(${JSON.stringify(startsFile)}, 'utf8').length;
+       process.on('SIGTERM', () => {
+         fs.appendFileSync(${JSON.stringify(deathsFile)}, 'x');
+         setTimeout(() => process.exit(0), ${lateExitMs});
+       });
+       const rl = readline.createInterface({ input: process.stdin });
+       rl.on('line', line => {
+         const request = JSON.parse(line);
+         const answer = () => process.stdout.write(JSON.stringify({
+           id: request.id,
+           ok: true,
+           output: JSON.stringify({ via: 'serve', generation }),
+           usage: generation === 1 ? { cpuSec: 12, rssMb: 1234 } : { cpuSec: 1, rssMb: 10 },
+         }) + '\\n');
+         if (request.args.includes('--slow')) setTimeout(answer, 300); else answer();
+       });
+     } else if (command === 'currency') {
+       process.stdout.write('currency updated');
+     } else {
+       fs.appendFileSync(${JSON.stringify(oneShotsFile)}, 'o');
+       process.stdout.write(JSON.stringify({ via: 'spawn' }));
+     }`,
+  )
+  return { startsFile, deathsFile, oneShotsFile }
+}
+
+describe('resident serve idle retire', { timeout: 30_000 }, () => {
+  beforeEach(() => { process.env.CODEBURN_SERVE_IDLE_MS = '50' })
+
+  posixOnly('retires an idle child and serves the next request from a new resident', async () => {
+    const files = fakeRetiringBin()
+    startServe()
+
+    await expect(spawnCli(['status', '--warm'], { timeoutMs: 5_000 })).resolves.toEqual({ via: 'serve', generation: 1 })
+    await waitFor(() => readMaybe(files.deathsFile) === 'x')
+
+    await expect(spawnCli(['status', '--after-retire'], { timeoutMs: 5_000 })).resolves.toEqual({ via: 'serve', generation: 2 })
+    expect(readMaybe(files.startsFile)).toBe('ss')
+    expect(readMaybe(files.oneShotsFile)).toBe('')
+  })
+
+  posixOnly('never spends the unexpected-death budget, however often it retires', async () => {
+    const files = fakeRetiringBin()
+    startServe()
+
+    for (let round = 1; round <= 5; round += 1) {
+      await expect(spawnCli(['status', '--round', String(round)], { timeoutMs: 5_000 }))
+        .resolves.toEqual({ via: 'serve', generation: round })
+      await waitFor(() => readMaybe(files.deathsFile).length === round)
+    }
+
+    // Three unexpected deaths disable serve for the app run; retires are
+    // deliberate, so the sixth request still reaches a resident.
+    await expect(spawnCli(['status', '--sixth'], { timeoutMs: 5_000 })).resolves.toEqual({ via: 'serve', generation: 6 })
+    expect(readMaybe(files.oneShotsFile)).toBe('')
+  })
+
+  posixOnly('never retires a child with a request in flight or queued behind one', async () => {
+    const files = fakeRetiringBin()
+    startServe()
+
+    // The slow answer takes 6 idle windows; the queued request takes its turn in
+    // the microtask right after it, which is the one moment a timer could slip in.
+    const slow = spawnCli(['status', '--slow'], { timeoutMs: 5_000 })
+    const queued = spawnCli(['models', '--queued'], { timeoutMs: 5_000 })
+
+    await expect(slow).resolves.toEqual({ via: 'serve', generation: 1 })
+    await expect(queued).resolves.toEqual({ via: 'serve', generation: 1 })
+    expect(readMaybe(files.deathsFile)).toBe('')
+    expect(readMaybe(files.oneShotsFile)).toBe('')
+
+    await waitFor(() => readMaybe(files.deathsFile) === 'x')
+    expect(readMaybe(files.startsFile)).toBe('s')
+  })
+
+  posixOnly('keeps the serve usage peak across a retire', async () => {
+    const files = fakeRetiringBin()
+    startServe()
+
+    await spawnCli(['status', '--peak'], { timeoutMs: 5_000 })
+    await waitFor(() => readMaybe(files.deathsFile) === 'x')
+    await spawnCli(['status', '--after-peak'], { timeoutMs: 5_000 })
+
+    // app_close reports what the resident cost, so a replacement's counters
+    // restarting at zero must not erase the peak.
+    expect(serveUsage()).toEqual({ cpuSec: 12, rssMb: 1234 })
+  })
+
+  posixOnly('keeps the child resident for good when the idle window is 0', async () => {
+    process.env.CODEBURN_SERVE_IDLE_MS = '0'
+    const files = fakeRetiringBin()
+    startServe()
+
+    await spawnCli(['status', '--no-retire'], { timeoutMs: 5_000 })
+    await new Promise(resolve => setTimeout(resolve, 250))
+
+    expect(readMaybe(files.deathsFile)).toBe('')
+    await expect(spawnCli(['status', '--still-warm'], { timeoutMs: 5_000 })).resolves.toEqual({ via: 'serve', generation: 1 })
+    expect(readMaybe(files.startsFile)).toBe('s')
+  })
+
+  posixOnly('ignores a retired child that exits only after its replacement is serving', async () => {
+    const files = fakeRetiringBin(200)
+    startServe()
+
+    await spawnCli(['status', '--warm'], { timeoutMs: 5_000 })
+    await waitFor(() => readMaybe(files.deathsFile) === 'x')
+
+    // The retired child's exit and stdout EOF land while the replacement is
+    // mid-request: they must reject nothing and requeue nothing.
+    await expect(spawnCli(['status', '--slow'], { timeoutMs: 5_000 })).resolves.toEqual({ via: 'serve', generation: 2 })
+    expect(readMaybe(files.startsFile)).toBe('ss')
+    expect(readMaybe(files.oneShotsFile)).toBe('')
+  })
+
+  posixOnly('leaves one child behind when a mutation restart lands in the idle window', async () => {
+    const files = fakeRetiringBin()
+    startServe()
+
+    await expect(spawnCli(['status', '--before'], { timeoutMs: 5_000 })).resolves.toEqual({ via: 'serve', generation: 1 })
+    await expect(spawnCliAction(['currency', 'EUR'], { timeoutMs: 5_000 })).resolves.toMatchObject({ ok: true })
+    // Issued without yielding to the timer queue: whichever of the retire and
+    // the restart ran first, exactly one child is alive to answer this.
+    await expect(spawnCli(['status', '--after'], { timeoutMs: 5_000 })).resolves.toEqual({ via: 'serve', generation: 2 })
+
+    expect(readMaybe(files.startsFile)).toBe('ss')
+    expect(readMaybe(files.oneShotsFile)).toBe('')
   })
 })
 

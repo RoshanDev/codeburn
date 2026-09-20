@@ -685,6 +685,8 @@ async function runScheduledCli(
 //    runs an artificial warm-up query beside a duplicate one-shot child;
 //  - progress frames from serve are forwarded through the same onStderr hook
 //    used by a one-shot cold start;
+//  - a child left idle for CODEBURN_SERVE_IDLE_MS retires; the next request
+//    restarts one through the same lazy path a crash uses;
 //  - any serve failure falls back to a normal spawn for that call;
 //  - three child deaths permanently disable serve for this app run.
 const SERVE_ROUTED = new Set(['status', 'models', 'sessions', 'compare', 'yield', 'spend', 'optimize', 'audit', 'report'])
@@ -712,6 +714,14 @@ class ServeClient {
   private warmed = false
   private destroyed = false
   private requestTail: Promise<void> = Promise.resolve()
+  private idleTimer: NodeJS.Timeout | undefined
+  // The renderer stops polling while the window is hidden, so an idle resident
+  // would otherwise hold its parsed cache (GBs on a large corpus) forever. After
+  // this much silence the child retires; the next request restarts it through
+  // the lazy path in spawnCli. 0 (or garbage) keeps the child resident for good.
+  // 15 minutes: longer than the slowest cadence a visible window can use (10 min),
+  // so only a window nobody is looking at gives the child up.
+  private readonly idleMs = Number(process.env.CODEBURN_SERVE_IDLE_MS ?? 900_000)
 
   constructor(private readonly spec: SpawnSpec, private readonly pidFile?: string) {}
 
@@ -745,6 +755,28 @@ class ServeClient {
       this.onDeath(child)
       killGracefully(child)
     })
+    this.armIdle()
+  }
+
+  /** (Re)start the retire countdown, and cancel any older one. Only an idle,
+   *  running client arms it, so a request in flight can never be retired out
+   *  from under its caller, and a stale timer from a previous generation is
+   *  always cleared by the start/death that replaced it. */
+  private armIdle(): void {
+    clearTimeout(this.idleTimer)
+    if (!(this.idleMs > 0) || this.pending.size > 0 || !this.child) return
+    this.idleTimer = setTimeout(() => {
+      const child = this.child
+      // A request admitted after the timer was armed clears it, but re-check
+      // anyway: nothing else may kill a child that has work on the wire.
+      if (this.pending.size > 0 || !child) return
+      // Deliberate, like a mutation restart: detach first so the exit event
+      // cannot spend the unexpected-death budget, then let it release its cache
+      // lock on SIGTERM. No restart here — the next request lazily starts one.
+      this.onDeath(child, false)
+      killGracefully(child)
+    }, this.idleMs)
+    this.idleTimer.unref?.()
   }
 
   private onData(child: ReturnType<typeof spawn>, chunk: string): void {
@@ -796,6 +828,7 @@ class ServeClient {
       } else {
         waiter.reject(new CliError('nonzero', msg.error ?? 'serve request failed'))
       }
+      this.armIdle()
     }
     // Complete lines are bounded above before parsing. Bound the partial frame
     // too, otherwise a child that never emits '\n' can grow this buffer forever.
@@ -849,6 +882,9 @@ class ServeClient {
       waiter.reject(new CliError('nonzero', 'codeburn serve exited'))
     }
     this.pending.clear()
+    // No child left to retire: this only cancels a timer armed for the one that
+    // just went away, so a later generation cannot inherit its countdown.
+    this.armIdle()
   }
 
   restartAfterMutation(): void {
@@ -875,6 +911,7 @@ class ServeClient {
   }
 
   private requestNow(args: string[], timeoutMs: number, onStderr?: (chunk: string) => void): Promise<unknown> {
+    clearTimeout(this.idleTimer)
     const child = this.child
     if (!child?.stdin) return Promise.reject(new CliError('nonzero', 'serve not running'))
     const id = this.nextId++
@@ -915,6 +952,7 @@ class ServeClient {
   }
 
   destroy(): ChildProcess | null {
+    clearTimeout(this.idleTimer)
     this.destroyed = true
     this.deaths = SERVE_MAX_RESTARTS
     const child = this.child
