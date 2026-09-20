@@ -714,3 +714,9 @@
 "%1$@ · %2$@ at 80%%" = "%1$@ · %2$@ 80%% 도달";
 "%1$@ · %2$@ limit reached" = "%1$@ · %2$@ 한도 도달";
 "Quota crossings (%1$lld%% and %2$lld%%)" = "할당량 임계값 알림 (%1$lld%% 및 %2$lld%%)";
+
+/* MARK: Privacy */
+"Privacy" = "개인정보";
+"Anonymous usage statistics" = "익명 사용 통계";
+"Controlled in the CodeBurn desktop app." = "CodeBurn 데스크톱 앱에서 관리됩니다.";
+"Optional usage statistics: model mix, task success, performance and errors. The daily report includes the names of the models, tools, skills and MCP servers you use, alongside bucketed counts of how often each one came up. Never your prompts, your code, or your project and file names." = "선택적 사용 통계입니다: 모델 구성, 작업 성공률, 성능 및 오류. 일일 보고서에는 사용한 모델, 도구, 스킬, MCP 서버의 이름과 각 항목이 나타난 횟수를 구간별로 집계한 값이 포함됩니다. 프롬프트, 코드, 프로젝트 및 파일 이름은 절대 포함되지 않습니다.";

@@ -714,3 +714,9 @@
 "%1$@ · %2$@ at 80%%" = "%1$@ · %2$@ à 80%%";
 "%1$@ · %2$@ limit reached" = "%1$@ · %2$@ limite atteinte";
 "Quota crossings (%1$lld%% and %2$lld%%)" = "Franchissements de quota (%1$lld%% et %2$lld%%)";
+
+/* MARK: Privacy */
+"Privacy" = "Confidentialité";
+"Anonymous usage statistics" = "Statistiques d'usage anonymes";
+"Controlled in the CodeBurn desktop app." = "Géré dans l'application de bureau CodeBurn.";
+"Optional usage statistics: model mix, task success, performance and errors. The daily report includes the names of the models, tools, skills and MCP servers you use, alongside bucketed counts of how often each one came up. Never your prompts, your code, or your project and file names." = "Statistiques d'usage optionnelles : répartition des modèles, réussite des tâches, performance et erreurs. Le rapport quotidien inclut les noms des modèles, outils, compétences et serveurs MCP utilisés, avec des compteurs groupés indiquant leur fréquence d'apparition. Jamais vos prompts, votre code, ni les noms de vos projets et fichiers.";

@@ -87,6 +87,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     private var providerSettingsObserver: NSObjectProtocol?
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Bounded by its own timeout, so a slow network can never hold up quit.
+        Telemetry.shared.flushOnQuit()
         // Synchronously, before the actor hop: the app can exit before a
         // detached Task is ever scheduled, and a serve child that outlives us
         // is the orphan in #1117. shutdown() still runs for the tidy case.
@@ -167,6 +169,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         observeSubscriptionDisconnect()
         observeCapacityDockProviderSettingsRequests()
         setupUpdateNotifications()
+        Telemetry.shared.start()
         Task { await updateChecker.checkIfNeeded() }
     }
 
@@ -1684,6 +1687,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
                 popover.contentViewController = makePopoverContent()
             }
             store.menuPopoverVisible = true
+            Telemetry.shared.track("popover_open")
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             if let window = popover.contentViewController?.view.window {
                 // Pin the popover's window above the status-bar layer but tag
@@ -1806,6 +1810,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     }
 
     @objc private func openSettings() {
+        Telemetry.shared.track("settings_open")
         // Accessory-policy apps (no Dock icon, no main menu) don't get the
         // SwiftUI Settings scene wired into the responder chain reliably, so
         // the standard `showSettingsWindow:` selector silently no-ops. We host

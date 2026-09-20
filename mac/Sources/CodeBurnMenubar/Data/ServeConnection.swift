@@ -152,6 +152,7 @@ actor ServeConnection {
         // keeps a closed child stdin on the normal throwable EPIPE path.
         guard Darwin.fcntl(stdinWriter.fileDescriptor, F_SETNOSIGPIPE, 1) == 0 else {
             disabled = true
+            NSLog("CodeBurn: resident CLI disabled for this app run — could not suppress SIGPIPE on the child's stdin; every refresh now spawns a cold CLI")
             return
         }
         let stdoutPipe = Pipe()
@@ -163,6 +164,7 @@ actor ServeConnection {
             try child.run()
         } catch {
             disabled = true // spawn path can't produce the binary either better than makeProcess did
+            NSLog("CodeBurn: resident CLI disabled for this app run — the serve child failed to launch: \(error); every refresh now spawns a cold CLI")
             return
         }
         process = child

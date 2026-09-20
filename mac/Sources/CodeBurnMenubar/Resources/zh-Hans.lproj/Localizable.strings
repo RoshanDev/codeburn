@@ -712,3 +712,9 @@
 "%1$@ · %2$@ at 80%%" = "%1$@ · %2$@ 已达 80%%";
 "%1$@ · %2$@ limit reached" = "%1$@ · %2$@ 已达上限";
 "Quota crossings (%1$lld%% and %2$lld%%)" = "配额跨越（%1$lld%% 与 %2$lld%%）";
+
+/* MARK: Privacy */
+"Privacy" = "隐私";
+"Anonymous usage statistics" = "匿名使用统计";
+"Controlled in the CodeBurn desktop app." = "由 CodeBurn 桌面应用管理。";
+"Optional usage statistics: model mix, task success, performance and errors. The daily report includes the names of the models, tools, skills and MCP servers you use, alongside bucketed counts of how often each one came up. Never your prompts, your code, or your project and file names." = "可选的使用统计信息:模型分布、任务成功率、性能和错误。每日报告包含您使用的模型、工具、技能和 MCP 服务器的名称,以及每项出现频率的分段计数。绝不包含您的提示词、代码或项目与文件名称。";

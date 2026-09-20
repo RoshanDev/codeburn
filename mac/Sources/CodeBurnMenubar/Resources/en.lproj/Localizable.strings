@@ -721,3 +721,9 @@
 "%1$@ · %2$@ at 80%%" = "%1$@ · %2$@ at 80%%";
 "%1$@ · %2$@ limit reached" = "%1$@ · %2$@ limit reached";
 "Quota crossings (%1$lld%% and %2$lld%%)" = "Quota crossings (%1$lld%% and %2$lld%%)";
+
+/* MARK: Privacy */
+"Privacy" = "Privacy";
+"Anonymous usage statistics" = "Anonymous usage statistics";
+"Controlled in the CodeBurn desktop app." = "Controlled in the CodeBurn desktop app.";
+"Optional usage statistics: model mix, task success, performance and errors. The daily report includes the names of the models, tools, skills and MCP servers you use, alongside bucketed counts of how often each one came up. Never your prompts, your code, or your project and file names." = "Optional usage statistics: model mix, task success, performance and errors. The daily report includes the names of the models, tools, skills and MCP servers you use, alongside bucketed counts of how often each one came up. Never your prompts, your code, or your project and file names.";
