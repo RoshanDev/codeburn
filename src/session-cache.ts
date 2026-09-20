@@ -74,6 +74,8 @@ export type CachedCall = {
   // depend on the `:obs:` key regex alone. Copilot still assigns the flag
   // at serve time and does not persist it.
   supplementaryAccounting?: boolean
+  // Requests this one call stands for (see ParsedProviderCall.requestCount).
+  requestCount?: number
   // Billing route id the provider recorded (see ParsedProviderCall).
   // Persisted so the row key survives the cache; a cached call without it is
   // a direct-door call or one parsed before the provider carried the column
@@ -809,6 +811,7 @@ function validateCall(c: unknown): c is CachedCall {
     && isOptionalNum(o['toolErrors'])
     && isOptionalNum(o['editFailed'])
     && isOptionalBool(o['supplementaryAccounting'])
+    && isOptionalNum(o['requestCount'])
     && isOptionalString(o['route'])
     && (o['billing'] === undefined || parseBillingMode(o['billing'] as string) !== undefined)
     && validateUsage(o['usage'])

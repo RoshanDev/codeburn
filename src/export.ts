@@ -4,7 +4,7 @@ import { dirname, join, resolve } from 'path'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
 import { getCurrency, convertCost, roundForActiveCurrency } from './currency.js'
 import { dateKey } from './day-aggregator.js'
-import { behavioralTurnCount, isBehavioralCall } from './behavioral-weight.js'
+import { behavioralCallWeight, behavioralTurnCount } from './behavioral-weight.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
 import { callBillableOutputTokens, sessionModelBillableOutputTokens } from './session-output.js'
 
@@ -64,7 +64,7 @@ function buildDailyRows(projects: ProjectSummary[], period: string): Row[] {
           // Same weight rule as aggregateProjectsIntoDays: a supplementary
           // accounting call carries cost/tokens but is not a distinct request,
           // so daily.csv call counts must reconcile with summary.csv.
-          if (isBehavioralCall(call)) daily[day].calls++
+          daily[day].calls += behavioralCallWeight(call)
           daily[day].input += call.usage.inputTokens
           daily[day].output += callBillableOutputTokens(call)
           daily[day].cacheRead += call.usage.cacheReadInputTokens

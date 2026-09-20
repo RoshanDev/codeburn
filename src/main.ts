@@ -16,7 +16,7 @@ import { toDateString } from './daily-cache.js'
 import { statusSnapshotSemanticKey } from './status-snapshot-semantic.js'
 import { dateKey } from './day-aggregator.js'
 import { inferSessionProvider } from './session-output.js'
-import { isBehavioralCall } from './behavioral-weight.js'
+import { behavioralCallWeight } from './behavioral-weight.js'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import type { AppliedFix } from './act/types.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
@@ -51,7 +51,7 @@ import {
   runAgyStatusLineHook,
   uninstallAntigravityStatusLineHook,
 } from './antigravity-statusline.js'
-import { clearPlan, readConfig, readPlan, readPlans, saveConfig, savePlan, getConfigFilePath, type CodeburnConfig, type Plan, type PlanId, type PlanProvider } from './config.js'
+import { clearPlan, readConfig, readPlan, readPlans, saveConfig, savePlan, getConfigFilePath, setIncludeGatewayInTotals, gatewayIncludedInTotals, type CodeburnConfig, type Plan, type PlanId, type PlanProvider } from './config.js'
 import { clampResetDay, copilotCreditsNote, getPlanUsageOrNull, getPlanUsages, type PlanUsage } from './plan-usage.js'
 import { getPresetPlan, isPlanId, isPlanProvider, PLAN_IDS, PLAN_PROVIDERS, planDisplayName } from './plans.js'
 import { createRequire } from 'node:module'
@@ -545,6 +545,7 @@ program.hook('preAction', async (thisCommand) => {
   setFlatRateModels(config.flatRateModels ?? [])
   setFlatRateRemoved(config.flatRateModelsRemoved ?? [])
   setProxyPaths(config.proxyPaths ?? [])
+  setIncludeGatewayInTotals(config.includeGatewayInTotals === true)
   if (thisCommand.opts<{ verbose?: boolean }>().verbose) {
     process.env['CODEBURN_VERBOSE'] = '1'
   }
@@ -566,6 +567,7 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
   // out-of-pocket figure. `cost` stays the full billable/would-be amount.
   const totalProxiedUSD = projects.reduce((s, p) => s + p.totalProxiedCostUSD, 0)
   const netCostUSD = totalCostUSD - totalProxiedUSD
+  const excludedGatewayUSD = durable.excludedGatewayCostUSD
   const totalCalls = durable.data.calls
   const totalSessions = durable.data.sessions
   const totalInput = durable.data.inputTokens
@@ -766,6 +768,11 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
       // paths configured, so existing consumers are unaffected.
       proxiedCost: convertCost(totalProxiedUSD),
       netCost: convertCost(netCostUSD),
+      // Vercel AI Gateway spend deliberately NOT in `cost`: its rows are daily
+      // aggregates the local tools routed through the gateway already report,
+      // so adding both double counts. Emitted only when something is actually
+      // excluded, so a report with no gateway credential is unchanged.
+      ...(excludedGatewayUSD > 0 ? { excludedGatewayCost: convertCost(excludedGatewayUSD) } : {}),
       savings: convertCost(totalSavingsUSD),
       // Portion of `cost` priced from estimated tokens (issue #639). Display/
       // metadata only; never subtracted from `cost`. 0 when nothing is estimated.
@@ -1045,6 +1052,7 @@ program
         days: durable.days,
         carriedCostUSD: durable.carriedCostUSD,
         unattributedCostUSD: durable.unattributedCostUSD,
+        excludedGatewayCostUSD: durable.excludedGatewayCostUSD,
       },
     }))
   })
@@ -1238,6 +1246,11 @@ program
         // fetch or a pricing-logic fix can keep serving old rendered costs
         // indefinitely against an unchanged session corpus.
         pricingGenerationKey: getPricingGenerationKey(),
+        // Not a pricing input, but it moves the headline: with it off the
+        // gateway's daily aggregates are held out of every total. A warm
+        // snapshot taken under the other setting would keep serving the wrong
+        // headline until something unrelated moved the corpus.
+        includeGatewayInTotals: gatewayIncludedInTotals(),
       })
       // Optimize findings (the default; see --no-optimize) depend on mutable
       // project/config/prompt/hook state: ~/.claude and project-level
@@ -1336,8 +1349,8 @@ program
       // Savings DOLLARS keep every call, but these are request COUNTS: a
       // supplementary accounting call (copilot rollup / paired store row) can
       // carry configured model-savings too and must not count as a request.
-      const savingsCallsToday = todayProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 && isBehavioralCall(c) ? 1 : 0), 0), 0), 0), 0)
-      const savingsCallsMonth = monthProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 && isBehavioralCall(c) ? 1 : 0), 0), 0), 0), 0)
+      const savingsCallsToday = todayProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 ? behavioralCallWeight(c) : 0), 0), 0), 0), 0)
+      const savingsCallsMonth = monthProjects.reduce((s, p) => s + p.sessions.reduce((s2, sess) => s2 + sess.turns.reduce((s3, turn) => s3 + turn.assistantCalls.reduce((s4, c) => s4 + (c.savingsUSD && c.savingsUSD > 0 ? behavioralCallWeight(c) : 0), 0), 0), 0), 0)
       if (todayData.savingsUSD > 0 || monthData.savingsUSD > 0) {
         payload.localModelSavings = {
           today: payload.today.savings,
@@ -1908,6 +1921,34 @@ program
     await saveConfig(config)
     console.log(`\n  Proxy path saved: ${trimmed}`)
     console.log('  Sessions under it keep their full API-rate cost as the would-be figure; that amount is reported as subscription-covered (net out-of-pocket excludes it).')
+    console.log(`  Config: ${getConfigFilePath()}\n`)
+  })
+
+program
+  .command('gateway-totals [mode]')
+  .description('Include or exclude Vercel AI Gateway spend in headline totals. Gateway reports are daily per-model aggregates with no request identity, so the same spend is usually already counted by the local tools you pointed at the gateway (Claude Code, Codex, OpenCode, Cline/Roo/Kilo, Cursor). Excluded by default; the gateway is always shown as its own row either way. Modes: include, exclude.')
+  .option('--format <format>', 'Output format: text, json', 'text')
+  .action(async (mode?: string, opts?: { format?: string }) => {
+    const format = opts?.format ?? 'text'
+    assertFormat(format, ['text', 'json'], 'gateway-totals')
+    const config = await readConfig()
+    if (mode !== undefined) {
+      if (mode !== 'include' && mode !== 'exclude') {
+        console.error(`\n  Usage: codeburn gateway-totals [include|exclude] (got: ${mode})\n`)
+        process.exitCode = 1
+        return
+      }
+      config.includeGatewayInTotals = mode === 'include' ? true : undefined
+      await saveConfig(config)
+    }
+    const included = config.includeGatewayInTotals === true
+    if (format === 'json') {
+      console.log(JSON.stringify({ includeGatewayInTotals: included }, null, 2))
+      return
+    }
+    console.log(included
+      ? '\n  Vercel AI Gateway spend is INCLUDED in headline totals.\n  Its daily aggregates may duplicate spend your local tools already report.\n  Exclude it with: codeburn gateway-totals exclude'
+      : '\n  Vercel AI Gateway spend is EXCLUDED from headline totals (default).\n  It is still shown as its own provider row.\n  Include it with: codeburn gateway-totals include')
     console.log(`  Config: ${getConfigFilePath()}\n`)
   })
 

@@ -6,7 +6,7 @@ import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types
 import { formatCost as baseCost, getCurrency } from './currency.js'
 import { findUnpricedModels, modelRowKey, unpricedModelHint } from './models.js'
 import { callBillableOutputTokens, sessionBillableOutputTokens, sessionModelBillableOutputTokens } from './session-output.js'
-import { markEstimated } from './format.js'
+import { markEstimated, excludedGatewayNote } from './format.js'
 import { maxOf } from './math-utils.js'
 import { formatSessionCount, SESSION_COUNT_HELP, type SessionCountBasis } from './session-count-label.js'
 import { normalizeAbsProjectPathKey } from './parser.js'
@@ -122,6 +122,9 @@ export type OverviewDurable = {
   /// Cost a --project/--exclude filter could not attribute (cached days with no
   /// per-project split). Optional so callers that never filter can omit it.
   unattributedCostUSD?: number
+  /// Gateway spend shown in the provider list but deliberately not in `cost`.
+  /// Optional so callers that never build it can omit it.
+  excludedGatewayCostUSD?: number
 }
 
 export function renderOverview(
@@ -398,6 +401,9 @@ export function renderOverview(
   if (durable && (durable.unattributedCostUSD ?? 0) > 0) {
     out.push(c.dim(`  excludes ${formatCost(durable.unattributedCostUSD!)} from days with no per-project history`))
   }
+
+  const gatewayNote = excludedGatewayNote(durable?.excludedGatewayCostUSD ?? 0)
+  if (gatewayNote) out.push(c.dim(`  ${gatewayNote}`))
 
   return out.join('\n') + '\n'
 }

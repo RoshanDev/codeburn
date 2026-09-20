@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events'
 import React, { Fragment, useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { render, Box, Text, measureElement, useInput, useApp, useWindowSize, type DOMElement, type Instance, type RenderOptions } from 'ink'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
-import { formatCost, formatTokens, markEstimated, carriedCostNote } from './format.js'
+import { formatCost, formatTokens, markEstimated, carriedCostNote, excludedGatewayNote } from './format.js'
 import { maxOf } from './math-utils.js'
 import { formatSessionCount } from './session-count-label.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
@@ -373,6 +373,9 @@ export type DurableOverview = {
   // its total may exceed what the (live-scan-bounded) Daily Activity panel
   // below can show. See carriedCostNote in format.ts.
   carriedCostUSD: number
+  // Gateway spend shown in the provider list but held out of `cost`.
+  // See excludedGatewayNote in format.ts.
+  excludedGatewayCostUSD: number
 }
 
 function getDurableRange(period: Period, customRange: DateRange | null | undefined, day: string | null): DateRange {
@@ -388,7 +391,7 @@ async function computeDurableOverview(
   day: string | null,
 ): Promise<DurableOverview> {
   const range = getDurableRange(period, customRange, day)
-  const { data, carriedCostUSD } = await buildDurablePeriod(
+  const { data, carriedCostUSD, excludedGatewayCostUSD } = await buildDurablePeriod(
     { range, label: PERIOD_LABELS[period] },
     { provider, project: projectFilter ?? [], exclude: excludeFilter ?? [] },
   )
@@ -403,6 +406,7 @@ async function computeDurableOverview(
     cacheReadTokens: data.cacheReadTokens,
     cacheWriteTokens: data.cacheWriteTokens,
     carriedCostUSD,
+    excludedGatewayCostUSD,
   }
 }
 
@@ -637,6 +641,9 @@ function Overview({ projects, label, width, planUsages, durable }: { projects: P
       )}
       {durable && carriedCostNote(durable.carriedCostUSD) && (
         <Text dimColor wrap="truncate-end">  {carriedCostNote(durable.carriedCostUSD)}</Text>
+      )}
+      {durable && excludedGatewayNote(durable.excludedGatewayCostUSD) && (
+        <Text dimColor wrap="truncate-end">  {excludedGatewayNote(durable.excludedGatewayCostUSD)}</Text>
       )}
       {activePlanUsages.length > 0 && (
         <>

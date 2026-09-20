@@ -89,6 +89,11 @@ export type ParsedProviderCall = {
   // Hermes observation-time deltas persist this flag (and reconstruct it at
   // serve time from a `:obs:` key). Copilot still assigns it only at serve time.
   supplementaryAccounting?: boolean
+  // How many requests this one call stands for. Set only by a provider whose
+  // API publishes daily aggregates rather than per-request records (Vercel AI
+  // Gateway's `request_count`); absent everywhere else, which means 1. Cost and
+  // tokens stay whole on the call — this moves request counters only.
+  requestCount?: number
   // Billing route the provider recorded for this call, as a route id from
   // `src/models.ts` ROUTES (`bedrock`). Set only from a provider's own
   // endpoint column (Hermes `billing_provider`); when absent, the model id's

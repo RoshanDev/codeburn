@@ -1370,6 +1370,40 @@ describe('codeburn status --format menubar-json', () => {
     }
   })
 
+  it('invalidates the snapshot when the gateway totals opt-in flips', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-gateway-optin-'))
+
+    try {
+      const projectDir = join(home, '.claude', 'projects', 'myapp')
+      await mkdir(projectDir, { recursive: true })
+      const now = new Date()
+      const todayUtcMidnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
+      const base = new Date(Math.max(todayUtcMidnight, now.getTime() - 2 * 3600_000))
+      const ts = (offset: number) => new Date(base.getTime() + offset).toISOString().replace(/\.\d+Z$/, 'Z')
+      await writeFile(
+        join(projectDir, 'session.jsonl'),
+        [userLine('s1', ts(0)), assistantLine('s1', ts(60_000), 'msg-1')].join('\n'),
+      )
+
+      const args = ['status', '--format', 'menubar-json', '--period', 'today', '--provider', 'all', '--no-optimize']
+      const cacheDir = join(home, '.cache', 'codeburn')
+
+      expect(runCli(args, home).status).toBe(0)
+      expect(findSnapshotFiles(cacheDir)).toHaveLength(1)
+      // An identical query reuses the record rather than writing a second one.
+      expect(runCli(args, home).status).toBe(0)
+      expect(findSnapshotFiles(cacheDir)).toHaveLength(1)
+
+      // The opt-in moves the headline without touching a session file or any
+      // pricing config, so it has to be part of the snapshot's query key.
+      expect(runCli(['gateway-totals', 'include'], home).status).toBe(0)
+      expect(runCli(args, home).status).toBe(0)
+      expect(findSnapshotFiles(cacheDir)).toHaveLength(2)
+    } finally {
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
   it('never persists or serves the default optimize-enabled payload from the status snapshot', async () => {
     const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-optimize-cache-'))
 

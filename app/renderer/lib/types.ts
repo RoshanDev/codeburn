@@ -229,7 +229,7 @@ export type MenubarPayload = {
     // Optional: older CLIs omit it. `id` is the internal provider name (round-trips
     // as --provider), `label` the display name. `hasUsage` distinguishes active $0
     // providers from detected-but-idle providers when present.
-    providerDetails?: Array<{ id: string; label: string; cost: number; calls?: number; hasUsage?: boolean; sessions?: number; sessionCountBasis?: 'identity' | 'partial' }>
+    providerDetails?: Array<{ id: string; label: string; cost: number; calls?: number; hasUsage?: boolean; excludedFromTotal?: boolean; sessions?: number; sessionCountBasis?: 'identity' | 'partial' }>
     topProjects: Array<{
       id?: string
       name: string

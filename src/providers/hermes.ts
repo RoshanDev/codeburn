@@ -724,6 +724,10 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
         )
 
         const cost = resolveHermesCost(row, model, tokens)
+        // Decided rule: a session's cost delta lands on the day it is OBSERVED
+        // (`observedAt`), not the day the session started. A mid-session price
+        // change therefore shows up on the observation day, and a sealed day is
+        // never rewritten to reprice it.
         const cursor = await recordHermesSnapshot({
           profile,
           sessionId: row.id,

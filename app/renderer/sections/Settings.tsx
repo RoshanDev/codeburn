@@ -304,7 +304,7 @@ function ProvidersPane({ refreshToken }: { refreshToken: number }) {
   const providers = detectedProviders(overview.data?.current)
   return <section className="set-p on">
     <div><h3 className="set-h">{t('settings.providers.heading')}</h3><p className="set-sub">{t('settings.providers.subtitle')}</p></div>
-    {overview.error ? <SettingsErrorText error={overview.error} /> : !overview.data ? <p className="set-cap">{t('settings.providers.loading')}</p> : providers.length === 0 ? <p className="set-cap">{t('settings.providers.empty')}</p> : providers.map(entry => <div className="card" key={entry.id}><div className="set-prov-head"><ProviderLogo provider={entry.id} /><span className="set-prov-name">{entry.label}</span><span className="set-status"><span className={entry.idle ? 'set-dot' : 'set-dot ok'} />{entry.idle ? t('settings.providers.idle') : t('settings.providers.detected', { cost: formatUsd(entry.cost) })}</span></div></div>)}
+    {overview.error ? <SettingsErrorText error={overview.error} /> : !overview.data ? <p className="set-cap">{t('settings.providers.loading')}</p> : providers.length === 0 ? <p className="set-cap">{t('settings.providers.empty')}</p> : providers.map(entry => <div className="card" key={entry.id}><div className="set-prov-head"><ProviderLogo provider={entry.id} /><span className="set-prov-name">{entry.label}</span><span className="set-status"><span className={entry.idle ? 'set-dot' : 'set-dot ok'} />{entry.idle ? t('settings.providers.idle') : t('settings.providers.detected', { cost: formatUsd(entry.cost) })}{entry.excludedFromTotal ? <span className="set-cap" title={t('settings.providers.notInTotalHint')}> · {t('settings.providers.notInTotal')}</span> : null}</span></div></div>)}
   </section>
 }
 

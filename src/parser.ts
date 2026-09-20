@@ -46,7 +46,7 @@ import { classifyWslCachePath, isWslUncPath, refreshWslHomes, wslMode } from './
 import { decideParseWorkers, parseFilesInOrder, ParseWorkerPool, type ClaudeWorkerParse, type ParseJob } from './parse-workers.js'
 import type { CodexFullParse } from './providers/codex.js'
 import { dateKey } from './day-aggregator.js'
-import { isBehavioralCall, isBehavioralTurn } from './behavioral-weight.js'
+import { behavioralCallWeight, isBehavioralTurn } from './behavioral-weight.js'
 import type { ParsedProviderCall, Provider, SessionSource } from './providers/types.js'
 import type {
   ApiUsageIteration,
@@ -1798,7 +1798,7 @@ function buildSessionSummary(
       totalCacheWrite += call.usage.cacheCreationInputTokens
       // Supplementary accounting calls contribute tokens/cost above but are
       // not distinct requests: no api-call or per-model call weight.
-      if (isBehavioralCall(call)) apiCalls++
+      apiCalls += behavioralCallWeight(call)
 
       const modelKey = call.provider === 'devin' ? call.model : modelRowKey(call.model, call.route)
       if (!modelBreakdown[modelKey]) {
@@ -1810,7 +1810,7 @@ function buildSessionSummary(
           tokens: { inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0, webSearchRequests: 0 },
         }
       }
-      if (isBehavioralCall(call)) modelBreakdown[modelKey].calls++
+      modelBreakdown[modelKey].calls += behavioralCallWeight(call)
       modelBreakdown[modelKey].costUSD += call.costUSD
       modelBreakdown[modelKey].savingsUSD += callSavings
       modelBreakdown[modelKey].estimatedCostUSD = (modelBreakdown[modelKey].estimatedCostUSD ?? 0) + callEstimated
@@ -2570,6 +2570,7 @@ function providerCallToTurn(call: ParsedProviderCall): ParsedTurn {
     deduplicationKey: call.deduplicationKey,
     isEstimated: call.costIsEstimated,
     ...(call.nanoAiu != null ? { nanoAiu: call.nanoAiu } : {}),
+    ...(call.requestCount != null ? { requestCount: call.requestCount } : {}),
     ...(call.route ? { route: call.route } : {}),
     ...(call.billing ? { billing: call.billing } : {}),
   })
@@ -2619,6 +2620,7 @@ function providerCallToCachedCall(call: ParsedProviderCall): CachedCall {
     ...(call.locRemoved ? { locRemoved: call.locRemoved } : {}),
     ...(call.editFailed ? { editFailed: call.editFailed } : {}),
     ...(call.nanoAiu != null ? { nanoAiu: call.nanoAiu } : {}),
+    ...(call.requestCount != null ? { requestCount: call.requestCount } : {}),
     ...(call.route ? { route: call.route } : {}),
     ...(call.billing ? { billing: call.billing } : {}),
     ...(call.requestMultiplier != null ? { requestMultiplier: call.requestMultiplier } : {}),
@@ -2790,6 +2792,7 @@ function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
     activeGeneratedTokens: call.activeGeneratedTokens,
     toolWaitMs: call.toolWaitMs,
     ...(call.nanoAiu != null ? { nanoAiu: call.nanoAiu } : {}),
+    ...(call.requestCount != null ? { requestCount: call.requestCount } : {}),
     ...(call.route ? { route: call.route } : {}),
     ...(call.billing ? { billing: call.billing } : {}),
     ...(call.supplementaryAccounting || isHermesObservationKey(call.deduplicationKey)

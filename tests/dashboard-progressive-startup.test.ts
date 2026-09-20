@@ -277,6 +277,7 @@ describe('interactive dashboard progressive startup', () => {
         cacheReadTokens: expected.data.cacheReadTokens,
         cacheWriteTokens: expected.data.cacheWriteTokens,
         carriedCostUSD: expected.carriedCostUSD,
+        excludedGatewayCostUSD: expected.excludedGatewayCostUSD,
       })
       expect(selected.projects.flatMap(project => project.sessions).map(session => session.sessionId).sort())
         .toEqual(expected.liveProjects.flatMap(project => project.sessions).map(session => session.sessionId).sort())
