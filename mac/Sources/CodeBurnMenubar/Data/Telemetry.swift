@@ -71,16 +71,25 @@ enum TelemetryConsentSource: String, Sendable {
 struct TelemetryConsent: Equatable, Sendable {
     let source: TelemetryConsentSource
     let installID: String
+    /// The effective answer: the decision that owns this install, less this
+    /// app's own veto.
     let enabled: Bool
-    /// Only the desktop app asks a consent question, so only its answer can be
-    /// pending. A standalone install's region default *is* its decision, which
-    /// is why nothing gates on this when `source` is `.app`.
-    let onboarded: Bool
+    /// Desktop: that app's consent screen has been answered. App: a decision
+    /// has been recorded here, by the toggle or inherited from a desktop file
+    /// this app has seen.
+    let decided: Bool
+    /// The desktop app's own answer is no. The local toggle can veto that app's
+    /// yes; it can never overturn its no, so the toggle reads as a readout.
+    let lockedOff: Bool
 
-    var canTrack: Bool {
+    /// `requiresExplicitDecision` is the one expression standing between
+    /// today's behaviour and "a standalone install must be asked first": see
+    /// `Telemetry.standaloneRequiresExplicitDecision`.
+    func canTrack(requiresExplicitDecision: Bool) -> Bool {
+        guard enabled else { return false }
         switch source {
-        case .desktop: enabled && onboarded
-        case .app: enabled
+        case .desktop: return decided
+        case .app: return decided || !requiresExplicitDecision
         }
     }
 }
@@ -133,7 +142,34 @@ protocol TelemetryTransport: Sendable {
     )
 }
 
-struct URLSessionTelemetryTransport: TelemetryTransport {
+/// A session of this app's own, never `URLSession.shared`.
+///
+/// The shared session carries a process-wide cookie jar and response cache, so
+/// a `Set-Cookie` from the endpoint or from a CDN in front of it would outlive
+/// both an opt-out and the install id that rotates with it — a stable
+/// identifier arriving by the back door. The default User-Agent is a second
+/// one: it spells out the CFNetwork and Darwin kernel build. Ephemeral storage,
+/// no cookies, no cache, a fixed agent, and no redirect followed at all —
+/// `telemetry.rs` pins https across redirects, and refusing them outright is
+/// the same guarantee with less to get wrong.
+final class URLSessionTelemetryTransport: NSObject, TelemetryTransport, URLSessionTaskDelegate, @unchecked Sendable {
+    static func makeConfiguration() -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieAcceptPolicy = .never
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        configuration.tlsMinimumSupportedProtocolVersion = .TLSv12
+        configuration.httpAdditionalHeaders = [
+            "Content-Type": "application/json",
+            "User-Agent": Telemetry.appName,
+        ]
+        return configuration
+    }
+
+    private let session = URLSession(configuration: makeConfiguration())
+
     func post(
         _ body: Data,
         to endpoint: URL,
@@ -142,9 +178,8 @@ struct URLSessionTelemetryTransport: TelemetryTransport {
     ) {
         var request = URLRequest(url: endpoint, timeoutInterval: timeout)
         request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = body
-        URLSession.shared.dataTask(with: request) { _, response, _ in
+        let task = session.dataTask(with: request) { _, response, _ in
             guard let status = (response as? HTTPURLResponse)?.statusCode else {
                 completion(.retry)
                 return
@@ -156,7 +191,22 @@ struct URLSessionTelemetryTransport: TelemetryTransport {
             } else {
                 completion(.retry)
             }
-        }.resume()
+        }
+        task.delegate = self
+        task.resume()
+    }
+
+    /// Refused, not followed: a redirect names a different endpoint than the one
+    /// this app decided to trust, and downgrading to plain http is one of the
+    /// things it could name.
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
     }
 }
 
@@ -165,6 +215,9 @@ struct URLSessionTelemetryTransport: TelemetryTransport {
 struct TelemetryStatus: Equatable, Sendable {
     let enabled: Bool
     let source: TelemetryConsentSource
+    /// The desktop app says no. The toggle shows that answer and cannot change
+    /// it; every other combination leaves the toggle usable as an off switch.
+    let isLocked: Bool
 }
 
 // MARK: - The client
@@ -181,7 +234,8 @@ final class Telemetry {
     static let endpoint = URL(string: "https://api.codeburn.app/v1/telemetry")!
     static let schema = 1
     /// What separates these rows from the desktop app's (`codeburn-desktop`).
-    static let appName = "codeburn-menubar"
+    /// Also the transport's User-Agent, which is built off the main actor.
+    nonisolated static let appName = "codeburn-menubar"
     static let releaseBundleID = "org.agentseal.codeburn-menubar"
 
     /// EU-27 + EEA (IS, LI, NO) + UK + CH: the conservative "default off"
@@ -194,7 +248,10 @@ final class Telemetry {
     ]
 
     /// Every event this app may send. An unknown name is dropped rather than
-    /// forwarded, so a typo at a call site cannot invent a metric.
+    /// forwarded, so a typo at a call site cannot invent a metric. `update_click`,
+    /// `glance_open`, `dock_provider_switch` and `dock_drag_end` have no call
+    /// site here yet: they are the Windows tray's vocabulary for the same
+    /// surfaces, kept so the two apps stay one list.
     static let eventNames: Set<String> = [
         "app_open", "app_close", "popover_open", "settings_open", "update_click",
         "glance_open", "dock_enabled", "dock_disabled", "dock_provider_switch",
@@ -217,8 +274,21 @@ final class Telemetry {
     static let quitTimeout: TimeInterval = 1.5
 
     static let enabledKey = "CodeBurnTelemetryEnabled"
+    /// Set once any decision has been recorded here — the toggle's, or the
+    /// desktop app's, inherited the first time a valid state file is seen.
+    static let decidedKey = "CodeBurnTelemetryDecided"
+    /// This app's veto over the desktop app's yes. Kept apart from
+    /// `enabledKey` so it survives the desktop answer being re-inherited.
+    static let localOptOutKey = "CodeBurnTelemetryLocalOptOut"
     static let installIDKey = "CodeBurnTelemetryInstallId"
     static let lastSnapshotDayKey = "CodeBurnTelemetryLastSnapshotDay"
+
+    /// Whether a standalone install has to be asked before anything is sent, or
+    /// whether the region default is itself the answer. Today it is the region
+    /// default, as on the Windows tray before its notice appears; flipping this
+    /// to `true` is the whole of "standalone needs a first-run notice", and
+    /// nothing else reads the `decidedKey` marker.
+    static let standaloneRequiresExplicitDecision = false
 
     private let defaults: UserDefaults
     private let desktopStateURL: URL?
@@ -230,11 +300,24 @@ final class Telemetry {
     /// wiring can be exercised, but nothing leaves the machine.
     private let maySend: Bool
     private let now: @Sendable () -> Date
+    private let requiresExplicitDecision: Bool
 
     private var consent: TelemetryConsent
+
+    /// The consent this run actually sends on.
+    private var canTrack: Bool {
+        consent.canTrack(requiresExplicitDecision: requiresExplicitDecision)
+    }
+    /// Memory only, unlike the Windows tray's file-backed queue: a run that
+    /// dies, or whose quit flush does not land inside its timeout, loses that
+    /// session's events and that day's `usage_snapshot` with them.
     private var queue: [TelemetryEvent] = []
     private var openedAt: Date
     private var flushing = false
+    /// Set when the toggle goes off while a batch is out. That batch is dropped
+    /// when it comes back rather than restored, mirroring `Queue::clear`'s
+    /// `abandon_in_flight` in the Windows tray.
+    private var abandonInFlight = false
     /// Consecutive failed sends, which is what the beat's backoff is computed
     /// from, and how many beats are still owed to it.
     private var failures = 0
@@ -249,7 +332,8 @@ final class Telemetry {
         endpoint: URL = Telemetry.endpoint,
         transport: TelemetryTransport = URLSessionTelemetryTransport(),
         maySend: Bool = Telemetry.defaultMaySend(),
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        requiresExplicitDecision: Bool = Telemetry.standaloneRequiresExplicitDecision
     ) {
         self.defaults = defaults
         self.desktopStateURL = desktopStateURL
@@ -259,15 +343,14 @@ final class Telemetry {
         self.transport = transport
         self.maySend = maySend
         self.now = now
+        self.requiresExplicitDecision = requiresExplicitDecision
         self.openedAt = now()
         self.consent = Telemetry.resolveConsent(
             desktop: Telemetry.readDesktopState(at: desktopStateURL),
             defaults: defaults,
             country: Telemetry.normalizedCountry(region)
         )
-        if consent.source == .app {
-            defaults.set(consent.installID, forKey: Telemetry.installIDKey)
-        }
+        reresolve()
     }
 
     // MARK: Environment
@@ -343,21 +426,27 @@ final class Telemetry {
         defaults: UserDefaults,
         country: String?
     ) -> TelemetryConsent {
+        let vetoed = defaults.bool(forKey: localOptOutKey)
         if let desktop {
             return TelemetryConsent(
                 source: .desktop,
                 installID: desktop.installID,
-                enabled: desktop.enabled,
-                onboarded: desktop.onboarded
+                enabled: desktop.enabled && !vetoed,
+                decided: desktop.onboarded,
+                lockedOff: !desktop.enabled
             )
         }
         let stored = defaults.string(forKey: installIDKey)
+        // A decision recorded here wins over the region default, which is what
+        // keeps a desktop app's "no" standing after that app is deleted: its
+        // answer was inherited locally the last time its file was read.
+        let recorded = defaults.object(forKey: enabledKey) as? Bool
         return TelemetryConsent(
             source: .app,
             installID: (stored?.isEmpty == false ? stored : nil) ?? UUID().uuidString,
-            enabled: defaults.object(forKey: enabledKey) as? Bool
-                ?? defaultEnabled(for: country),
-            onboarded: true
+            enabled: (recorded ?? defaultEnabled(for: country)) && !vetoed,
+            decided: defaults.bool(forKey: decidedKey),
+            lockedOff: false
         )
     }
 
@@ -366,44 +455,93 @@ final class Telemetry {
     /// and its consent screen is answered in a different process.
     @discardableResult
     private func reresolve() -> TelemetryConsent {
+        let desktop = Telemetry.readDesktopState(at: desktopStateURL)
         var fresh = Telemetry.resolveConsent(
-            desktop: Telemetry.readDesktopState(at: desktopStateURL),
+            desktop: desktop,
             defaults: defaults,
             country: country
         )
-        // A defaults write that did not land leaves this app's id unstored, and
-        // resolving would mint a fresh one every time it is asked. Keep the one
-        // this run already has.
-        if fresh.source == .app, consent.source == .app,
-           defaults.string(forKey: Telemetry.installIDKey) == nil {
+        if let desktop {
+            inheritDesktopDecision(desktop)
+        } else if consent.source == .app,
+                  defaults.string(forKey: Telemetry.installIDKey) == nil {
+            // A defaults write that did not land leaves this app's id unstored,
+            // and resolving would mint a fresh one every time it is asked. Keep
+            // the one this run already has.
             fresh = TelemetryConsent(
                 source: .app,
                 installID: consent.installID,
                 enabled: fresh.enabled,
-                onboarded: true
+                decided: fresh.decided,
+                lockedOff: false
             )
+        }
+        // One install, one id: stored the moment it is minted, not only at
+        // init, so a run that starts beside the desktop app and outlives it
+        // does not mint a new id at every resolve.
+        if fresh.source == .app,
+           defaults.string(forKey: Telemetry.installIDKey) != fresh.installID {
+            defaults.set(fresh.installID, forKey: Telemetry.installIDKey)
         }
         consent = fresh
         return fresh
     }
 
-    func status() -> TelemetryStatus {
-        let consent = reresolve()
-        return TelemetryStatus(enabled: consent.enabled, source: consent.source)
+    /// Records the desktop app's answer here as well. Deleting that app leaves
+    /// its `telemetry.v1.json` behind on a Mac, but a file that is removed or
+    /// corrupted would otherwise hand the question back to the region default
+    /// — turning an explicit "no" into a "yes" on the next resolve.
+    private func inheritDesktopDecision(_ desktop: DesktopTelemetryState) {
+        if defaults.object(forKey: Telemetry.enabledKey) as? Bool != desktop.enabled {
+            defaults.set(desktop.enabled, forKey: Telemetry.enabledKey)
+        }
+        if desktop.onboarded, !defaults.bool(forKey: Telemetry.decidedKey) {
+            defaults.set(true, forKey: Telemetry.decidedKey)
+        }
     }
 
-    /// The settings toggle. Off mints a fresh install id and empties the queue,
-    /// so nothing already recorded is sent and nothing later can be tied to what
-    /// came before. Refused while the desktop app is the source: its file is
-    /// that app's to write.
+    func status() -> TelemetryStatus {
+        let consent = reresolve()
+        return TelemetryStatus(
+            enabled: consent.enabled,
+            source: consent.source,
+            isLocked: consent.lockedOff
+        )
+    }
+
+    /// The settings toggle.
+    ///
+    /// Standalone it is the decision: off empties the queue, disowns a batch
+    /// that is still in flight and mints a fresh install id, so past and future
+    /// data cannot be linked. Under the desktop app's decision it is a veto and
+    /// nothing more — it can switch this app off while that app says yes, never
+    /// on while it says no, and it neither rotates an id that app owns nor
+    /// writes that app's file.
     func setEnabled(_ enabled: Bool) {
-        guard reresolve().source == .app else { return }
-        defaults.set(enabled, forKey: Telemetry.enabledKey)
-        if !enabled {
-            queue.removeAll()
-            defaults.set(UUID().uuidString, forKey: Telemetry.installIDKey)
+        let consent = reresolve()
+        switch consent.source {
+        case .desktop:
+            guard !consent.lockedOff else { return }
+            defaults.set(!enabled, forKey: Telemetry.localOptOutKey)
+            if !enabled { stopSending(rotatingInstallID: false) }
+        case .app:
+            defaults.set(enabled, forKey: Telemetry.enabledKey)
+            defaults.set(true, forKey: Telemetry.decidedKey)
+            defaults.set(false, forKey: Telemetry.localOptOutKey)
+            if !enabled { stopSending(rotatingInstallID: true) }
         }
         reresolve()
+    }
+
+    /// Everything recorded under the answer being withdrawn goes, including a
+    /// batch that is already out: it would otherwise come back on a retry and
+    /// be posted under the id that replaced it.
+    private func stopSending(rotatingInstallID: Bool) {
+        queue.removeAll()
+        abandonInFlight = flushing
+        if rotatingInstallID {
+            defaults.set(UUID().uuidString, forKey: Telemetry.installIDKey)
+        }
     }
 
     // MARK: Sanitizing
@@ -491,7 +629,7 @@ final class Telemetry {
     /// Queues one event. An unknown name, junk props or a withheld decision are
     /// all dropped here rather than reaching the wire.
     func track(_ name: String, _ props: JSONValue = .object([:])) {
-        guard Telemetry.eventNames.contains(name), consent.canTrack else { return }
+        guard Telemetry.eventNames.contains(name), canTrack else { return }
         // The oldest event gives way at the cap, so the queue always carries the
         // most recent window rather than freezing at whatever filled it first.
         if queue.count >= Telemetry.maxQueue { queue.removeFirst() }
@@ -508,7 +646,7 @@ final class Telemetry {
     /// every figure in it.
     func trackUsageSnapshot(_ snapshot: JSONValue?) {
         guard let snapshot, case .object = snapshot else { return }
-        guard consent.canTrack, consent.source == .app else { return }
+        guard canTrack, consent.source == .app else { return }
         let day = Telemetry.dayKey(now())
         guard defaults.string(forKey: Telemetry.lastSnapshotDayKey) != day else { return }
         defaults.set(day, forKey: Telemetry.lastSnapshotDayKey)
@@ -570,6 +708,7 @@ final class Telemetry {
         reresolve()
         guard maySend, !flushing, let (body, batch) = makeBatch() else { return }
         flushing = true
+        abandonInFlight = false
         transport.post(body, to: endpoint, timeout: Telemetry.httpTimeout) { [weak self] outcome in
             Task { @MainActor in
                 self?.settle(outcome, batch: batch)
@@ -589,7 +728,7 @@ final class Telemetry {
     }
 
     private func makeBatch() -> (Data, [TelemetryEvent])? {
-        guard consent.canTrack, !queue.isEmpty else { return nil }
+        guard canTrack, !queue.isEmpty else { return nil }
         let batch = queue
         let envelope = TelemetryEnvelope(
             schema: Telemetry.schema,
@@ -610,6 +749,12 @@ final class Telemetry {
 
     private func settle(_ outcome: TelemetryPostOutcome, batch: [TelemetryEvent]) {
         flushing = false
+        if abandonInFlight {
+            abandonInFlight = false
+            failures = 0
+            beatsOwed = 0
+            return
+        }
         switch outcome {
         case .sent, .rejected:
             // The endpoint answered, so it is up: only a refused payload is

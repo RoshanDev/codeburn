@@ -20,6 +20,7 @@ struct TelemetryTests {
 
         private let lock = NSLock()
         private var _bodies: [Data] = []
+        private var _pending: [@Sendable (TelemetryPostOutcome) -> Void] = []
         private let answer: Answer
 
         init(_ answer: Answer = .sent) { self.answer = answer }
@@ -27,6 +28,16 @@ struct TelemetryTests {
         var bodies: [Data] {
             lock.lock(); defer { lock.unlock() }
             return _bodies
+        }
+
+        /// Answers every request still waiting, which is how a test decides
+        /// what happens *after* it has changed the consent underneath one.
+        func answerPending(_ outcome: TelemetryPostOutcome) {
+            lock.lock()
+            let waiting = _pending
+            _pending = []
+            lock.unlock()
+            for completion in waiting { completion(outcome) }
         }
 
         func post(
@@ -43,7 +54,10 @@ struct TelemetryTests {
             case .sent: completion(.sent)
             case .rejected: completion(.rejected)
             case .retry: completion(.retry)
-            case .pending: break
+            case .pending:
+                lock.lock()
+                _pending.append(completion)
+                lock.unlock()
             }
         }
     }
@@ -86,7 +100,8 @@ struct TelemetryTests {
         region: String? = "US",
         transport: TelemetryTransport = RecordingTransport(),
         maySend: Bool = true,
-        now: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1_788_393_600) }
+        now: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 1_788_393_600) },
+        requiresExplicitDecision: Bool = false
     ) -> Telemetry {
         Telemetry(
             defaults: scratch.defaults,
@@ -96,7 +111,8 @@ struct TelemetryTests {
             endpoint: endpoint,
             transport: transport,
             maySend: maySend,
-            now: now
+            now: now,
+            requiresExplicitDecision: requiresExplicitDecision
         )
     }
 
@@ -234,17 +250,101 @@ struct TelemetryTests {
         #expect(scratch.defaults.string(forKey: Telemetry.installIDKey) != before)
     }
 
-    @Test("the toggle is refused while the desktop app is the source")
-    func toggleRefusedUnderDesktop() {
+    @Test("the local toggle can veto the desktop app's yes without rotating its id")
+    func localVetoOverDesktopYes() throws {
         let scratch = Scratch()
         let state = scratch.writeDesktopState(
             #"{"version":1,"installId":"desk-1","enabled":true,"onboardedAt":"2026-01-01T00:00:00Z"}"#)
-        let telemetry = Self.client(scratch, desktopStateURL: state)
+        let before = try Data(contentsOf: state)
+        let transport = RecordingTransport()
+        let telemetry = Self.client(scratch, desktopStateURL: state, transport: transport)
+        #expect(telemetry.status().isLocked == false, "a desktop yes leaves the toggle usable")
 
         telemetry.setEnabled(false)
+        telemetry.track("app_open")
+        telemetry.flush()
 
-        #expect(telemetry.status().enabled, "the desktop app's file is that app's to write")
-        #expect(scratch.defaults.object(forKey: Telemetry.enabledKey) == nil)
+        #expect(telemetry.status().enabled == false)
+        #expect(telemetry.queuedEvents.isEmpty)
+        #expect(transport.bodies.isEmpty)
+        #expect(scratch.defaults.string(forKey: Telemetry.installIDKey) == nil,
+                "the id belongs to the desktop app, so a local veto does not rotate one")
+        #expect(try Data(contentsOf: state) == before, "the desktop app's file is that app's to write")
+
+        telemetry.setEnabled(true)
+        #expect(telemetry.status().enabled)
+    }
+
+    @Test("the local toggle can never opt in against the desktop app's no")
+    func localVetoCannotOverturnDesktopNo() {
+        let scratch = Scratch()
+        let state = scratch.writeDesktopState(
+            #"{"version":1,"installId":"desk-1","enabled":false,"onboardedAt":"2026-01-01T00:00:00Z"}"#)
+        let telemetry = Self.client(scratch, desktopStateURL: state)
+        #expect(telemetry.status().isLocked, "a desktop no makes the toggle a readout")
+
+        telemetry.setEnabled(true)
+
+        #expect(telemetry.status().enabled == false)
+        #expect(scratch.defaults.bool(forKey: Telemetry.localOptOutKey) == false)
+    }
+
+    @Test("a desktop decision is inherited, so deleting that app cannot reverse its no")
+    func desktopDecisionSurvivesTheFileDisappearing() {
+        let scratch = Scratch()
+        let state = scratch.writeDesktopState(
+            #"{"version":1,"installId":"desk-1","enabled":false,"onboardedAt":"2026-01-01T00:00:00Z"}"#)
+        // Region US, whose default is ON — exactly the reversal being guarded.
+        let telemetry = Self.client(scratch, desktopStateURL: state, region: "US")
+        #expect(telemetry.status().source == .desktop)
+
+        try? FileManager.default.removeItem(at: state)
+        let after = telemetry.status()
+
+        #expect(after.source == .app)
+        #expect(after.enabled == false, "an explicit no must outlive the app that made it")
+        #expect(scratch.defaults.object(forKey: Telemetry.enabledKey) as? Bool == false)
+    }
+
+    @Test("a desktop yes is inherited too, under one stable install id of this app's own")
+    func desktopYesFallsBackToAStableLocalID() {
+        let scratch = Scratch()
+        let state = scratch.writeDesktopState(
+            #"{"version":1,"installId":"desk-1","enabled":true,"onboardedAt":"2026-01-01T00:00:00Z"}"#)
+        let telemetry = Self.client(scratch, desktopStateURL: state, region: "DE")
+        #expect(telemetry.status().source == .desktop)
+
+        try? FileManager.default.removeItem(at: state)
+        let first = telemetry.status()
+        let id = scratch.defaults.string(forKey: Telemetry.installIDKey)
+
+        #expect(first.source == .app)
+        #expect(first.enabled, "a desktop yes is a decision too, even in a default-off region")
+        #expect(id != nil && id != "desk-1")
+        _ = telemetry.status()
+        _ = telemetry.status()
+        #expect(scratch.defaults.string(forKey: Telemetry.installIDKey) == id,
+                "one install, one id: resolving again must not mint another")
+    }
+
+    @Test("a standalone install can be made to wait for an explicit decision")
+    func standaloneExplicitDecisionSwitch() {
+        // Both settings of Telemetry.standaloneRequiresExplicitDecision, so the
+        // product call is a one-line change with tests already standing.
+        let regionDecides = Scratch()
+        let deciding = Self.client(regionDecides, region: "US", requiresExplicitDecision: false)
+        deciding.track("app_open")
+        #expect(deciding.queuedEvents.count == 1, "the region default is itself the answer")
+
+        let mustBeAsked = Scratch()
+        let waiting = Self.client(mustBeAsked, region: "US", requiresExplicitDecision: true)
+        waiting.track("app_open")
+        #expect(waiting.queuedEvents.isEmpty, "nothing before the question has been answered")
+
+        waiting.setEnabled(true)
+        waiting.track("app_open")
+        #expect(waiting.queuedEvents.count == 1)
+        #expect(mustBeAsked.defaults.bool(forKey: Telemetry.decidedKey))
     }
 
     @Test("the default-off region list is still the desktop app's list")
@@ -563,5 +663,165 @@ struct TelemetryTests {
         telemetry.flushOnQuit(timeout: 0.2)
 
         #expect(transport.bodies.isEmpty)
+    }
+
+    // MARK: - In flight
+
+    @Test("opting out while a batch is in flight drops it instead of retrying it")
+    func optOutAbandonsTheBatchInFlight() async {
+        let scratch = Scratch()
+        let transport = RecordingTransport(.pending)
+        let telemetry = Self.client(scratch, transport: transport)
+        telemetry.track("app_open")
+        telemetry.flush()
+        #expect(transport.bodies.count == 1)
+        let firstID = scratch.defaults.string(forKey: Telemetry.installIDKey)
+
+        telemetry.setEnabled(false)
+        transport.answerPending(.retry)
+        await Self.settled()
+
+        #expect(telemetry.queuedEvents.isEmpty,
+                "events recorded under the retired id must never come back")
+        #expect(scratch.defaults.string(forKey: Telemetry.installIDKey) != firstID)
+
+        telemetry.setEnabled(true)
+        telemetry.flush()
+        await Self.settled()
+        #expect(transport.bodies.count == 1, "nothing from before the opt-out is ever posted")
+    }
+
+    @Test("a veto under desktop consent abandons the batch in flight as well")
+    func vetoAbandonsTheBatchInFlight() async {
+        let scratch = Scratch()
+        let state = scratch.writeDesktopState(
+            #"{"version":1,"installId":"desk-1","enabled":true,"onboardedAt":"2026-01-01T00:00:00Z"}"#)
+        let transport = RecordingTransport(.pending)
+        let telemetry = Self.client(scratch, desktopStateURL: state, transport: transport)
+        telemetry.track("app_open")
+        telemetry.flush()
+
+        telemetry.setEnabled(false)
+        transport.answerPending(.retry)
+        await Self.settled()
+
+        #expect(telemetry.queuedEvents.isEmpty)
+        telemetry.flush()
+        await Self.settled()
+        #expect(transport.bodies.count == 1)
+    }
+
+    @Test("a quit that lands on top of a live flush still returns, bounded")
+    func quitRacesALiveFlush() {
+        let scratch = Scratch()
+        let transport = RecordingTransport(.pending)
+        let telemetry = Self.client(scratch, transport: transport)
+        telemetry.track("popover_open")
+        telemetry.flush()
+        #expect(transport.bodies.count == 1)
+
+        let started = Date()
+        telemetry.flushOnQuit(timeout: 0.2)
+        let elapsed = Date().timeIntervalSince(started)
+
+        #expect(elapsed < 2, "quit waited \(elapsed)s behind an unanswered flush")
+        #expect(transport.bodies.count == 2, "app_close still gets its own attempt")
+    }
+
+    // MARK: - Transport
+
+    @Test("the telemetry session keeps no cookies, no cache and no identifying agent")
+    func transportSessionIsPrivate() {
+        let configuration = URLSessionTelemetryTransport.makeConfiguration()
+
+        #expect(configuration.httpCookieStorage == nil, "a cookie would outlive an opt-out")
+        #expect(configuration.httpShouldSetCookies == false)
+        #expect(configuration.httpCookieAcceptPolicy == .never)
+        #expect(configuration.urlCache == nil)
+        #expect(configuration.requestCachePolicy == .reloadIgnoringLocalAndRemoteCacheData)
+        #expect(configuration.tlsMinimumSupportedProtocolVersion == .TLSv12)
+        let agent = configuration.httpAdditionalHeaders?["User-Agent"] as? String
+        #expect(agent == "codeburn-menubar", "the default agent spells out the kernel build")
+        #expect(configuration.httpAdditionalHeaders?["Content-Type"] as? String == "application/json")
+        // Ephemeral, so nothing it does touch reaches disk.
+        #expect(configuration.identifier == nil)
+    }
+
+    @Test("a redirect is refused rather than followed")
+    func transportRefusesRedirects() async {
+        let transport = URLSessionTelemetryTransport()
+        let redirect = HTTPURLResponse(
+            url: Telemetry.endpoint, statusCode: 302,
+            httpVersion: nil, headerFields: nil)!
+        var followed: URLRequest? = URLRequest(url: URL(string: "http://elsewhere.invalid")!)
+
+        await withCheckedContinuation { continuation in
+            transport.urlSession(
+                URLSession(configuration: .ephemeral),
+                task: URLSession(configuration: .ephemeral)
+                    .dataTask(with: URLRequest(url: Telemetry.endpoint)),
+                willPerformHTTPRedirection: redirect,
+                newRequest: URLRequest(url: URL(string: "http://elsewhere.invalid")!)
+            ) { request in
+                followed = request
+                continuation.resume()
+            }
+        }
+
+        #expect(followed == nil)
+    }
+
+    // MARK: - Cross-implementation sanitizer fixture
+
+    @Test("the sanitizer answers exactly what the desktop app's sanitizeProps would")
+    func sanitizerMatchesTheDesktopImplementation() {
+        // Fixture and expectation both derived from `sanitizeProps` /
+        // `sanitizeValue` / `sanitizeObject` in app/electron/telemetry.ts:
+        // MAX_STRING 64, MAX_ARRAY 12, MAX_KEYS 16, MAX_DEPTH 5, MAX_LEAVES 1000.
+        // Strings and keys truncate, non-finite numbers and nulls are dropped,
+        // a container that empties out is dropped with them, and a container
+        // sitting at MAX_DEPTH is dropped whole rather than flattened.
+        let longString = String(repeating: "x", count: 100)
+        let longKey = String(repeating: "k", count: 100)
+
+        var wide: [String: JSONValue] = [:]
+        for index in 0..<20 { wide[String(format: "w%02d", index)] = .int(index) }
+
+        var tooDeep = JSONValue.object(["leaf": .int(1)])
+        for _ in 0..<5 { tooDeep = .object(["down": tooDeep]) }
+
+        let clean = Telemetry.sanitizeProps(.object([
+            "str": .string(longString),
+            longKey: .string("short"),
+            "nan": .double(.nan),
+            "inf": .double(-.infinity),
+            "nil": .null,
+            "bool": .bool(false),
+            "int": .int(-3),
+            "rate": .double(0.5),
+            "arr": .array((0..<20).map { .int($0) }),
+            "mixed": .array([.string("a"), .null, .double(.nan), .int(2)]),
+            "wide": .object(wide),
+            // props -> deep -> b -> c -> d -> leaf: the snapshot's own depth.
+            "deep": .object(["b": .object(["c": .object(["d": .int(4)])])]),
+            "tooDeep": tooDeep,
+            "emptyAfterCleaning": .object(["only": .null]),
+        ]))
+
+        let truncated = String(repeating: "x", count: 64)
+        var expectedWide: [String: JSONValue] = [:]
+        for index in 0..<16 { expectedWide[String(format: "w%02d", index)] = .int(index) }
+
+        #expect(clean == [
+            "str": .string(truncated),
+            String(repeating: "k", count: 64): .string("short"),
+            "bool": .bool(false),
+            "int": .int(-3),
+            "rate": .double(0.5),
+            "arr": .array((0..<12).map { .int($0) }),
+            "mixed": .array([.string("a"), .int(2)]),
+            "wide": .object(expectedWide),
+            "deep": .object(["b": .object(["c": .object(["d": .int(4)])])]),
+        ])
     }
 }

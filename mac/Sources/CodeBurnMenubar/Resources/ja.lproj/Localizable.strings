@@ -719,4 +719,4 @@
 "Privacy" = "プライバシー";
 "Anonymous usage statistics" = "匿名の利用統計";
 "Controlled in the CodeBurn desktop app." = "CodeBurn デスクトップアプリで管理されています。";
-"Optional usage statistics: model mix, task success, performance and errors. The daily report includes the names of the models, tools, skills and MCP servers you use, alongside bucketed counts of how often each one came up. Never your prompts, your code, or your project and file names." = "任意の利用統計です:モデルの内訳、タスクの成功状況、パフォーマンス、エラーなど。日次レポートには使用したモデル、ツール、スキル、MCPサーバーの名前と、それぞれの出現回数を区分けした集計が含まれます。プロンプト、コード、プロジェクト名やファイル名は一切含まれません。";
+"Optional usage statistics: the names of the models, tools and providers you use, with bucketed counts of how often each one came up, plus when the app is opened. A random install id, the app version and your country code travel with them. Never your prompts, your code, your project and file names, or exact amounts." = "任意の利用統計です:使用したモデル、ツール、プロバイダーの名前と、それぞれの出現回数を区分けした集計、およびアプリを開いた回数。これらにはランダムなインストールID、アプリのバージョン、国コードが付随します。プロンプト、コード、プロジェクト名やファイル名、正確な金額は一切含まれません。";

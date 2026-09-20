@@ -717,4 +717,4 @@
 "Privacy" = "隐私";
 "Anonymous usage statistics" = "匿名使用统计";
 "Controlled in the CodeBurn desktop app." = "由 CodeBurn 桌面应用管理。";
-"Optional usage statistics: model mix, task success, performance and errors. The daily report includes the names of the models, tools, skills and MCP servers you use, alongside bucketed counts of how often each one came up. Never your prompts, your code, or your project and file names." = "可选的使用统计信息:模型分布、任务成功率、性能和错误。每日报告包含您使用的模型、工具、技能和 MCP 服务器的名称,以及每项出现频率的分段计数。绝不包含您的提示词、代码或项目与文件名称。";
+"Optional usage statistics: the names of the models, tools and providers you use, with bucketed counts of how often each one came up, plus when the app is opened. A random install id, the app version and your country code travel with them. Never your prompts, your code, your project and file names, or exact amounts." = "可选的使用统计信息:您使用的模型、工具和服务商的名称,以及每项出现频率的分段计数,还有应用的打开次数。随附的还有随机安装 ID、应用版本和国家/地区代码。绝不包含您的提示词、代码、项目与文件名称或确切金额。";

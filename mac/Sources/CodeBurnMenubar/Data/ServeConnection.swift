@@ -164,7 +164,10 @@ actor ServeConnection {
             try child.run()
         } catch {
             disabled = true // spawn path can't produce the binary either better than makeProcess did
-            NSLog("CodeBurn: resident CLI disabled for this app run — the serve child failed to launch: \(error); every refresh now spawns a cold CLI")
+            // Domain and code only: a Process launch error carries the path it
+            // tried, and the unified log is not the place for it.
+            let failure = error as NSError
+            NSLog("CodeBurn: resident CLI disabled for this app run — the serve child failed to launch (%@ %ld); every refresh now spawns a cold CLI", failure.domain, failure.code)
             return
         }
         process = child

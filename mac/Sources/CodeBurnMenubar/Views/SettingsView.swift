@@ -680,28 +680,36 @@ private struct GeneralSettingsTab: View {
 /// state file the toggle is a read-only readout of it: that file is the desktop
 /// app's to write, and one decision covers both apps.
 private struct PrivacySettingsSection: View {
-    @State private var status = Telemetry.shared.status()
+    /// Read on appear rather than in the initializer: resolving reads the
+    /// desktop app's state file, and an initializer runs on every rebuild of
+    /// the pane around it. Refreshed when the window comes forward, so a
+    /// decision changed in the desktop app shows without reopening Settings
+    /// and without anything polling for it.
+    @State private var status: TelemetryStatus?
 
     var body: some View {
         Section(L("Privacy")) {
             Toggle(L("Anonymous usage statistics"), isOn: Binding(
-                get: { status.enabled },
+                get: { status?.enabled ?? false },
                 set: {
                     Telemetry.shared.setEnabled($0)
                     status = Telemetry.shared.status()
                 }
             ))
-            .disabled(status.source == .desktop)
-            if status.source == .desktop {
+            .disabled(status?.isLocked ?? true)
+            if status?.isLocked == true {
                 Text(L("Controlled in the CodeBurn desktop app."))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
-            Text(L("Optional usage statistics: model mix, task success, performance and errors. The daily report includes the names of the models, tools, skills and MCP servers you use, alongside bucketed counts of how often each one came up. Never your prompts, your code, or your project and file names."))
+            Text(L("Optional usage statistics: the names of the models, tools and providers you use, with bucketed counts of how often each one came up, plus when the app is opened. A random install id, the app version and your country code travel with them. Never your prompts, your code, your project and file names, or exact amounts."))
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
         }
         .onAppear { status = Telemetry.shared.status() }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            status = Telemetry.shared.status()
+        }
     }
 }
 
