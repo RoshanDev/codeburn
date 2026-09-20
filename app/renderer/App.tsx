@@ -602,14 +602,13 @@ function AppMain() {
   }, [overview.data?.currency?.code, overview.data?.currency?.rate, overview.data?.currency?.symbol, overview.switching])
 
   // Prefetch for millisecond switches: once the first overview has resolved,
-  // quietly warm every standard time horizon for the active provider in product
-  // priority order (Today -> 7D -> 30D -> Month -> 6M -> Life). After each
-  // headline, warm that horizon's first-click reports before moving farther back
-  // in history. Preserve the reviewed current-period provider warm after those
-  // horizons: the universal provider-summary prototype is still held, but a
-  // user's first provider switch must not silently regress to a cold parse. The
-  // CLI's own read-cache + in-flight
-  // coalescing keep it from double-spawning against a live user fetch;
+  // quietly warm the SELECTED period's first-click reports for the active
+  // provider, then that same period for the other detected providers. Only the
+  // selected period: sweeping all six horizons cost ~18 CPU-seconds a minute for
+  // five minutes and 2.8 GB peak on a real corpus, to pre-answer switches most
+  // users never make. A period the user does select takes the ordinary on-demand
+  // path (usePolled shows its loading state). The CLI's own read-cache +
+  // in-flight coalescing keep it from double-spawning against a live user fetch;
   // hasPolledMemo skips any result already warm (including one warmed by a real
   // visit).
   //
@@ -629,91 +628,74 @@ function AppMain() {
     // lifecycle and must not inherit local-corpus assumptions by accident.
     if (!ready || overview.data == null || customRange || claudeConfigSource || scope !== 'local') return
     let cancelled = false
+    // Hold before every warm request: while a user-triggered fetch is in flight
+    // (it takes priority) and while the window is hidden (nobody is waiting on a
+    // speculative result, so the sweep pauses and resumes on its own).
+    const holdWhileBusyOrHidden = async () => {
+      while (!cancelled && (overviewBusyRef.current || document.visibilityState === 'hidden')) {
+        await new Promise(resolve => setTimeout(resolve, PREFETCH_STAGGER_MS))
+      }
+    }
     const warm = async () => {
-      for (const targetPeriod of STANDARD_PERIODS) {
+      const targetPeriod = period
+      // The selected period's first-click reports. (Its overview needs no warm:
+      // the visible poll's own result is already under that exact memo key.) The
+      // queue is deliberately serial. Results use the exact section memo keys,
+      // then persist through usePolled so tomorrow's launch paints them before
+      // revalidation.
+      const reportTargets: Array<{ key: string; load: () => Promise<unknown> }> = [
+        {
+          key: reportMemoKey('sessions', targetPeriod, provider),
+          load: () => codeburn.getSessions(targetPeriod, provider, undefined, true),
+        },
+        {
+          key: reportMemoKey('spendflow', targetPeriod, provider),
+          load: () => codeburn.getSpendFlow(targetPeriod, provider, undefined, true),
+        },
+        {
+          key: reportMemoKey('models', targetPeriod, provider, null, 'false'),
+          load: () => codeburn.getModels(targetPeriod, provider, false, undefined, true),
+        },
+        {
+          key: reportMemoKey('comparemodels', targetPeriod, provider),
+          load: () => codeburn.getCompareModels(targetPeriod, provider, true),
+        },
+        {
+          key: reportMemoKey('optimize', targetPeriod, provider),
+          load: () => codeburn.getOptimizeReport(targetPeriod, provider, undefined, true),
+        },
+        {
+          key: reportMemoKey('yield', targetPeriod, provider),
+          load: () => codeburn.getYield(targetPeriod, provider, undefined, true),
+        },
+        {
+          key: reportMemoKey('plans', targetPeriod),
+          load: () => codeburn.getPlans(targetPeriod, true),
+        },
+      ]
+      for (const target of reportTargets) {
         if (cancelled) break
-
-        const overviewKey = overviewMemoKey(provider, targetPeriod, null, null)
-        if (!warmedKeys.current.has(overviewKey) && !hasPolledMemo(overviewKey)) {
-          // Only warm while the visible overview is idle: a user fetch in flight
-          // takes priority, so hold this horizon rather than racing it.
-          while (!cancelled && overviewBusyRef.current) {
-            await new Promise(resolve => setTimeout(resolve, PREFETCH_STAGGER_MS))
-          }
+        if (!hasPolledMemo(target.key)) {
+          await holdWhileBusyOrHidden()
           try {
             const configGeneration = configGenerationRef.current
-            // Background priority (5th arg) lets an interactive click jump ahead.
-            const value = await codeburn.getOverview(targetPeriod, provider, undefined, undefined, true)
-            if (!cancelled
-              && configGeneration === configGenerationRef.current
-              && value.hydration?.complete !== false) {
-              primePolledMemo(overviewKey, value)
-              writeOverviewHeadline(overviewKey, value)
-              warmedKeys.current.add(overviewKey)
+            const value = await target.load()
+            if (!cancelled && configGeneration === configGenerationRef.current) {
+              primePolledMemo(target.key, value)
             }
-          } catch { /* best-effort warm; a real switch will retry and surface the error */ }
-          if (!cancelled) await new Promise(resolve => setTimeout(resolve, PREFETCH_STAGGER_MS))
-        }
-
-        // Warm the reports for this horizon before moving farther back in time.
-        // The queue is deliberately serial and every request is background-
-        // priority. Results use the exact section memo keys, then persist through
-        // usePolled so tomorrow's launch paints them before revalidation.
-        const reportTargets: Array<{ key: string; load: () => Promise<unknown> }> = [
-          {
-            key: reportMemoKey('sessions', targetPeriod, provider),
-            load: () => codeburn.getSessions(targetPeriod, provider, undefined, true),
-          },
-          {
-            key: reportMemoKey('spendflow', targetPeriod, provider),
-            load: () => codeburn.getSpendFlow(targetPeriod, provider, undefined, true),
-          },
-          {
-            key: reportMemoKey('models', targetPeriod, provider, null, 'false'),
-            load: () => codeburn.getModels(targetPeriod, provider, false, undefined, true),
-          },
-          {
-            key: reportMemoKey('comparemodels', targetPeriod, provider),
-            load: () => codeburn.getCompareModels(targetPeriod, provider, true),
-          },
-          {
-            key: reportMemoKey('optimize', targetPeriod, provider),
-            load: () => codeburn.getOptimizeReport(targetPeriod, provider, undefined, true),
-          },
-          {
-            key: reportMemoKey('yield', targetPeriod, provider),
-            load: () => codeburn.getYield(targetPeriod, provider, undefined, true),
-          },
-          {
-            key: reportMemoKey('plans', targetPeriod),
-            load: () => codeburn.getPlans(targetPeriod, true),
-          },
-        ]
-        for (const target of reportTargets) {
-          if (cancelled) break
-          if (!hasPolledMemo(target.key)) {
-            try {
-              const configGeneration = configGenerationRef.current
-              const value = await target.load()
-              if (!cancelled && configGeneration === configGenerationRef.current) {
-                primePolledMemo(target.key, value)
-              }
-            } catch { /* on-demand visit will retry and surface the error */ }
-            if (!cancelled) await new Promise(resolve => setTimeout(resolve, REPORT_PREFETCH_STAGGER_MS))
-          }
+          } catch { /* on-demand visit will retry and surface the error */ }
+          if (!cancelled) await new Promise(resolve => setTimeout(resolve, REPORT_PREFETCH_STAGGER_MS))
         }
       }
 
       // Keep the current-main provider-switch contract while the shared Core
       // provider snapshot work is still held: warm the visible period for each
-      // detected provider only after the higher-value period/report queue.
+      // detected provider only after the higher-value report queue.
       for (const targetProvider of visibleProviderEntries.filter(entry => !entry.idle).map(entry => entry.id)) {
         if (cancelled || targetProvider === provider) continue
         const key = overviewMemoKey(targetProvider, period, null, null)
         if (warmedKeys.current.has(key) || hasPolledMemo(key)) continue
-        while (!cancelled && overviewBusyRef.current) {
-          await new Promise(resolve => setTimeout(resolve, PREFETCH_STAGGER_MS))
-        }
+        await holdWhileBusyOrHidden()
         try {
           const configGeneration = configGenerationRef.current
           const value = await codeburn.getOverview(period, targetProvider, undefined, undefined, true)
