@@ -76,7 +76,7 @@ struct TelemetryTests {
         }
 
         deinit {
-            UserDefaults.standard.removePersistentDomain(forName: suiteName)
+            TestDefaults.forget(suiteName)
             try? FileManager.default.removeItem(at: directory)
         }
 
