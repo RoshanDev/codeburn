@@ -15,7 +15,7 @@ vi.mock('electron', () => ({
 }))
 
 import { createBridgeHandlers } from './main'
-import { readOptimizeSnapshot, writeOptimizeSnapshot, type OptimizeSnapshot } from './optimize-store'
+import { readOptimizeSnapshots, readOptimizeSnapshot, sameLocalDay, writeOptimizeSnapshot, type OptimizeSnapshot } from './optimize-store'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const STORE = 'optimize-snapshots.json'
@@ -130,6 +130,81 @@ describe('optimize snapshot store', () => {
     const res = await again.snapshot('today', 'all') as { value: OptimizeSnapshot }
     expect(again.calls).toHaveLength(0)
     expect(res.value.optimize.savingsUSD).toBe(12)
+  })
+
+  it('recomputes across local midnight even though the scan is minutes old', async () => {
+    const dir = tempDir()
+    vi.useFakeTimers()
+    // 23:50 local. The argv says `--period today`, which names a window that
+    // moves at midnight, so age alone is not freshness.
+    vi.setSystemTime(new Date(2026, 8, 18, 23, 50, 0))
+    const evening = handlers(dir, 12)
+    await evening.snapshot('today', 'all')
+    expect(evening.calls).toHaveLength(1)
+
+    // 00:10 the next day: 20 minutes old, well inside the 24h bound, but a
+    // different local day → recompute.
+    vi.setSystemTime(new Date(2026, 8, 19, 0, 10, 0))
+    const after = handlers(dir, 42)
+    const res = await after.snapshot('today', 'all') as { value: OptimizeSnapshot }
+    expect(after.calls).toHaveLength(1)
+    expect(res.value.optimize.savingsUSD).toBe(42)
+
+    // Later the same day the fresh scan is reused, no spawn.
+    vi.setSystemTime(new Date(2026, 8, 19, 9, 30, 0))
+    const sameDay = handlers(dir, 999)
+    const reused = await sameDay.snapshot('today', 'all') as { value: OptimizeSnapshot }
+    expect(sameDay.calls).toHaveLength(0)
+    expect(reused.value.optimize.savingsUSD).toBe(42)
+  })
+
+  it('applies the same-day rule to rolling windows and pinned custom ranges alike', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(2026, 8, 18, 23, 50, 0))
+    for (const args of [['week', 'all'], ['30days', 'all'], ['month', 'all'], ['today', 'all', { from: '2026-09-01', to: '2026-09-18' }]]) {
+      const dir = tempDir()
+      const evening = handlers(dir, 12)
+      await evening.snapshot(...args)
+      vi.setSystemTime(new Date(2026, 8, 19, 0, 10, 0))
+      const after = handlers(dir, 42)
+      const res = await after.snapshot(...args) as { value: OptimizeSnapshot }
+      expect(after.calls).toHaveLength(1)
+      expect(res.value.optimize.savingsUSD).toBe(42)
+      vi.setSystemTime(new Date(2026, 8, 18, 23, 50, 0))
+    }
+  })
+
+  it('sameLocalDay compares calendar days, not elapsed time', () => {
+    const lateNight = new Date(2026, 8, 18, 23, 50).getTime()
+    expect(sameLocalDay(lateNight, new Date(2026, 8, 18, 0, 1).getTime())).toBe(true)
+    expect(sameLocalDay(lateNight, new Date(2026, 8, 19, 0, 10).getTime())).toBe(false)
+    expect(sameLocalDay(lateNight, new Date(2025, 8, 18, 23, 50).getTime())).toBe(false)
+    expect(sameLocalDay(lateNight, NaN)).toBe(false)
+  })
+
+  it('drops rows from other app versions on write instead of letting them fill the cap', () => {
+    const dir = tempDir()
+    for (let i = 0; i < 8; i++) {
+      writeOptimizeSnapshot(dir, {
+        scope: `old-${i}`,
+        computedAt: new Date().toISOString(),
+        appVersion: '0.0.1',
+        optimize: block(i),
+      })
+    }
+    expect(readOptimizeSnapshots(dir)).toHaveLength(8)
+
+    writeOptimizeSnapshot(dir, {
+      scope: 'current',
+      computedAt: new Date().toISOString(),
+      appVersion: '1.2.3',
+      optimize: block(7),
+    })
+
+    // The unservable rows are gone, so the cap belongs to rows that can be used.
+    const rows = readOptimizeSnapshots(dir)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.scope).toBe('current')
   })
 
   it('ignores a store written by a different app version', async () => {

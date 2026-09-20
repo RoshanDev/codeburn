@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 
-import { codeburn } from '../lib/ipc'
-import type { DateRange, OptimizeSnapshot, Period } from '../lib/types'
+import { codeburn, normalizeCliError } from '../lib/ipc'
+import type { CliError, DateRange, OptimizeSnapshot, Period } from '../lib/types'
 
 /** Force a recompute regardless of what is cached. */
 const FORCE = 0
+
+type OptimizeSnapshotState = { data: OptimizeSnapshot | null; loading: boolean; error: CliError | null }
 
 export type OptimizeScope = {
   period: Period
@@ -28,8 +30,8 @@ export type OptimizeScope = {
 export function useOptimizeSnapshot(
   { period, provider, range = null, configSource = null, scope = 'local' }: OptimizeScope,
   { enabled = true, alwaysFresh = false, refreshToken = 0 }: { enabled?: boolean; alwaysFresh?: boolean; refreshToken?: number } = {},
-): { data: OptimizeSnapshot | null; loading: boolean } {
-  const [state, setState] = useState<{ data: OptimizeSnapshot | null; loading: boolean }>({ data: null, loading: true })
+): { data: OptimizeSnapshot | null; loading: boolean; error: CliError | null } {
+  const [state, setState] = useState<OptimizeSnapshotState>({ data: null, loading: true, error: null })
   const lastToken = useRef<number | null>(null)
 
   useEffect(() => {
@@ -37,19 +39,22 @@ export function useOptimizeSnapshot(
     lastToken.current = refreshToken
     const fetchSnapshot = codeburn.getOptimizeSnapshot
     if (!enabled || typeof fetchSnapshot !== 'function') {
-      // No bridge method (older preload) is not a loading state that never ends.
-      if (!enabled) setState({ data: null, loading: true })
-      else setState({ data: null, loading: false })
+      // No bridge method (older preload) is not a loading state that never ends;
+      // it is simply nothing to show, which is not an error either.
+      setState({ data: null, loading: enabled === false, error: null })
       return
     }
     let cancelled = false
-    setState({ data: null, loading: true })
+    setState({ data: null, loading: true, error: null })
     // Off the critical path: yield the frame so the headline paints first. The
     // main process additionally spawns this at background CLI priority.
     const handle = setTimeout(() => {
       fetchSnapshot(period, provider, range ?? undefined, configSource, scope, forced ? FORCE : undefined)
-        .then(value => { if (!cancelled) setState({ data: value, loading: false }) })
-        .catch(() => { if (!cancelled) setState({ data: null, loading: false }) })
+        .then(value => { if (!cancelled) setState({ data: value, loading: false, error: null }) })
+        // A failed scan must not look like one still running: the Optimize page
+        // shows the error (a manual refresh re-runs it), Overview just omits
+        // the clause.
+        .catch(err => { if (!cancelled) setState({ data: null, loading: false, error: normalizeCliError(err) }) })
     }, 0)
     return () => { cancelled = true; clearTimeout(handle) }
   }, [period, provider, range?.from, range?.to, configSource, scope, enabled, alwaysFresh, refreshToken])

@@ -10,13 +10,20 @@ import { useOptimizeSnapshot } from '../hooks/useOptimizeSnapshot'
 import { type Polled, usePolled } from '../hooks/usePolled'
 import { asOfLabel, formatCompact, formatCount, formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
+import { YIELD_SLOW_MS } from '../lib/refreshCadence'
 import { reportMemoKey } from '../lib/reportMemoKey'
 import { trackEvent } from '../lib/track'
-import type { DateRange, FindingClass, MenubarPayload, OptimizeBlock, OptimizeJsonReport, Period, SessionYieldJson, WasteAction, YieldJsonReport } from '../lib/types'
+import type { CliError, DateRange, FindingClass, MenubarPayload, OptimizeBlock, OptimizeJsonReport, Period, SessionYieldJson, WasteAction, YieldJsonReport } from '../lib/types'
 import { Icon, type IconName } from '../components/icons'
 import { t } from '../i18n'
 
 type OptimizeTab = 'waste' | 'reverts' | 'abandoned' | 'fixes'
+
+/** The header title, with the age of the figures below it when they are not
+ *  live (the daily scan, the 5-minute yield tier). */
+function panelTitle(tab: OptimizeTab, age: string | null): string {
+  return age ? `${tabTitle(tab)} · ${age}` : tabTitle(tab)
+}
 
 /** The card's header title: the tab the list below is showing. Computed at
  *  call time (not a module-level const) so it re-reads the current locale. */
@@ -68,7 +75,7 @@ export function OptimizeContent({
   const yieldReport = usePolled<YieldJsonReport>(
     () => range ? codeburn.getYield(period, provider, range) : codeburn.getYield(period, provider),
     [period, provider, range?.from, range?.to, refreshToken],
-    { enabled: ready, memoKey: reportMemoKey('yield', period, provider, range) },
+    { enabled: ready, memoKey: reportMemoKey('yield', period, provider, range), cadence: { slowMs: YIELD_SLOW_MS } },
   )
   // This page is the one place the scan is always recomputed on open, so it
   // behaves exactly as it did when the overview poll still carried the block —
@@ -79,6 +86,7 @@ export function OptimizeContent({
   )
   const optimizeBlock: OptimizeBlock | null = optimizeSnapshot.data?.optimize ?? null
   const optimizeAge = asOfLabel(optimizeSnapshot.data?.computedAt ?? null)
+  const yieldAge = asOfLabel(yieldReport.lastSuccessAt)
   const [tab, setTab] = useState<OptimizeTab>('waste')
 
   if (!overview.data) {
@@ -101,7 +109,7 @@ export function OptimizeContent({
     <>
       {overview.error && <StaleBanner error={overview.error} />}
       <Panel
-        title={optimizeAge ? `${tabTitle(tab)} · ${optimizeAge}` : tabTitle(tab)}
+        title={panelTitle(tab, tab === 'reverts' || tab === 'abandoned' ? yieldAge : optimizeAge)}
         right={<SegTabs options={options} value={tab} onChange={value => setTab(value as OptimizeTab)} />}
       >
         {tab === 'waste' ? (
@@ -111,7 +119,7 @@ export function OptimizeContent({
         ) : tab === 'abandoned' ? (
           <YieldRows report={yieldReport} category="abandoned" empty={t('spend.optimize.abandoned.empty')} />
         ) : (
-          <FixesRows block={optimizeBlock} />
+          <FixesRows block={optimizeBlock} error={optimizeSnapshot.error} />
         )}
       </Panel>
     </>
@@ -349,7 +357,10 @@ function YieldRows({
   )
 }
 
-function FixesRows({ block }: { block: OptimizeBlock | null }) {
+function FixesRows({ block, error }: { block: OptimizeBlock | null; error: CliError | null }) {
+  // A failed scan is not a scan still running: say so, so the dash on the tab
+  // label has a reason on screen. A manual refresh re-runs it.
+  if (error) return <CliErrorPanel error={error} subject={t('common.subject.optimize')} />
   if (!block) return <EmptyNote>{t('spend.optimize.waste.scanning')}</EmptyNote>
   return <FindingRows findings={block.topFindings} empty={t('spend.optimize.fixes.empty')} />
 }

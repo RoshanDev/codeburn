@@ -46,6 +46,14 @@ export function persistRefreshValue(value: string): void {
   try { globalThis.localStorage?.setItem(STORAGE_KEY, value) } catch { /* storage can be unavailable */ }
 }
 
+// The SLOW tier intervals, shared by every section that shows the same report.
+// Neither report moves minute to minute and each costs a full CLI spawn
+// (`act report --json` is not even served by the resident child), so they
+// refresh on mount, on a manual refresh, and on these timers — never on a live
+// tick. usePolled additionally floors them at the user's live cadence.
+export const ACT_SLOW_MS = 600_000
+export const YIELD_SLOW_MS = 300_000
+
 // On battery the live poll runs half as often. The user's choice stays the base
 // — only the resolved interval moves, and it moves back the moment AC returns.
 export const BATTERY_CADENCE_FACTOR = 2

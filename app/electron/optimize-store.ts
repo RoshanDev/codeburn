@@ -41,6 +41,23 @@ function isSnapshot(value: unknown): value is OptimizeSnapshot {
     && Array.isArray(block.topFindings)
 }
 
+/**
+ * Whether two instants fall on the same LOCAL calendar day.
+ *
+ * Age alone is not freshness here. Every period the scan is computed for
+ * ('today', 'week', '30days', 'month', …) is anchored to the local day, so a
+ * scan taken at 23:50 describes a different window than a request at 00:10 even
+ * though it is 20 minutes old. A cached scan is only ever served on the day it
+ * was computed.
+ */
+export function sameLocalDay(a: number, b: number): boolean {
+  const left = new Date(a)
+  const right = new Date(b)
+  return left.getFullYear() === right.getFullYear()
+    && left.getMonth() === right.getMonth()
+    && left.getDate() === right.getDate()
+}
+
 /** Every stored scan, newest first. A missing, unreadable or corrupt file reads
  *  as empty: the caller then recomputes, which is always safe. */
 export function readOptimizeSnapshots(dir: string): OptimizeSnapshot[] {
@@ -59,7 +76,10 @@ export function readOptimizeSnapshot(dir: string, scope: string, appVersion: str
 
 export function writeOptimizeSnapshot(dir: string, snapshot: OptimizeSnapshot): void {
   try {
-    const rows = [snapshot, ...readOptimizeSnapshots(dir).filter(row => row.scope !== snapshot.scope)]
+    // A row from another app version can never be served, so it only takes up a
+    // slot under the cap. Drop those before capping.
+    const rows = [snapshot, ...readOptimizeSnapshots(dir)
+      .filter(row => row.scope !== snapshot.scope && row.appVersion === snapshot.appVersion)]
       .slice(0, MAX_ENTRIES)
     fs.mkdirSync(dir, { recursive: true })
     const target = storePath(dir)

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { MenubarPayload, OptimizeBlock, OptimizeSnapshot, OptimizeJsonReport, YieldJsonReport } from '../lib/types'
 import { Optimize, OptimizeContent } from './Optimize'
@@ -341,5 +341,63 @@ describe('Optimize', () => {
     await waitFor(() => expect(getYield).toHaveBeenCalledTimes(2))
     expect(screen.getByRole('tab', { name: 'Reverts $107.00' })).toBeInTheDocument()
     expect(screen.getByText('codeburn')).toBeInTheDocument()
+  })
+})
+
+describe('Optimize refresh tiers', () => {
+  beforeEach(() => {
+    getOverview.mockReset().mockResolvedValue(makePayload())
+    getOptimizeSnapshot.mockReset().mockResolvedValue(snapshot(makePayload().optimize))
+    getOptimizeReport.mockReset().mockResolvedValue(makeOptimizeReport())
+    getYield.mockReset().mockResolvedValue(makeYield())
+    telemetryTrack.mockReset().mockResolvedValue(true)
+  })
+  afterEach(() => { vi.useRealTimers() })
+
+  it('keeps yield off the live cadence here too, and dates it on its own tabs', async () => {
+    vi.useFakeTimers()
+    try {
+      render(<Optimize period="30days" provider="all" />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(getYield).toHaveBeenCalledTimes(1)
+
+      // Four minutes of live (60s default) ticks move the overview, not yield.
+      await act(async () => { await vi.advanceTimersByTimeAsync(4 * 60_000) })
+      expect(getYield).toHaveBeenCalledTimes(1)
+      // Its own 5-minute tier comes due.
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+      expect(getYield).toHaveBeenCalledTimes(2)
+
+      // A yield-backed tab carries yield's age, not the scan's.
+      fireEvent.click(screen.getByRole('tab', { name: 'Reverts $107.00' }))
+      expect(screen.getByText(/^Reverts · as of /)).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('reports a failed scan instead of scanning forever', async () => {
+    getOptimizeSnapshot.mockRejectedValue({ kind: 'nonzero', message: 'codeburn exited 1' })
+
+    render(<Optimize period="30days" provider="all" />)
+
+    // The dash on the tab label now has a reason on screen.
+    expect(await screen.findByRole('tab', { name: 'Waste —' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('tab', { name: 'Fixes 0' }))
+    expect(await screen.findByText(/codeburn exited 1/)).toBeInTheDocument()
+    expect(screen.queryByText('Scanning for waste…')).not.toBeInTheDocument()
+  })
+
+  it('re-runs a failed scan on a manual refresh', async () => {
+    getOptimizeSnapshot.mockRejectedValueOnce({ kind: 'nonzero', message: 'codeburn exited 1' })
+    const overview = { data: makePayload(), error: null, loading: false, switching: false, lastSuccessAt: Date.now(), refresh: vi.fn() }
+    const { rerender } = render(<OptimizeContent period="30days" overview={overview} refreshToken={0} />)
+    await screen.findByRole('tab', { name: 'Waste —' })
+
+    getOptimizeSnapshot.mockResolvedValue(snapshot(makePayload().optimize))
+    rerender(<OptimizeContent period="30days" overview={overview} refreshToken={1} />)
+
+    expect(await screen.findByRole('tab', { name: 'Waste $94.40' })).toBeInTheDocument()
+    expect(getOptimizeSnapshot.mock.calls.at(-1)![5]).toBe(0) // forced rescan
   })
 })

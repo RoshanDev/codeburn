@@ -22,6 +22,7 @@ import {
   type InvestigationFilters,
 } from '../lib/investigation'
 import { contiguousDailyWindow, dataStartKey, formatChartDate, localDateKey, sliceDailyToPeriod, sliceDailyToRange } from '../lib/period'
+import { ACT_SLOW_MS, YIELD_SLOW_MS } from '../lib/refreshCadence'
 import { reportMemoKey } from '../lib/reportMemoKey'
 import { barBucketDays, barLayout, formatAxisMoney, niceTicks, ticksClearOfPeak } from '../lib/chartAxis'
 import { generationHeadline, generationModels, rememberGeneration } from '../lib/generation'
@@ -296,7 +297,13 @@ function WorkflowCard({ current }: { current: MenubarPayload['current'] }) {
   )
 }
 
-export type Signal = { text: string; trailing?: string }
+export type Signal = {
+  text: string
+  trailing?: string
+  /** Set on rows whose figure is NOT live — today only the stored optimize
+   *  findings, which sit beside live signals and must not read as current. */
+  asOf?: string
+}
 export type SignalGroups = { wins: Signal[]; improvements: Signal[]; risks: Signal[] }
 
 /**
@@ -305,7 +312,13 @@ export type SignalGroups = { wins: Signal[]; improvements: Signal[]; risks: Sign
  * mirror the Swift; the desktop-only weekday-spike anomaly is absorbed as a risk.
  * Week-over-week and month-projection rules are suppressed for a custom range.
  */
-export function deriveSignals(data: MenubarPayload, now: Date, rangeActive: boolean, topFindings: OptimizeBlock['topFindings'] = []): SignalGroups {
+export function deriveSignals(
+  data: MenubarPayload,
+  now: Date,
+  rangeActive: boolean,
+  /** The stored daily scan: its findings and the age to label them with. */
+  stored: { topFindings: OptimizeBlock['topFindings']; asOf?: string | null } = { topFindings: [] },
+): SignalGroups {
   const daily = data.history.daily
   const current = data.current
   const wins: Signal[] = []
@@ -363,8 +376,8 @@ export function deriveSignals(data: MenubarPayload, now: Date, rangeActive: bool
   }
 
   // ————— Improvements —————
-  for (const finding of topFindings.slice(0, 3)) {
-    improvements.push({ text: finding.title, trailing: formatUsd(finding.savingsUSD) })
+  for (const finding of stored.topFindings.slice(0, 3)) {
+    improvements.push({ text: finding.title, trailing: formatUsd(finding.savingsUSD), ...(stored.asOf ? { asOf: stored.asOf } : {}) })
   }
   if (current.cacheHitPercent > 0 && current.cacheHitPercent < 50) {
     improvements.push({ text: t('overview.signals.improve.lowCacheHit', { percent: Math.round(current.cacheHitPercent) }) })
@@ -430,6 +443,7 @@ function SignalsCard({ signals }: { signals: SignalGroups }) {
               {signals[group.key].map((signal, index) => (
                 <li className="ov-signal" key={`${signal.text}-${index}`}>
                   <span title={signal.text}>{signal.text}</span>
+                  {signal.asOf && <small className="ov-signal-age">{signal.asOf}</small>}
                   {signal.trailing && <span className="ov-signal-trailing">{signal.trailing}</span>}
                 </li>
               ))}
@@ -936,12 +950,6 @@ export function Overview({ period, provider }: { period: Period; provider: strin
   return <OverviewContent period={period} provider={provider} overview={overview} />
 }
 
-// Slow tiers. Neither report moves minute to minute, and each costs a full CLI
-// spawn (`act report --json` is not served by the resident child at all), so
-// they refresh on mount, on a manual refresh, and on these timers — never on a
-// live tick.
-const ACT_SLOW_MS = 600_000
-const YIELD_SLOW_MS = 300_000
 
 /** Combined-scope hero footer: a per-device cost breakdown plus a reachable/
  *  total device count, mirroring the menubar's combined view. An unreachable
@@ -1032,8 +1040,11 @@ export function OverviewContent({
   if (!data) {
     if (error) return <CliErrorPanel error={error} subject={t('common.subject.usage')} />
     if (headlineSnapshot) {
-      const generated = new Date(headlineSnapshot.generated)
-      const captured = Number.isNaN(generated.getTime()) ? new Date(headlineSnapshot.capturedAt) : generated
+      // The time THIS app received (and therefore verified) the payload, not
+      // the payload's own `generated`: since the poll runs --no-optimize it
+      // takes the CLI's status snapshot fast path, so `generated` can be up to
+      // a day older than the moment these numbers were confirmed.
+      const captured = new Date(headlineSnapshot.capturedAt)
       const capturedLabel = Number.isNaN(captured.getTime())
         ? t('overview.snapshot.earlier')
         : localDateKey(captured) === localDateKey(new Date())
@@ -1150,7 +1161,7 @@ export function OverviewContent({
     ? <> <span className="num">{formatUsd(optimizeBlock.savingsUSD)}</span>{t('overview.coach.recoverableSuffix')}{optimizeAge ? <small className="ov-coach-age"> ({optimizeAge})</small> : null}</>
     : null
   // A custom range has no meaningful "vs last week" or month-to-date baseline.
-  const signals = deriveSignals(data, now, rangeActive, optimizeBlock?.topFindings ?? [])
+  const signals = deriveSignals(data, now, rangeActive, { topFindings: optimizeBlock?.topFindings ?? [], asOf: optimizeAge })
   // Drill-through entry points. An expensive-session row can only open the
   // exact session when the payload carries its identity (provider + id);
   // otherwise the row keeps the plain "See all" navigation, never a guess.

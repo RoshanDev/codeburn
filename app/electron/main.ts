@@ -7,7 +7,7 @@ import path from 'node:path'
 import { CliError, DESKTOP_COLD_TIMEOUT_MS, PROGRESS_LINE_PREFIX, reapOrphanServe, resolveCodeburnPath, serveUsage, shutdownAll, spawnCli, spawnCliAction, startServe, type ActionResult, type SpawnPriority } from './cli'
 import { MenubarCompanion, readDockEnabled, STARTUP_APPS_SETTINGS_URL, type CompanionStatus } from './menubar'
 import { MacMenubar, NO_MAC_MENUBAR, type InstallPhase } from './mac-menubar'
-import { readOptimizeSnapshot, writeOptimizeSnapshot, type OptimizeBlock, type OptimizeSnapshot } from './optimize-store'
+import { readOptimizeSnapshot, sameLocalDay, writeOptimizeSnapshot, type OptimizeBlock, type OptimizeSnapshot } from './optimize-store'
 import { getQuota, sanitizeError } from './quota'
 import { Telemetry } from './telemetry'
 import { createUpdateChecker, type UpdateChecker, type UpdateStatus } from './updates'
@@ -618,11 +618,16 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
   }
 
   // The optimize scan is a DAILY figure: recomputed when nothing is cached for
-  // this scope, when the cache is older than `maxAgeMs` (24h by default), or
-  // when the renderer forces it (the Optimize page, manual refresh). Never on a
-  // poll tick. The cache key is the full argv, so a period/provider/project/
-  // config/scope change is a different entry and one scope's savings can never
-  // be served for another.
+  // this scope, when the cache is older than `maxAgeMs` (24h by default) OR was
+  // computed on an earlier local day, or when the renderer forces it (the
+  // Optimize page, manual refresh). Never on a poll tick. The cache key is the
+  // full argv, so a period/provider/project/config/scope change is a different
+  // entry and one scope's savings can never be served for another.
+  //
+  // The same-day rule is what makes the key honest: the key says
+  // `--period today` (or week/30days/month), which names a window anchored to
+  // the LOCAL day, not a fixed date. Without it a scan taken at 23:50 would be
+  // served at 00:10 as today's, and every rolling window would be a day stale.
   const OPTIMIZE_MAX_AGE_MS = 24 * 60 * 60 * 1000
   const getOptimizeSnapshot: Handler = async (period: string, provider: string, range?: DateRange, configSource?: string | null, scope?: string, maxAgeMs?: number) => {
     const argv = buildOverviewArgs(period, provider, range, configSource, scope, true)
@@ -631,9 +636,11 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
     const maxAge = typeof maxAgeMs === 'number' && maxAgeMs >= 0 ? maxAgeMs : OPTIMIZE_MAX_AGE_MS
     if (deps.stateDir) {
       const cached = readOptimizeSnapshot(deps.stateDir, key, appVersion)
-      // An unparseable computedAt yields NaN, which fails this test and
+      // An unparseable computedAt yields NaN, which fails both tests and
       // recomputes — the safe direction.
-      if (cached && Date.now() - Date.parse(cached.computedAt) < maxAge) return { ok: true, value: cached }
+      const computedAt = cached ? Date.parse(cached.computedAt) : NaN
+      const now = Date.now()
+      if (cached && now - computedAt < maxAge && sameLocalDay(computedAt, now)) return { ok: true, value: cached }
     }
     try {
       // Background priority: this must never take a CLI slot from the live
@@ -1219,7 +1226,9 @@ function bootstrap(): void {
     // battery and restores on AC.
     const broadcastPower = () => {
       const onBattery = powerMonitor.isOnBatteryPower()
-      for (const win of BrowserWindow.getAllWindows()) win.webContents.send('codeburn:power', onBattery)
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed()) win.webContents.send('codeburn:power', onBattery)
+      }
     }
     powerMonitor.on('on-battery', broadcastPower)
     powerMonitor.on('on-ac', broadcastPower)

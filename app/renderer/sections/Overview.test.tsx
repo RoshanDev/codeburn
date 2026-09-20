@@ -937,10 +937,12 @@ describe('Overview', () => {
           { title: 'Route trivial edits to Haiku', impact: 'medium', savingsUSD: 8 },
         ],
       },
-    }), now, false, [
-      { title: 'Trim CLAUDE.md preamble', impact: 'high', savingsUSD: 12 },
-      { title: 'Route trivial edits to Haiku', impact: 'medium', savingsUSD: 8 },
-    ])
+    }), now, false, {
+      topFindings: [
+        { title: 'Trim CLAUDE.md preamble', impact: 'high', savingsUSD: 12 },
+        { title: 'Route trivial edits to Haiku', impact: 'medium', savingsUSD: 8 },
+      ],
+    })
     expect(wins.wins.map(s => s.text)).toEqual([
       'Cache hit at 85%, most prompts reuse cache',
       '82% one-shot, edits land first try',
@@ -1371,5 +1373,67 @@ describe('Overview refresh tiers', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+describe('Overview stored-figure honesty', () => {
+  beforeEach(() => {
+    setActiveCurrency({ code: 'USD', symbol: '$', rate: 1 })
+    getOverview.mockReset()
+    getActReport.mockReset().mockResolvedValue({ totals: { realizedCostUSD: 0, measuredActions: 0 } })
+    getYield.mockReset().mockResolvedValue(makeYieldReport())
+    getOptimizeSnapshot.mockReset().mockResolvedValue(snapshot({ findingCount: 0, savingsUSD: 0, topFindings: [] }))
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+    __resetGeneration()
+  })
+
+  it('dates the stored findings that sit beside live signals in the Signals card', async () => {
+    const now = new Date()
+    const computedAt = new Date(Date.now() - 3 * 60 * 60_000)
+    getOptimizeSnapshot.mockResolvedValue(snapshot(
+      { findingCount: 1, savingsUSD: 12, topFindings: [{ title: 'Trim CLAUDE.md preamble', impact: 'high', savingsUSD: 12 }] },
+      computedAt.toISOString(),
+    ))
+    const payload = signalsPayload(now, {
+      current: { cacheHitPercent: 85, oneShotRate: 0.82 },
+    })
+
+    render(<OverviewContent period="30days" provider="all" overview={polled(payload)} />)
+
+    const signals = await screen.findByLabelText('Coaching signals')
+    const improvements = (await within(signals).findByText('Improvements')).closest('.ov-signal-group') as HTMLElement
+    const row = within(improvements).getByText('Trim CLAUDE.md preamble').closest('.ov-signal') as HTMLElement
+    const time = computedAt.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+    expect(within(row).getByText(`as of ${time}`)).toBeInTheDocument()
+
+    // The live rows in the same card carry no age: they came from this poll.
+    const wins = within(signals).getByText('Wins').closest('.ov-signal-group') as HTMLElement
+    const liveRow = within(wins).getByText(/Cache hit at 85%/).closest('.ov-signal') as HTMLElement
+    expect(liveRow.querySelector('.ov-signal-age')).toBeNull()
+  })
+
+  it('dates the cold-boot headline by when THIS app verified it, not the payload generated stamp', async () => {
+    // The poll takes the CLI status snapshot path, so `generated` can be a day
+    // older than the moment these numbers were confirmed.
+    const capturedAt = new Date()
+    capturedAt.setHours(9, 15, 0, 0)
+    const cold: Polled<MenubarPayload> = { data: null, error: null, loading: true, switching: false, lastSuccessAt: null, refresh: vi.fn() }
+
+    render(<OverviewContent period="30days" provider="all" overview={cold} headlineSnapshot={{
+      version: 2,
+      key: 'k',
+      capturedAt: capturedAt.getTime(),
+      generated: new Date(capturedAt.getTime() - 26 * 60 * 60_000).toISOString(),
+      label: 'Last 30 days',
+      cost: 42,
+      calls: 10,
+      inputTokens: 1, outputTokens: 1, cacheReadTokens: 1, cacheWriteTokens: 1,
+    }} />)
+
+    const head = await screen.findByText(/^exact /)
+    const time = capturedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+    expect(head).toHaveTextContent(`exact at ${time}`)
   })
 })

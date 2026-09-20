@@ -599,11 +599,77 @@ describe('usePolled', () => {
         await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
         expect(fetcher).toHaveBeenCalledTimes(2)
 
-        // Back on AC: the chosen 1m applies again.
-        rerender(tree(false))
-        const onAc = fetcher.mock.calls.length
-        await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
-        expect(fetcher.mock.calls.length).toBe(onAc + 1)
+        // Back on AC. Changing how OFTEN to poll is not a reason to poll NOW:
+        // the power transition itself must spawn nothing.
+        await act(async () => { rerender(tree(false)) })
+        expect(fetcher).toHaveBeenCalledTimes(2)
+
+        // The timer is re-armed at the restored 1m, measured from the change.
+        await act(async () => { await vi.advanceTimersByTimeAsync(59_000) })
+        expect(fetcher).toHaveBeenCalledTimes(2)
+        await act(async () => { await vi.advanceTimersByTimeAsync(1_000) })
+        expect(fetcher).toHaveBeenCalledTimes(3)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('launching on battery does not double the first fetch of every hook', async () => {
+      vi.useFakeTimers()
+      try {
+        // useOnBattery reads the bridge asynchronously, so the first render is
+        // always AC and the real answer lands a tick later. That must re-arm the
+        // timer, not re-fetch: with act on its 10-minute tier the old effect
+        // spawned a whole extra `act report` on every power transition.
+        const live = vi.fn().mockResolvedValue('x')
+        const slow = vi.fn().mockResolvedValue('x')
+        const Probe = () => {
+          usePolled(live, [])
+          usePolled(slow, [], { cadence: { slowMs: 600_000 } })
+          return null
+        }
+        const tree = (onBattery: boolean) => createElement(
+          RefreshCadenceContext.Provider,
+          { value: { value: '1m', intervalMs: resolveCadenceMs('1m', onBattery), setValue: () => {} } },
+          createElement(Probe),
+        )
+        const { rerender } = render(tree(false))
+        expect(live).toHaveBeenCalledTimes(1)
+        expect(slow).toHaveBeenCalledTimes(1)
+
+        await act(async () => { rerender(tree(true)) }) // powerStatus resolves: on battery
+        expect(live).toHaveBeenCalledTimes(1)
+        expect(slow).toHaveBeenCalledTimes(1)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('a cadence change from Settings re-arms the timer without an immediate fetch', async () => {
+      vi.useFakeTimers()
+      try {
+        const fetcher = vi.fn().mockResolvedValue('x')
+        const Probe = () => { usePolled(fetcher, []); return null }
+        const tree = (intervalMs: number | null) => createElement(
+          RefreshCadenceContext.Provider,
+          { value: { value: 'x', intervalMs, setValue: () => {} } },
+          createElement(Probe),
+        )
+        const { rerender } = render(tree(30_000))
+        expect(fetcher).toHaveBeenCalledTimes(1)
+
+        await act(async () => { rerender(tree(300_000)) }) // user picks 5m
+        expect(fetcher).toHaveBeenCalledTimes(1)
+        await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+        expect(fetcher).toHaveBeenCalledTimes(1) // old cadence is gone
+        await act(async () => { await vi.advanceTimersByTimeAsync(270_000) })
+        expect(fetcher).toHaveBeenCalledTimes(2) // new cadence fires
+
+        // Manual stops the timer, still without fetching.
+        await act(async () => { rerender(tree(null)) })
+        expect(fetcher).toHaveBeenCalledTimes(2)
+        await act(async () => { await vi.advanceTimersByTimeAsync(3_600_000) })
+        expect(fetcher).toHaveBeenCalledTimes(2)
       } finally {
         vi.useRealTimers()
       }
