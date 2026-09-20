@@ -9,6 +9,7 @@ import {
   formatGitHubReleaseLookupError,
   hasRunnableRecordedCli,
   isMissingDirectAssetError,
+  leftoverBundleLines,
   resolveLatestMenubarReleaseAssets,
   pidIsLive,
   placeMenubarBundle,
@@ -782,5 +783,19 @@ describe('pidIsLive', () => {
     } finally {
       denied.mockRestore()
     }
+  })
+})
+
+describe('leftoverBundleLines', () => {
+  const path = '/Applications/CodeBurnMenubar.app'
+
+  it('tells a terminal in prose and nothing else', () => {
+    expect(leftoverBundleLines([path], {})).toEqual([
+      `An older copy is still at ${path}. Move it to the Trash; CodeBurn will not delete it for you.`,
+    ])
+  })
+
+  it('adds a machine-readable twin for the desktop app', () => {
+    expect(leftoverBundleLines([path], { CODEBURN_PROGRESS: '1' })[1]).toBe(`CODEBURN_LEFTOVER ${path}`)
   })
 })

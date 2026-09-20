@@ -1086,7 +1086,13 @@ export type MacMenubarStatus = {
   outdated: boolean
 }
 
-export type MacMenubarInstall = { ok: boolean; error: string | null; status: MacMenubarStatus }
+export type MacMenubarInstall = {
+  ok: boolean
+  error: string | null
+  status: MacMenubarStatus
+  /** Older bundles the CLI found and left in place. Absent on the actions that never install. */
+  leftovers?: string[]
+}
 
 /** The tray app's own settings, from the two files it reads them from
  *  (windows-settings.json, windows-dock.json) plus the HKCU Run value. */

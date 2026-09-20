@@ -8,6 +8,14 @@ private let coldTimeoutNanoseconds: UInt64 = 10 * 60 * 1_000_000_000
 private let warmTimeoutNanoseconds: UInt64 = 45 * 1_000_000_000
 private let terminationGraceNanoseconds: UInt64 = 5 * 1_000_000_000
 
+/// Serve children are recorded to a pid file so a later run can reap an orphan.
+/// Tests get a scratch path; the production default is the user's cache directory.
+private func scratchPidFile() -> URL {
+    URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("serve-connection-pids", isDirectory: true)
+        .appendingPathComponent(UUID().uuidString)
+}
+
 private func currentSIGPIPEHandlerBits() -> UInt {
     var action = sigaction()
     _ = sigaction(SIGPIPE, nil, &action)
@@ -176,14 +184,16 @@ struct ServeConnectionTests {
     @Test("the resident child starts at user-initiated QoS")
     func residentChildUsesInteractiveQoS() async {
         let recorder = QualityOfServiceRecorder()
-        let connection = ServeConnection { _, qualityOfService in
-            recorder.record(qualityOfService)
-            let child = Process()
-            child.executableURL = URL(fileURLWithPath: "/bin/sh")
-            child.arguments = ["-c", "while IFS= read -r line; do :; done"]
-            child.qualityOfService = qualityOfService
-            return child
-        }
+        let connection = ServeConnection(
+            pidFile: scratchPidFile(),
+            makeProcess: { _, qualityOfService in
+                recorder.record(qualityOfService)
+                let child = Process()
+                child.executableURL = URL(fileURLWithPath: "/bin/sh")
+                child.arguments = ["-c", "while IFS= read -r line; do :; done"]
+                child.qualityOfService = qualityOfService
+                return child
+            })
 
         await connection.ensureStarted()
 
@@ -207,6 +217,7 @@ struct ServeConnectionTests {
         // its own would instead be retried on replacements until the death
         // budget surfaced ServeUnavailable.
         let connection = ServeConnection(
+            pidFile: scratchPidFile(),
             makeProcess: { _, qualityOfService in
                 let child = Process()
                 child.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -256,6 +267,7 @@ struct ServeConnectionTests {
         let clock = ManualTimeoutClock()
 
         let connection = ServeConnection(
+            pidFile: scratchPidFile(),
             makeProcess: { _, qualityOfService in
                 let child = Process()
                 child.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -378,6 +390,7 @@ struct ServeConnectionTests {
 
         let children = ProcessQueue([stuckChild, replacement])
         let connection = ServeConnection(
+            pidFile: scratchPidFile(),
             makeProcess: { _, qualityOfService in
                 children.take(qualityOfService: qualityOfService)
             },
@@ -476,6 +489,7 @@ struct ServeConnectionTests {
 
         let children = ProcessQueue([stuckChild])
         let connection = ServeConnection(
+            pidFile: scratchPidFile(),
             makeProcess: { _, qualityOfService in
                 children.take(qualityOfService: qualityOfService)
             },
@@ -546,6 +560,7 @@ struct ServeConnectionTests {
         }
         let children = ProcessQueue(processes)
         let connection = ServeConnection(
+            pidFile: scratchPidFile(),
             makeProcess: { _, qualityOfService in
                 children.take(qualityOfService: qualityOfService)
             },
@@ -610,6 +625,7 @@ struct ServeConnectionTests {
         // the late reply cannot beat the cancellation it is meant to follow
         // (#1333).
         let connection = ServeConnection(
+            pidFile: scratchPidFile(),
             makeProcess: { _, qualityOfService in
                 let child = Process()
                 child.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -689,6 +705,7 @@ struct ServeConnectionTests {
         let recorder = TimeoutRecorder()
 
         let connection = ServeConnection(
+            pidFile: scratchPidFile(),
             makeProcess: { _, qualityOfService in
                 let child = Process()
                 child.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -747,6 +764,7 @@ struct ServeConnectionTests {
         let requestMarker = dir + "/request-read"
         let recorder = TimeoutRecorder()
         let connection = ServeConnection(
+            pidFile: scratchPidFile(),
             makeProcess: { _, qualityOfService in
                 let child = Process()
                 child.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -796,6 +814,7 @@ struct ServeConnectionTests {
         let children = ProcessQueue([oldChild, newChild])
         let recorder = TimeoutRecorder()
         let connection = ServeConnection(
+            pidFile: scratchPidFile(),
             makeProcess: { _, qualityOfService in
                 children.take(qualityOfService: qualityOfService)
             },
@@ -840,6 +859,7 @@ struct ServeConnectionTests {
         let recorder = TimeoutRecorder()
 
         let connection = ServeConnection(
+            pidFile: scratchPidFile(),
             makeProcess: { _, qualityOfService in
                 let child = Process()
                 child.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -886,6 +906,7 @@ struct ServeConnectionTests {
     func failedTerminalResponseKeepsColdTimeout() async throws {
         let recorder = TimeoutRecorder()
         let connection = ServeConnection(
+            pidFile: scratchPidFile(),
             makeProcess: { _, qualityOfService in
                 let child = Process()
                 child.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -950,6 +971,7 @@ struct ServeConnectionTests {
         let children = ProcessQueue([oldChild, replacement])
         let recorder = TimeoutRecorder()
         let connection = ServeConnection(
+            pidFile: scratchPidFile(),
             makeProcess: { _, qualityOfService in
                 children.take(qualityOfService: qualityOfService)
             },
@@ -981,6 +1003,7 @@ struct ServeConnectionTests {
             child.arguments = ["-c", "IFS= read -r line; sleep 5"]
             let recorder = TimeoutRecorder()
             let connection = ServeConnection(
+                pidFile: scratchPidFile(),
                 makeProcess: { _, qualityOfService in
                     child.qualityOfService = qualityOfService
                     return child
@@ -1033,6 +1056,7 @@ struct ServeConnectionTests {
         let children = ProcessQueue([oldChild, replacement])
         let recorder = TimeoutRecorder()
         let connection = ServeConnection(
+            pidFile: scratchPidFile(),
             makeProcess: { _, qualityOfService in
                 children.take(qualityOfService: qualityOfService)
             },
@@ -1078,6 +1102,7 @@ struct ServeConnectionTests {
         let children = ProcessQueue(processes)
         let recorder = TimeoutRecorder()
         let connection = ServeConnection(
+            pidFile: scratchPidFile(),
             makeProcess: { _, qualityOfService in
                 children.take(qualityOfService: qualityOfService)
             },
@@ -1183,23 +1208,25 @@ struct ServeConnectionTests {
         defer { try? FileManager.default.removeItem(atPath: dir) }
         let requestLog = dir + "/requests.log"
 
-        let connection = ServeConnection { _, qualityOfService in
-            let child = Process()
-            child.executableURL = URL(fileURLWithPath: "/bin/sh")
-            child.arguments = ["-c", """
-                while IFS= read -r line; do
-                  printf 'request\\n' >> "$1"
-                  id=$(printf '%s' "$line" | sed -E 's/.*\"id\":([0-9]+).*/\\1/')
-                  printf '{\"id\":%s,\"progress\":\"scanning\"}\\n' "$id"
-                  printf '{\"id\":%s,\"ok\":true,\"output\":\"served\"}\\n' "$id"
-                  # Emit READY after the terminal response. The client must
-                  # register and complete the first real request without it.
-                  printf '{\"ready\":true,\"pid\":1}\\n'
-                done
-                """, "serve-fixture", requestLog]
-            child.qualityOfService = qualityOfService
-            return child
-        }
+        let connection = ServeConnection(
+            pidFile: scratchPidFile(),
+            makeProcess: { _, qualityOfService in
+                let child = Process()
+                child.executableURL = URL(fileURLWithPath: "/bin/sh")
+                child.arguments = ["-c", """
+                    while IFS= read -r line; do
+                      printf 'request\\n' >> "$1"
+                      id=$(printf '%s' "$line" | sed -E 's/.*\"id\":([0-9]+).*/\\1/')
+                      printf '{\"id\":%s,\"progress\":\"scanning\"}\\n' "$id"
+                      printf '{\"id\":%s,\"ok\":true,\"output\":\"served\"}\\n' "$id"
+                      # Emit READY after the terminal response. The client must
+                      # register and complete the first real request without it.
+                      printf '{\"ready\":true,\"pid\":1}\\n'
+                    done
+                    """, "serve-fixture", requestLog]
+                child.qualityOfService = qualityOfService
+                return child
+            })
 
         await connection.ensureStarted()
         let payload = try await connection.request(args: ["status", "--format", "menubar-json"])
@@ -1232,9 +1259,11 @@ struct ServeConnectionTests {
             """]
 
         let children = ProcessQueue([first, replacement])
-        let connection = ServeConnection { _, qualityOfService in
-            children.take(qualityOfService: qualityOfService)
-        }
+        let connection = ServeConnection(
+            pidFile: scratchPidFile(),
+            makeProcess: { _, qualityOfService in
+                children.take(qualityOfService: qualityOfService)
+            })
 
         let drained = try await connection.request(args: ["status", "drain"])
         #expect(String(decoding: drained, as: UTF8.self) == "final-drain")
@@ -1252,13 +1281,15 @@ struct ServeConnectionTests {
         let closedMarker = dir + "/stdin-closed"
         let sigpipeHandlerBefore = currentSIGPIPEHandlerBits()
 
-        let connection = ServeConnection { _, qualityOfService in
-            let child = Process()
-            child.executableURL = URL(fileURLWithPath: "/bin/sh")
-            child.arguments = ["-c", "exec 0<&-; : > \"$1\"; sleep 2", "serve-fixture", closedMarker]
-            child.qualityOfService = qualityOfService
-            return child
-        }
+        let connection = ServeConnection(
+            pidFile: scratchPidFile(),
+            makeProcess: { _, qualityOfService in
+                let child = Process()
+                child.executableURL = URL(fileURLWithPath: "/bin/sh")
+                child.arguments = ["-c", "exec 0<&-; : > \"$1\"; sleep 2", "serve-fixture", closedMarker]
+                child.qualityOfService = qualityOfService
+                return child
+            })
 
         await connection.ensureStarted()
         #expect(currentSIGPIPEHandlerBits() == sigpipeHandlerBefore)

@@ -407,10 +407,23 @@ export async function placeMenubarBundle(
   }
 }
 
-function reportLeftoverBundles(leftovers: string[]): void {
+/// Machine-readable twin of the sentence below, for the desktop app's install
+/// reader (app/electron/mac-menubar.ts), which would otherwise have to match
+/// English prose. Gated the same way scan progress is, so a terminal sees only
+/// the sentence.
+export const LEFTOVER_LINE_PREFIX = 'CODEBURN_LEFTOVER '
+
+export function leftoverBundleLines(leftovers: string[], env: NodeJS.ProcessEnv = process.env): string[] {
+  const lines: string[] = []
   for (const path of leftovers) {
-    console.log(`An older copy is still at ${path}. Move it to the Trash; CodeBurn will not delete it for you.`)
+    lines.push(`An older copy is still at ${path}. Move it to the Trash; CodeBurn will not delete it for you.`)
+    if (env['CODEBURN_PROGRESS'] === '1') lines.push(`${LEFTOVER_LINE_PREFIX}${path}`)
   }
+  return lines
+}
+
+function reportLeftoverBundles(leftovers: string[]): void {
+  for (const line of leftoverBundleLines(leftovers)) console.log(line)
 }
 
 async function exists(path: string): Promise<boolean> {

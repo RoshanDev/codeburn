@@ -395,9 +395,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             lastSuccessAt: lastSuccessfulUsageDataSnapshotAt,
             force: false
         )
+#if DEBUG
         if shouldSkip {
             NSLog("CodeBurn: skipping unchanged background usage refresh")
         }
+#endif
         return shouldSkip
     }
 

@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, existsSync, readFileSync, statSync, writeFileSy
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { DOCK_ENABLED_KEY, MENUBAR_BUNDLE_ID, NO_ANSWER, OLDEST_ASKABLE, REMOTE_COMMAND_KEY, MacMenubar, installErrorMessage, installPhase, isOlderThan } from './mac-menubar'
+import { DOCK_ENABLED_KEY, MENUBAR_BUNDLE_ID, NO_ANSWER, OLDEST_ASKABLE, REMOTE_COMMAND_KEY, MacMenubar, installErrorMessage, installPhase, isOlderThan, leftoverBundle } from './mac-menubar'
 
 const HOME = '/Users/tester'
 const USER_APP = `${HOME}/Applications/CodeBurnMenubar.app`
@@ -570,5 +570,34 @@ describe('install progress', () => {
     })
     await menubar.install()
     expect(seen).toEqual(['Downloading', 'Downloading', 'Verifying', 'Installing', 'Installing', 'Starting'])
+  })
+
+  it('collects the leftover bundles the CLI reports, and asks for them', async () => {
+    let env: NodeJS.ProcessEnv | undefined
+    const menubar = new MacMenubar({
+      platform: 'darwin', mas: false, home: HOME,
+      run: async () => null,
+      exists: () => true,
+      runCli: async (_args, opts) => {
+        env = opts?.extraEnv
+        opts?.onStdout?.('An older copy is still at /Applications/CodeBurnMenubar.app. Move it to the Trash.\n')
+        opts?.onStdout?.('CODEBURN_LEFTOVER /Applications/CodeBurnMenubar.app\n')
+        return { ok: true, stdout: '', stderr: '', code: 0 }
+      },
+    })
+
+    const result = await menubar.install()
+
+    // The prose line is the terminal's; only the marker reaches the card.
+    expect(result.leftovers).toEqual(['/Applications/CodeBurnMenubar.app'])
+    expect(env).toEqual({ CODEBURN_PROGRESS: '1' })
+  })
+})
+
+describe('leftoverBundle', () => {
+  it('reads the path off a marker line and ignores everything else', () => {
+    expect(leftoverBundle('CODEBURN_LEFTOVER /Applications/CodeBurnMenubar.app')).toBe('/Applications/CodeBurnMenubar.app')
+    expect(leftoverBundle('An older copy is still at /Applications/CodeBurnMenubar.app.')).toBeNull()
+    expect(leftoverBundle('CODEBURN_LEFTOVER ')).toBeNull()
   })
 })

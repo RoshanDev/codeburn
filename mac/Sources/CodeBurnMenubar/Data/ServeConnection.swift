@@ -61,6 +61,7 @@ actor ServeConnection {
     private let timeoutSleep: TimeoutSleep
     private let terminationGraceSleep: TimeoutSleep
     private let responseLimitBytes: Int
+    private let pidFile: URL
 
     private static let maxDeaths = 3
     static let maxResponseBytes = 16 * 1024 * 1024
@@ -94,6 +95,9 @@ actor ServeConnection {
     }
 
     init(
+        // First so tests, which all pass `makeProcess`, cannot silently inherit
+        // the real user cache directory.
+        pidFile: URL = ServeOrphanReaper.pidFileURL(),
         makeProcess: @escaping ProcessFactory = CodeburnCLI.makeProcess,
         timeoutSleep: @escaping TimeoutSleep = { nanoseconds in
             try await Task<Never, Never>.sleep(nanoseconds: nanoseconds)
@@ -103,6 +107,7 @@ actor ServeConnection {
         },
         responseLimitBytes: Int = ServeConnection.maxResponseBytes
     ) {
+        self.pidFile = pidFile
         self.makeProcess = makeProcess
         self.timeoutSleep = timeoutSleep
         self.terminationGraceSleep = terminationGraceSleep
@@ -132,7 +137,7 @@ actor ServeConnection {
         // Before adding a child, clear the one a crashed previous run (or an
         // earlier generation of this one) left behind. Idempotent: the recorded
         // pid is only signalled if it is still that exact serve command.
-        ServeOrphanReaper.reap()
+        ServeOrphanReaper.reap(at: pidFile)
         // This single resident serves both background and user-visible status
         // requests. Its cold hydration replaces the old interactive one-shot,
         // so keep the child at the same user-initiated QoS as visible fetches.
@@ -166,6 +171,7 @@ actor ServeConnection {
         // Record the argv WITHOUT the `/usr/bin/env --` prefix: that is the part
         // exec rewrites away before `ps` can see it. See serveCommandMatches.
         ServeOrphanReaper.record(
+            at: pidFile,
             pid: child.processIdentifier,
             command: (child.arguments ?? []).drop(while: { $0 == "--" }).joined(separator: " ")
         )
@@ -632,8 +638,7 @@ enum ServeOrphanReaper {
             .appendingPathComponent("menubar-serve.pid", isDirectory: false)
     }
 
-    static func record(pid: pid_t, command: String) {
-        let url = pidFileURL()
+    static func record(at url: URL = pidFileURL(), pid: pid_t, command: String) {
         try? FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
@@ -647,19 +652,22 @@ enum ServeOrphanReaper {
     /// recycled — signals it only after `ps` confirms the process is still that
     /// exact serve child. SIGTERM, never SIGKILL: the orphan may be holding the
     /// cache refresh lock and can release it on the way out.
-    static func reap() {
-        let url = pidFileURL()
+    static func reap(at url: URL = pidFileURL()) {
         defer { try? FileManager.default.removeItem(at: url) }
         guard let data = try? Data(contentsOf: url),
               let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let pid = record["pid"] as? Int,
               let cmd = record["cmd"] as? String,
               pid > 1, pid != Int(ProcessInfo.processInfo.processIdentifier),
-              !cmd.isEmpty,
+              cmd.hasSuffix(serveArgvSuffix),
               serveCommandMatches(recorded: cmd, observed: commandLine(of: pid_t(pid)))
         else { return }
         _ = Darwin.kill(pid_t(pid), SIGTERM)
     }
+
+    /// The tail every `codeburn serve` argv ends with. A record that does not
+    /// carry it was not written for a serve child and is never signalled.
+    static let serveArgvSuffix = "serve --stdio"
 
     /// Suffix match on the full recorded argv, not a keyword sniff: any looser
     /// test signals whatever unrelated process inherited the pid.

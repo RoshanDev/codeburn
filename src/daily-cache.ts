@@ -4,6 +4,7 @@ import { mkdir, open, readdir, readFile, rename, stat, unlink } from 'fs/promise
 import { join } from 'path'
 
 import { getCodeburnCacheDir } from './cache-dir.js'
+import { sweepSupersededCacheFiles } from './cache-sweep.js'
 import type { ProjectFilterTarget } from './parser.js'
 import type { DateRange, ProjectSummary } from './types.js'
 
@@ -698,6 +699,8 @@ export async function saveDailyCache(cache: DailyCache): Promise<void> {
     try { await unlink(tempPath) } catch { /* ignore */ }
     throw err
   }
+  // Off the hot path and at most once a day: the save is already done.
+  await sweepSupersededCacheFiles()
 }
 
 export function addNewDays(cache: DailyCache, incoming: DailyEntry[], newestDate: string): DailyCache {
