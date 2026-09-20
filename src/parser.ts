@@ -32,6 +32,7 @@ import {
   computeEnvFingerprint,
   DURABLE_PROVIDER_NAMES,
   fingerprintFile,
+  hasDirtyDurableProvider,
   isCacheComplete,
   isCacheCurrent,
   isCacheDirty,
@@ -6150,7 +6151,12 @@ async function runParseInner(
     // published, so this object's months were reloaded into a different one,
     // and what the old one held is simply re-parsed.
     if (pendingShardPublish && pendingShardPublish !== diskCache) pendingShardPublish = null
+    // A durable provider's cache entry is the only record of that spend once
+    // the provider prunes its own files, so its window is published on the poll
+    // that parsed it — exactly as it was before coalescing existed. Holding it
+    // would put the spend one `kill -9` away from being gone for good.
     if (shardPublishCoalescing && !completenessChanged && !isCold
+      && !hasDirtyDurableProvider(diskCache)
       && Date.now() - lastShardPublishAt < SHARD_PUBLISH_COALESCE_MS) {
       // Held, not lost: the entries stay in this cache object — the one the
       // next load memo hands back, dirty flags and all — until a later refresh

@@ -94,6 +94,8 @@ afterEach(async () => {
   clearSessionCache()
   clearLoadCacheMemo()
   delete process.env['CODEBURN_PARSE_BURST_MS']
+  delete process.env['CODEBURN_COPILOT_SESSION_STATE_DIR']
+  delete process.env['CODEBURN_COPILOT_DISABLE_OTEL']
   await rm(tmpDir, { recursive: true, force: true })
 })
 
@@ -208,15 +210,16 @@ describe('incremental discovery sweep', () => {
 describe('coalesced shard publication', () => {
   // Read the published shards straight off disk: the usual test reader drops the
   // load memo, and dropping it is exactly what retires a held publish.
-  const claudeFiles = async (): Promise<string[]> => {
+  const publishedFiles = async (provider = 'claude'): Promise<Record<string, { turns: unknown[] }>> => {
     const dir = sessionCacheDir()
     const envelope = JSON.parse(await readFile(join(dir, 'envelope.json'), 'utf-8')) as
       { providers: Record<string, { shards: Record<string, { name: string }> }> }
-    const names = Object.values(envelope.providers['claude']?.shards ?? {}).map(s => s.name)
-    const paths: string[] = []
-    for (const name of names) paths.push(...Object.keys(JSON.parse(await readFile(join(dir, name), 'utf-8'))))
-    return paths
+    const names = Object.values(envelope.providers[provider]?.shards ?? {}).map(s => s.name)
+    const files: Record<string, { turns: unknown[] }> = {}
+    for (const name of names) Object.assign(files, JSON.parse(await readFile(join(dir, name), 'utf-8')))
+    return files
   }
+  const claudeFiles = async (): Promise<string[]> => Object.keys(await publishedFiles())
 
   it('publishes the first time, holds the next, and flushes on shutdown', async () => {
     const path = await session('p', 's.jsonl', 1)
@@ -280,12 +283,97 @@ describe('coalesced shard publication', () => {
     expect(await claudeFiles()).toContain(foreign)
     expect(await claudeFiles()).not.toContain(extra)
 
-    // Nothing is lost: the dropped window is simply re-parsed and republished.
+    // Nothing is lost — for a provider whose transcripts are still on disk: the
+    // dropped window is simply re-parsed and republished. That is NOT true of a
+    // durable provider, whose cache entry is the only surviving record once it
+    // prunes its own files; those windows are never held (see below).
     setShardPublishCoalescing(false)
     fake.changed = [extra, foreign]
     expect(totalCalls(await poll())).toBe(3)
     const merged = await claudeFiles()
     expect(merged).toContain(foreign)
     expect(merged).toContain(extra)
+  })
+
+  // Copilot's cache entry is the only record of that spend once Copilot prunes
+  // its own files, so a window containing one may never be held: a kill -9
+  // between the poll and the flush would lose it for good.
+  const copilotEvents = async (name: string, calls: number): Promise<string> => {
+    const dir = join(tmpDir, 'copilot', 'session-state', name)
+    await mkdir(dir, { recursive: true })
+    const path = join(dir, 'events.jsonl')
+    const lines = [JSON.stringify({ type: 'session.start', timestamp: '2026-05-15T10:00:00Z', data: { selectedModel: 'gpt-4o' } })]
+    for (let i = 0; i < calls; i++) {
+      lines.push(JSON.stringify({
+        type: 'assistant.message', timestamp: `2026-05-15T10:00:0${i}Z`,
+        data: { messageId: `m-${name}-${i}`, model: 'gpt-4o', outputTokens: 1000 },
+      }))
+    }
+    await writeFile(path, lines.join('\n') + '\n')
+    return path
+  }
+
+  it('never holds a window that a durable provider dirtied', async () => {
+    process.env['CODEBURN_COPILOT_SESSION_STATE_DIR'] = join(tmpDir, 'copilot', 'session-state')
+    process.env['CODEBURN_COPILOT_DISABLE_OTEL'] = '1'
+    const claude = await session('p', 's.jsonl', 1)
+    const copilot = await copilotEvents('sess', 1)
+    installWatcher()
+    setShardPublishCoalescing(true)
+
+    await parseAllSessions()
+    expect(hasPendingShardPublish()).toBe(false)
+
+    // A claude-only change inside the window is still held: nothing else keeps
+    // that record, but the transcript itself does.
+    const extra = await session('p', 'later.jsonl', 2)
+    fake.changed = [extra]
+    await poll()
+    expect(hasPendingShardPublish()).toBe(true)
+    await flushPendingShardPublish()
+
+    // The same window, now also carrying new copilot turns, publishes on the
+    // poll that parsed them — before any flush runs.
+    await copilotEvents('sess', 3)
+    fake.changed = [claude, copilot]
+    await poll()
+    expect(hasPendingShardPublish()).toBe(false)
+    expect((await publishedFiles('copilot'))[copilot]?.turns).toHaveLength(3)
+
+    // An UNCHANGED durable section must not defeat coalescing for everyone
+    // else: only a dirtied one forces the publish.
+    const third = await session('p', 'third.jsonl', 1)
+    fake.changed = [third]
+    await poll()
+    expect(hasPendingShardPublish()).toBe(true)
+  })
+
+  // src/serve.ts's RSS guard clears the load memo. A held window that is not
+  // published FIRST is not merely delayed — isCacheCurrent() no longer matches,
+  // so the later flush drops it.
+  it('flushing before the load memo is cleared publishes; after, it discards', async () => {
+    const path = await session('p', 's.jsonl', 1)
+    installWatcher()
+    setShardPublishCoalescing(true)
+    await parseAllSessions()
+
+    const extra = await session('p', 'later.jsonl', 2)
+    fake.changed = [extra]
+    await poll()
+    expect(hasPendingShardPublish()).toBe(true)
+
+    // What serve.ts does: flush, then clear.
+    await flushPendingShardPublish()
+    clearLoadCacheMemo()
+    expect((await claudeFiles()).sort()).toEqual([path, extra].sort())
+
+    // The other order loses the window.
+    const third = await session('p', 'third.jsonl', 1)
+    fake.changed = [third]
+    await poll()
+    expect(hasPendingShardPublish()).toBe(true)
+    clearLoadCacheMemo()
+    await flushPendingShardPublish()
+    expect(await claudeFiles()).not.toContain(third)
   })
 })

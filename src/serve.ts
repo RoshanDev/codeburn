@@ -844,11 +844,18 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
         // margin, so a warm cache sitting above the ceiling is not dropped on
         // every request.
         if (rss > lastClearRss + SERVE_RSS_CLEAR_MARGIN_BYTES) {
-          const { clearSessionCache } = await import('./parser.js')
+          const { clearSessionCache, flushPendingShardPublish } = await import('./parser.js')
           const { clearLoadCacheMemo } = await import('./session-cache.js')
           const { clearCodexMemCaches } = await import('./codex-cache.js')
           const { clearAntigravityCacheStates } = await import('./providers/antigravity.js')
           const { clearScanFileMemo } = await import('./optimize.js')
+          // Before the clears, not after: the held window strongly references
+          // the whole cache (so clearing without it frees nothing), and
+          // clearLoadCacheMemo() makes a later flush see a cache that is no
+          // longer current and DISCARD the window. Here the memo still matches,
+          // so it publishes. Safe to await: requests and the background fill
+          // share one promise chain, so no parse can be mid-flight.
+          await flushPendingShardPublish()
           clearSessionCache()
           clearLoadCacheMemo()
           clearCodexMemCaches()

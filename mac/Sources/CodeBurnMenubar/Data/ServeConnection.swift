@@ -491,6 +491,45 @@ actor ServeConnection {
         guard activeRequest == nil, queuedRequests.isEmpty, let child = process else { return }
         retireCurrentGeneration(countsAsDeath: false)
         cancelTimeouts(ownedBy: child)
+        flushThenTerminate(child)
+    }
+
+    /// Let a deliberately retired child exit on its own first. `retireCurrentGeneration`
+    /// has just closed our end of its stdin, and EOF is what makes `serve --stdio`
+    /// publish its coalesced shard window before exiting. SIGTERM in the same hop
+    /// kills that flush: the CLI catches it only to unlink its cache lock and then
+    /// re-raises (src/session-cache.ts). So wait out one grace and signal only a
+    /// child that is still running — reusing `terminationTasks`, so `shutdown()`
+    /// cancels this exactly like the termination grace it replaces and stays bounded.
+    private func flushThenTerminate(_ child: Process) {
+        guard child.isRunning else {
+            ServeChildRegistry.shared.remove(child)
+            return
+        }
+        let generation = ObjectIdentifier(child)
+        let sleep = terminationGraceSleep
+        terminationTasks[generation] = Task.detached { [weak self] in
+            do {
+                try await sleep(Self.terminationGraceNanoseconds)
+            } catch {
+                // Cancelled: either shutdown (which must not orphan a child that
+                // is ignoring EOF) or the child already died and its stream
+                // finished. Escalate either way; the isRunning guard inside makes
+                // the dead-child case a no-op.
+                await self?.forceKillAfterGrace(child)
+                return
+            }
+            await self?.terminateAfterFlushGrace(child)
+        }
+    }
+
+    private func terminateAfterFlushGrace(_ child: Process) {
+        terminationTasks.removeValue(forKey: ObjectIdentifier(child))
+        // Exited on its own inside the grace: it flushed, nothing left to signal.
+        guard child.isRunning else {
+            ServeChildRegistry.shared.remove(child)
+            return
+        }
         terminateTimedOutChild(child)
     }
 

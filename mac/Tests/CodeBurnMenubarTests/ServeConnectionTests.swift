@@ -199,6 +199,25 @@ private func makeEchoFixture(pidsFile: String) -> Process {
     return child
 }
 
+/// A serve fixture that RECORDS every SIGTERM it receives into `signalsFile`
+/// instead of dying from one, and exits on stdin EOF. `ignoreEOF` keeps it alive
+/// past EOF, modelling a child that only a signal can end.
+private func makeSignalRecordingFixture(pidsFile: String, signalsFile: String, ignoreEOF: Bool = false) -> Process {
+    let child = Process()
+    child.executableURL = URL(fileURLWithPath: "/bin/sh")
+    let tail = ignoreEOF ? "while :; do sleep 0.1; done" : "exit 0"
+    child.arguments = ["-c", """
+        trap 'printf T >> "$2"' TERM
+        printf '%s\n' "$$" >> "$1"
+        while IFS= read -r line; do
+          id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\\1/')
+          printf '{"id":%s,"ok":true,"output":"reply-%s"}\n' "$id" "$id"
+        done
+        \(tail)
+        """, "serve-fixture", pidsFile, signalsFile]
+    return child
+}
+
 private func recordedPids(_ pidsFile: String) throws -> [Substring] {
     try String(contentsOfFile: pidsFile, encoding: .utf8).split(separator: "\n")
 }
@@ -1428,6 +1447,90 @@ struct ServeConnectionTests {
             await requestClock.history() == [coldTimeoutNanoseconds, coldTimeoutNanoseconds]
         }
         #expect(coldTwice)
+        await connection.shutdown()
+    }
+
+    @Test("an idle retire closes stdin first and signals nothing that exits on EOF")
+    func idleRetireClosesStdinBeforeSignalling() async throws {
+        let dir = NSTemporaryDirectory() + "serve-connection-retire-stdin-test-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let pidsFile = dir + "/pids"
+        let signalsFile = dir + "/signals"
+        let idleClock = ManualTimeoutClock()
+        let graceClock = ManualTimeoutClock()
+        // EOF is what makes `serve --stdio` publish its coalesced shard window,
+        // and SIGTERM is caught only to unlink the cache lock before being
+        // re-raised — so a signal in the same hop kills the flush.
+        let first = makeSignalRecordingFixture(pidsFile: pidsFile, signalsFile: signalsFile)
+        let second = makeSignalRecordingFixture(pidsFile: pidsFile, signalsFile: signalsFile)
+        let children = ProcessQueue([first, second])
+        defer { killIfRunning([first, second]) }
+
+        let connection = ServeConnection(
+            pidFile: scratchPidFile(),
+            makeProcess: { _, qualityOfService in children.take(qualityOfService: qualityOfService) },
+            timeoutSleep: { nanoseconds in try await ManualTimeoutClock().sleep(nanoseconds) },
+            terminationGraceSleep: { nanoseconds in try await graceClock.sleep(nanoseconds) },
+            idleSeconds: idleWindowSeconds,
+            idleSleep: { nanoseconds in try await idleClock.sleep(nanoseconds) }
+        )
+
+        _ = try await connection.request(args: ["status", "--first"])
+        #expect(await eventually { await idleClock.snapshot() == [idleWindowNanoseconds] })
+        await idleClock.fireOldest()
+
+        let exited = await eventually { !first.isRunning }
+        #expect(exited)
+        #expect(first.terminationReason == .exit)
+        #expect(first.terminationStatus == 0)
+        // The grace was armed but never fired, and nothing was signalled.
+        #expect(await graceClock.firedCount() == 0)
+        #expect((try? String(contentsOfFile: signalsFile, encoding: .utf8)) == nil)
+
+        // The next request still gets a fresh resident.
+        _ = try await connection.request(args: ["status", "--second"])
+        #expect(await connection.residentChildForTesting === second)
+        await connection.shutdown()
+    }
+
+    @Test("a retired child that ignores EOF is still terminated after the grace")
+    func idleRetireTerminatesAChildThatIgnoresEOF() async throws {
+        let dir = NSTemporaryDirectory() + "serve-connection-retire-stuck-test-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let pidsFile = dir + "/pids"
+        let signalsFile = dir + "/signals"
+        let idleClock = ManualTimeoutClock()
+        let graceClock = ManualTimeoutClock()
+        let stuck = makeSignalRecordingFixture(pidsFile: pidsFile, signalsFile: signalsFile, ignoreEOF: true)
+        let children = ProcessQueue([stuck])
+        defer { killIfRunning([stuck]) }
+
+        let connection = ServeConnection(
+            pidFile: scratchPidFile(),
+            makeProcess: { _, qualityOfService in children.take(qualityOfService: qualityOfService) },
+            timeoutSleep: { nanoseconds in try await ManualTimeoutClock().sleep(nanoseconds) },
+            terminationGraceSleep: { nanoseconds in try await graceClock.sleep(nanoseconds) },
+            idleSeconds: idleWindowSeconds,
+            idleSleep: { nanoseconds in try await idleClock.sleep(nanoseconds) }
+        )
+
+        _ = try await connection.request(args: ["status", "--first"])
+        #expect(await eventually { await idleClock.snapshot() == [idleWindowNanoseconds] })
+        await idleClock.fireOldest()
+
+        // The flush grace is armed; the child is still alive inside it.
+        #expect(await eventually { await graceClock.snapshot().count == 1 })
+        #expect(stuck.isRunning)
+        #expect((try? String(contentsOfFile: signalsFile, encoding: .utf8)) == nil)
+
+        // Grace elapses: only now is it signalled.
+        await graceClock.fireOldest()
+        let signalled = await eventually {
+            (try? String(contentsOfFile: signalsFile, encoding: .utf8)) == "T"
+        }
+        #expect(signalled)
         await connection.shutdown()
     }
 

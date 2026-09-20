@@ -77,6 +77,12 @@ const MAX_RUNTIME_MS = 15 * 60_000
 // dead pid — self-healing, but via the stale-takeover path rather than a clean
 // release. Neither signal publishes a partial parse; nothing does.
 const KILL_GRACE_MS = 5_000
+// How long a deliberately retired serve child may take to publish its coalesced
+// shard window after stdin EOF before it is signalled anyway. Measured at
+// ~0.9-1.0s on a large corpus; 2.5s leaves headroom without making a retire
+// visible to anything (nothing waits on it — the next request starts a fresh
+// child immediately).
+const SERVE_FLUSH_GRACE_MS = 2_500
 // Quit has a stricter user-visible budget than ordinary request timeouts. Give
 // the CLI enough time to catch SIGTERM and release its cache locks, then reap
 // every remaining process-group member before Electron exits.
@@ -559,6 +565,28 @@ function killGracefully(child: ChildProcess): void {
   grace.unref?.()
 }
 
+/** Retire a serve child the way `serve --stdio` expects: EOF on stdin ends its
+ *  read loop, which publishes the coalesced shard window on the way out. No
+ *  signal is sent while that runs — SIGTERM is caught only to unlink the cache
+ *  lock and is then re-raised (src/session-cache.ts), so it kills the flush.
+ *  Only a child still alive after the grace is handed to {@link killGracefully}.
+ *  The child stays in `activeChildren` throughout, so a quit landing inside the
+ *  window still reaps it. */
+function retireWithFlush(child: ChildProcess): void {
+  activeChildren.add(child)
+  let grace: NodeJS.Timeout | undefined
+  const settle = () => { activeChildren.delete(child); if (grace) clearTimeout(grace) }
+  child.once('exit', () => { if (!ownedTreeAlive(child)) settle() })
+  // A child whose stdin is already gone never sees a new EOF; the grace still
+  // bounds it and the signal below still lands.
+  try { child.stdin?.end() } catch { /* already closed */ }
+  grace = setTimeout(() => {
+    if (ownedTreeAlive(child)) killGracefully(child)
+    else settle()
+  }, SERVE_FLUSH_GRACE_MS)
+  grace.unref?.()
+}
+
 /** Progress heartbeats share the stderr stream with real diagnostics, and every
  *  read spawn now enables them — so they must never become the error message. */
 function withoutProgressLines(stderr: string): string {
@@ -771,10 +799,12 @@ class ServeClient {
       // anyway: nothing else may kill a child that has work on the wire.
       if (this.pending.size > 0 || !child) return
       // Deliberate, like a mutation restart: detach first so the exit event
-      // cannot spend the unexpected-death budget, then let it release its cache
-      // lock on SIGTERM. No restart here — the next request lazily starts one.
+      // cannot spend the unexpected-death budget, then close its stdin so it
+      // publishes its held shard window and exits on its own. No restart here —
+      // the next request lazily starts one, and the outgoing child's late exit
+      // is inert once it is no longer `this.child`.
       this.onDeath(child, false)
-      killGracefully(child)
+      retireWithFlush(child)
     }, this.idleMs)
     this.idleTimer.unref?.()
   }
@@ -891,11 +921,12 @@ class ServeClient {
     const child = this.child
     if (child) {
       // This is an intentional replacement, not a crash. Detach first so the
-      // later exit event cannot consume the unexpected-death budget. The
-      // outgoing child may hold the refresh lock, so it gets the same SIGTERM
-      // grace a timed-out one does and can unlink that lock on its way out.
+      // later exit event cannot consume the unexpected-death budget, then close
+      // its stdin: the outgoing child publishes its held shard window and exits
+      // cleanly, releasing the refresh lock it may hold. Only if it is still
+      // alive after the grace does it get the old SIGTERM treatment.
       this.onDeath(child, false)
-      killGracefully(child)
+      retireWithFlush(child)
     }
     this.start()
   }

@@ -1129,33 +1129,42 @@ describe('resident serve single-flight', { timeout: 30_000 }, () => {
     expect(readMaybe(files.actionsFile)).toBe('a')
   })
 
-  posixOnly('SIGTERMs the outgoing resident on a mutation restart instead of hard-killing it', async () => {
-    // A settings mutation replaces a child that may hold the cache refresh lock.
-    // Same hazard as a timeout, so it gets the same grace: only a catchable
-    // signal lets the outgoing child unlink its own lock instead of leaving it
-    // for the next parse's stale-pid takeover.
+  posixOnly('retires the outgoing resident on EOF, and signals it only if it ignores EOF', async () => {
+    // A settings mutation replaces a child that may hold the cache refresh lock
+    // and a held shard window. Closing stdin lets it publish that window and
+    // unlink its own lock on the way out; SIGTERM is the fallback for a child
+    // that does not end on EOF, not the first move.
+    const eofFile = join(dir, 'restart-eof')
     const signalFile = join(dir, 'restart-signals')
-    fakeBin(
-      'sigterm-aware-resident.js',
+    const residentBin = (ignoreEof: boolean): string =>
       `const fs = require('node:fs'); const readline = require('node:readline');
        const command = process.argv[2];
        if (command === 'serve') {
          process.on('SIGTERM', () => { fs.appendFileSync(${JSON.stringify(signalFile)}, 'TERM'); process.exit(0); });
          const rl = readline.createInterface({ input: process.stdin });
+         if (${ignoreEof}) setInterval(() => {}, 1000);
+         else rl.on('close', () => { fs.appendFileSync(${JSON.stringify(eofFile)}, 'EOF'); process.exit(0); });
          rl.on('line', line => {
            const request = JSON.parse(line);
            process.stdout.write(JSON.stringify({ id: request.id, ok: true, output: JSON.stringify({ via: 'serve' }) }) + '\\n');
          });
        } else {
          process.stdout.write('currency updated');
-       }`,
-    )
-    startServe()
+       }`
 
+    fakeBin('eof-aware-resident.js', residentBin(false))
+    startServe()
     await expect(spawnCli(['status'], { timeoutMs: 5_000 })).resolves.toEqual({ via: 'serve' })
     await expect(spawnCliAction(['currency', 'EUR'], { timeoutMs: 5_000 })).resolves.toMatchObject({ ok: true })
+    await waitFor(() => readMaybe(eofFile) === 'EOF')
+    expect(readMaybe(signalFile)).toBe('')
 
-    await waitFor(() => readMaybe(signalFile) === 'TERM')
+    killAll()
+    fakeBin('eof-aware-resident.js', residentBin(true))
+    startServe()
+    await expect(spawnCli(['status'], { timeoutMs: 5_000 })).resolves.toEqual({ via: 'serve' })
+    await expect(spawnCliAction(['currency', 'EUR'], { timeoutMs: 5_000 })).resolves.toMatchObject({ ok: true })
+    await waitFor(() => readMaybe(signalFile) === 'TERM', 10_000)
   })
 
   it('preserves the unexpected-death budget across mutation restarts', async () => {
@@ -1316,17 +1325,22 @@ describe('resident serve single-flight', { timeout: 30_000 }, () => {
   })
 })
 
-/** A resident that reports its SIGTERM before exiting, so a retire is observable
- * without probing pids (a signalled child is briefly a zombie, which answers
- * `kill(pid, 0)`). `--slow` delays one answer; `lateExitMs` holds the exit open
- * past the replacement's start. */
-function fakeRetiringBin(lateExitMs = 0): {
+/** A resident that reports how it was retired, so a retire is observable without
+ * probing pids (a signalled child is briefly a zombie, which answers
+ * `kill(pid, 0)`). It goes away on stdin EOF — like `serve --stdio`, which
+ * publishes its coalesced shard window there — and records any SIGTERM it
+ * received separately, so a test can pin that none was sent. `--slow` delays one
+ * answer; `lateExitMs` holds the exit open past the replacement's start;
+ * `ignoreEof` models a child that does not end on EOF and must still be reaped. */
+function fakeRetiringBin(lateExitMs = 0, ignoreEof = false): {
   startsFile: string
   deathsFile: string
+  signalsFile: string
   oneShotsFile: string
 } {
   const startsFile = join(dir, 'retire-starts')
   const deathsFile = join(dir, 'retire-deaths')
+  const signalsFile = join(dir, 'retire-signals')
   const oneShotsFile = join(dir, 'retire-one-shots')
   fakeBin(
     'retiring-resident.js',
@@ -1335,11 +1349,13 @@ function fakeRetiringBin(lateExitMs = 0): {
      if (command === 'serve') {
        fs.appendFileSync(${JSON.stringify(startsFile)}, 's');
        const generation = fs.readFileSync(${JSON.stringify(startsFile)}, 'utf8').length;
-       process.on('SIGTERM', () => {
+       const retire = () => {
          fs.appendFileSync(${JSON.stringify(deathsFile)}, 'x');
          setTimeout(() => process.exit(0), ${lateExitMs});
-       });
+       };
+       process.on('SIGTERM', () => { fs.appendFileSync(${JSON.stringify(signalsFile)}, 'T'); retire(); });
        const rl = readline.createInterface({ input: process.stdin });
+       if (${ignoreEof}) setInterval(() => {}, 1000); else rl.on('close', retire);
        rl.on('line', line => {
          const request = JSON.parse(line);
          const answer = () => process.stdout.write(JSON.stringify({
@@ -1357,7 +1373,7 @@ function fakeRetiringBin(lateExitMs = 0): {
        process.stdout.write(JSON.stringify({ via: 'spawn' }));
      }`,
   )
-  return { startsFile, deathsFile, oneShotsFile }
+  return { startsFile, deathsFile, signalsFile, oneShotsFile }
 }
 
 describe('resident serve idle retire', { timeout: 30_000 }, () => {
@@ -1447,6 +1463,37 @@ describe('resident serve idle retire', { timeout: 30_000 }, () => {
     await expect(spawnCli(['status', '--slow'], { timeoutMs: 5_000 })).resolves.toEqual({ via: 'serve', generation: 2 })
     expect(readMaybe(files.startsFile)).toBe('ss')
     expect(readMaybe(files.oneShotsFile)).toBe('')
+  })
+
+  posixOnly('closes stdin first and never signals a child that exits on EOF', async () => {
+    // EOF is what makes `serve --stdio` publish its coalesced shard window on
+    // the way out. SIGTERM is caught only to unlink the cache lock and is then
+    // re-raised, so signalling here would kill the flush.
+    const files = fakeRetiringBin()
+    startServe()
+
+    await expect(spawnCli(['status', '--warm'], { timeoutMs: 5_000 })).resolves.toEqual({ via: 'serve', generation: 1 })
+    await waitFor(() => readMaybe(files.deathsFile) === 'x')
+    expect(readMaybe(files.signalsFile)).toBe('')
+
+    // Still exactly one resident per generation, and no one-shot fallback.
+    await expect(spawnCli(['status', '--after-retire'], { timeoutMs: 5_000 })).resolves.toEqual({ via: 'serve', generation: 2 })
+    expect(readMaybe(files.startsFile)).toBe('ss')
+    expect(readMaybe(files.oneShotsFile)).toBe('')
+    expect(readMaybe(files.signalsFile)).toBe('')
+  })
+
+  posixOnly('signals a retired child that ignores EOF, but only after the grace', async () => {
+    const files = fakeRetiringBin(0, true)
+    startServe()
+
+    await expect(spawnCli(['status', '--warm'], { timeoutMs: 5_000 })).resolves.toEqual({ via: 'serve', generation: 1 })
+    // Inside the grace: stdin is closed, nothing has been signalled yet.
+    await new Promise(resolve => setTimeout(resolve, 400))
+    expect(readMaybe(files.signalsFile)).toBe('')
+
+    await waitFor(() => readMaybe(files.signalsFile) === 'T', 10_000)
+    expect(readMaybe(files.deathsFile)).toBe('x')
   })
 
   posixOnly('leaves one child behind when a mutation restart lands in the idle window', async () => {

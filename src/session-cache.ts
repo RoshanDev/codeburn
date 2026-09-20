@@ -628,6 +628,17 @@ export function isCacheDirty(cache: SessionCache): boolean {
   return stateOf(cache).dirty
 }
 
+/** True when a dirty bucket belongs to a provider whose cache entry is the ONLY
+ *  surviving record of that spend (see {@link DURABLE_PROVIDER_NAMES}): the
+ *  source can be pruned before the next publish, so such a window must never be
+ *  held back by the resident process's coalescing. */
+export function hasDirtyDurableProvider(cache: SessionCache): boolean {
+  for (const provider of stateOf(cache).dirtyBuckets.keys()) {
+    if (DURABLE_PROVIDER_NAMES.has(provider)) return true
+  }
+  return false
+}
+
 // ── Env Fingerprint ────────────────────────────────────────────────────
 
 export function computeEnvFingerprint(provider: string): string {
