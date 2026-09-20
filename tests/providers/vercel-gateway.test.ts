@@ -124,6 +124,17 @@ describe('vercel-gateway end-to-end (parseAllSessions network path)', () => {
     // request_count was parsed and then dropped, so a day+model row with three
     // requests counted as one call on every surface.
     expect(projects.reduce((sum, p) => sum + p.totalApiCalls, 0)).toBe(3)
+
+    // The network source is written into the session cache as CachedTurns and
+    // served back through cachedCallToApiCall, so the count has to survive both
+    // halves of that round-trip — the total above is the read half, the stored
+    // record is the write half.
+    const { readdirSync, readFileSync } = await import('node:fs')
+    const cacheRoot = join(cacheDir, 'session-cache.v9')
+    const stored = readdirSync(cacheRoot)
+      .map(f => readFileSync(join(cacheRoot, f), 'utf-8'))
+      .join('')
+    expect(stored).toContain('"requestCount":3')
   })
 
   it('emits no gateway rows at all without a credential', async () => {

@@ -47,6 +47,7 @@ import { decideParseWorkers, parseFilesInOrder, ParseWorkerPool, type ClaudeWork
 import type { CodexFullParse } from './providers/codex.js'
 import { dateKey } from './day-aggregator.js'
 import { behavioralCallWeight, isBehavioralTurn } from './behavioral-weight.js'
+import { gatewayIncludedInTotals } from './config.js'
 import type { ParsedProviderCall, Provider, SessionSource } from './providers/types.js'
 import type {
   ApiUsageIteration,
@@ -5547,7 +5548,74 @@ function deferToBackgroundFill(path: string, fp: { mtimeMs: number }, cached: un
   return true
 }
 
-export function parseAllSessions(dateRange?: DateRange, providerFilter?: string): Promise<ProjectSummary[]> {
+/// Providers whose records are DAILY AGGREGATES instead of per-request rows:
+/// Vercel AI Gateway's `/v1/report` returns one cost/token/request_count per
+/// day per model, with no request id, timestamp or attribution. The local
+/// tools that were pointed at the gateway (Claude Code via
+/// ANTHROPIC_BASE_URL, Codex, OpenCode, Cline/Roo/Kilo, Cursor) record those
+/// same requests in their own session files, and nothing in an aggregate row
+/// can be matched against them — so a corpus holding both counts the same
+/// spend twice.
+export const AGGREGATE_ONLY_PROVIDER = 'vercel-gateway'
+export const AGGREGATE_ONLY_PROVIDERS: ReadonlySet<string> = new Set([AGGREGATE_ONLY_PROVIDER])
+
+/// True when an all-provider read must drop the aggregate-only corpus. A
+/// provider-scoped read never does: `--provider vercel-gateway` exists to
+/// inspect the full amount.
+export function excludesAggregateOnlyProviders(providerFilter?: string): boolean {
+  return (providerFilter ?? 'all') === 'all' && !gatewayIncludedInTotals()
+}
+
+function hasAggregateOnlyCall(projects: ProjectSummary[]): boolean {
+  return projects.some(project => project.sessions.some(session =>
+    session.turns.some(turn => turn.assistantCalls.some(call => AGGREGATE_ONLY_PROVIDERS.has(call.provider)))))
+}
+
+/// Drop the aggregate-only providers from a parsed corpus, rebuilding every
+/// nested total from the retained calls. Returns the SAME array when nothing
+/// matches, so a machine with no gateway credential pays nothing and its
+/// output is byte-identical to a build without this rule.
+export function excludeAggregateOnlyProjects(projects: ProjectSummary[], providerFilter?: string): ProjectSummary[] {
+  if (!excludesAggregateOnlyProviders(providerFilter)) return projects
+  if (!hasAggregateOnlyCall(projects)) return projects
+  return filterProjectsByCall(projects, call => !AGGREGATE_ONLY_PROVIDERS.has(call.provider))
+}
+
+/// Cost the aggregate-only providers contribute to a corpus, for the "what was
+/// left out" footnote. Read from the UNFILTERED parse.
+export function aggregateOnlyCostUSD(projects: ProjectSummary[]): number {
+  let total = 0
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      for (const turn of session.turns) {
+        for (const call of turn.assistantCalls) {
+          if (AGGREGATE_ONLY_PROVIDERS.has(call.provider)) total += call.costUSD
+        }
+      }
+    }
+  }
+  return total
+}
+
+/// `includeAggregateOnly` is the WRITE-side opt-out. The session cache and the
+/// durable daily cache must keep sealing the gateway slice — it can never be
+/// re-fetched for a past day — so the cache writer, and the aggregator paths
+/// that derive day entries, ask for the full corpus and hold the provider out
+/// of the totals at read time instead (`excludeProviderFromDay`). Every other
+/// caller gets the shared default, which is what makes `models`, `sessions`,
+/// `export`, `compare`, `spend`, `yield`, `audit`, `budget` and the sync push
+/// agree with the headline without each one knowing the rule.
+export function parseAllSessions(
+  dateRange?: DateRange,
+  providerFilter?: string,
+  opts?: { includeAggregateOnly?: boolean },
+): Promise<ProjectSummary[]> {
+  const parsed = parseAllSessionsUnfiltered(dateRange, providerFilter)
+  if (opts?.includeAggregateOnly === true) return parsed
+  return parsed.then(projects => excludeAggregateOnlyProjects(projects, providerFilter))
+}
+
+function parseAllSessionsUnfiltered(dateRange?: DateRange, providerFilter?: string): Promise<ProjectSummary[]> {
   const scoped = singlePassParse(dateRange, providerFilter)
   if (scoped) return scoped
   // Capture synchronously, before the first await. AsyncLocalStorage keeps all

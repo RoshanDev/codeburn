@@ -5,13 +5,14 @@ import { exportCsv, exportJson, type PeriodExport } from './export.js'
 import { findUnpricedModels, modelRowKey, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setFlatRateRemoved, setProxyPaths, normalizeProxyPath, unpricedModelHint, isBuiltInFlatRateModel, isSameFlatRateModel, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash, getFlatRateModelsConfigHash, getPricingGenerationKey } from './models.js'
 import { cachedProjectIdentitiesForRange } from './daily-cache.js'
 import { reportUnmatchedProjectPatterns } from './project-filter-warnings.js'
+import { getVercelGatewayApiKey } from './providers/vercel-gateway.js'
 import { BILLING_FILTER_VALUES, ROUTE_FILTER_VALUES, filterProjectsByBillingRoute } from './billing-filter.js'
-import { parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI, computeCorpusFingerprint, isSessionHydrationComplete } from './parser.js'
+import { AGGREGATE_ONLY_PROVIDER, aggregateOnlyCostUSD, excludesAggregateOnlyProviders, parseAllSessions, filterProjectsByName, filterProjectsByDateRange, clearSessionCache, setInteractiveScanUI, computeCorpusFingerprint, isSessionHydrationComplete } from './parser.js'
 import { allProviderNames, getAllProviders } from './providers/index.js'
 import { getProvider } from './providers/index.js'
 import { getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { convertCost, formatCost } from './currency.js'
-import { formatTokens, renderStatusBar } from './format.js'
+import { excludedGatewayNote, formatTokens, renderStatusBar } from './format.js'
 import { toDateString } from './daily-cache.js'
 import { statusSnapshotSemanticKey } from './status-snapshot-semantic.js'
 import { dateKey } from './day-aggregator.js'
@@ -552,6 +553,20 @@ program.hook('preAction', async (thisCommand) => {
   await loadCurrency()
 })
 
+/// Every standalone report (`models`, `sessions`, `export`, `compare`,
+/// `compare-periods`, `spend`, `yield`, `audit`, `web`, `optimize`) leaves the
+/// aggregate-only gateway corpus out of its totals, the same rule the headline
+/// uses. Say so once, on stderr — beside the unmatched-`--project` warning that
+/// already lives at these call sites — so every stdout body (text, JSON, CSV)
+/// stays byte-identical to a run with no gateway credential. Gated on the
+/// credential: without one there is no gateway corpus and this costs nothing.
+async function reportExcludedGatewayCost(range: DateRange, provider?: string): Promise<void> {
+  if (!excludesAggregateOnlyProviders(provider) || !getVercelGatewayApiKey()) return
+  // Same memo entry the caller just filled, so this is a sum, not a re-parse.
+  const note = excludedGatewayNote(aggregateOnlyCostUSD(await parseAllSessions(range, provider, { includeAggregateOnly: true })))
+  if (note) process.stderr.write(`codeburn: ${note}\n`)
+}
+
 function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: string, durable: DurablePeriod) {
   const sessions = projects.flatMap(p => p.sessions)
   const { code } = getCurrency()
@@ -567,7 +582,7 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
   // out-of-pocket figure. `cost` stays the full billable/would-be amount.
   const totalProxiedUSD = projects.reduce((s, p) => s + p.totalProxiedCostUSD, 0)
   const netCostUSD = totalCostUSD - totalProxiedUSD
-  const excludedGatewayUSD = durable.excludedGatewayCostUSD
+  const excludedGateway = durable.excludedGateway
   const totalCalls = durable.data.calls
   const totalSessions = durable.data.sessions
   const totalInput = durable.data.inputTokens
@@ -772,7 +787,19 @@ function buildJsonReport(projects: ProjectSummary[], period: string, periodKey: 
       // aggregates the local tools routed through the gateway already report,
       // so adding both double counts. Emitted only when something is actually
       // excluded, so a report with no gateway credential is unchanged.
-      ...(excludedGatewayUSD > 0 ? { excludedGatewayCost: convertCost(excludedGatewayUSD) } : {}),
+      ...(excludedGateway.costUSD > 0 ? {
+        excludedGatewayCost: convertCost(excludedGateway.costUSD),
+        // The same amount as one labelled provider row, so a consumer can show
+        // it beside the counted providers without adding it to `cost` or
+        // looking for it in `projects[]` / `models[]` (which no longer hold it).
+        excludedProviders: [{
+          id: AGGREGATE_ONLY_PROVIDER,
+          cost: convertCost(excludedGateway.costUSD),
+          calls: excludedGateway.calls,
+          tokens: excludedGateway.tokens,
+          excludedFromTotal: true,
+        }],
+      } : {}),
       savings: convertCost(totalSavingsUSD),
       // Portion of `cost` priced from estimated tokens (issue #639). Display/
       // metadata only; never subtracted from `cost`. 0 when nothing is estimated.
@@ -1052,7 +1079,7 @@ program
         days: durable.days,
         carriedCostUSD: durable.carriedCostUSD,
         unattributedCostUSD: durable.unattributedCostUSD,
-        excludedGatewayCostUSD: durable.excludedGatewayCostUSD,
+        excludedGateway: durable.excludedGateway,
       },
     }))
   })
@@ -1112,6 +1139,7 @@ program
       const { range } = periodInfoFromQuery({ period: opts.period, from: opts.from, to: opts.to }, 'today')
       const parsed = await parseAllSessions(range, opts.provider)
       await reportUnmatchedProjectPatterns(parsed, opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(range))
+      await reportExcludedGatewayCost(range, opts.provider)
     }
     await runWebDashboard({
       period: opts.period,
@@ -1451,10 +1479,12 @@ program
     if (customRange) {
       periods = [{ label: formatDateRangeLabel(opts.from, opts.to), projects: fp(await parseAllSessions(customRange, pf)) }]
       await reportUnmatchedProjectPatterns(widestParse ?? [], opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(customRange!))
+      await reportExcludedGatewayCost(customRange!, opts.provider)
       clearSessionCache()
     } else {
       const thirtyDayProjects = fp(await parseAllSessions(getDateRange('30days').range, pf))
       await reportUnmatchedProjectPatterns(widestParse ?? [], opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(getDateRange('30days').range))
+      await reportExcludedGatewayCost(getDateRange('30days').range, opts.provider)
       clearSessionCache()
       periods = [
         { label: 'Today', projects: filterProjectsByDateRange(thirtyDayProjects, getDateRange('today').range) },
@@ -2174,6 +2204,7 @@ program
     }
     const parsed = await parseAllSessions(range, opts.provider)
     await reportUnmatchedProjectPatterns(parsed, opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(range))
+    await reportExcludedGatewayCost(range, opts.provider)
     const projects = filterProjectsByName(parsed, opts.project, opts.exclude)
     if (opts.apply) {
       const { runOptimizeApply } = await import('./act/optimize-apply.js')
@@ -2354,6 +2385,7 @@ program
       const { aggregateModelStats, buildCohortComparison, buildCohortFacets, findModelStat, renderCohortJson, selectCohortProjects } = await import('./compare-cohorts.js')
       const parsed = await parseAllSessions(range, opts.provider)
       await reportUnmatchedProjectPatterns(parsed, opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(range))
+      await reportExcludedGatewayCost(range, opts.provider)
       const projects = selectCohortProjects(filterProjectsByName(parsed, opts.project, opts.exclude), opts.projectId)
 
       // Without --model-a/--model-b the cohort format answers the FACET query:
@@ -2390,6 +2422,7 @@ program
       const { aggregateModelStats, buildCompareJson, findModelStat, projectSessionIds, renderCompareJson, scanSelfCorrections } = await import('./compare-stats.js')
       const parsed = await parseAllSessions(range, opts.provider)
       await reportUnmatchedProjectPatterns(parsed, opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(range))
+      await reportExcludedGatewayCost(range, opts.provider)
       const projects = filterProjectsByName(parsed, opts.project, opts.exclude)
       const models = aggregateModelStats(projects)
 
@@ -2516,6 +2549,7 @@ program
       parseAllSessions(keyRangeB, opts.provider),
     ])
     await reportUnmatchedProjectPatterns([...parsedA, ...parsedB], opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(keyRangeB))
+    await reportExcludedGatewayCost(keyRangeB, opts.provider)
     const projectsA = filterProjectsByName(parsedA, opts.project, opts.exclude)
     const projectsB = filterProjectsByName(parsedB, opts.project, opts.exclude)
 
@@ -2528,7 +2562,9 @@ program
       try {
         const { ensureCacheHydrated } = await import('./daily-cache.js')
         const cache = await ensureCacheHydrated(
-          range => parseAllSessions(range, 'all'),
+          // Cache writer: seals whole days, gateway slice included (see
+          // parseAllSessions' includeAggregateOnly).
+          range => parseAllSessions(range, 'all', { includeAggregateOnly: true }),
           aggregateProjectsIntoDays,
           getDailyCacheConfigHash(),
           isSessionHydrationComplete,
@@ -2590,6 +2626,7 @@ program
 
     const parsed = await parseAllSessions(range, opts.provider)
     await reportUnmatchedProjectPatterns(parsed, opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(range))
+    await reportExcludedGatewayCost(range, opts.provider)
     const projects = filterProjectsByBillingRoute(
       filterProjectsByName(parsed, opts.project, opts.exclude),
       { route: opts.route, billing: opts.billing },
@@ -2652,6 +2689,7 @@ program
 
     const parsed = await parseAllSessions(range, opts.provider)
     await reportUnmatchedProjectPatterns(parsed, opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(range))
+    await reportExcludedGatewayCost(range, opts.provider)
     const projects = filterProjectsByBillingRoute(
       filterProjectsByName(parsed, opts.project, opts.exclude),
       { route: opts.route, billing: opts.billing },
@@ -2801,6 +2839,7 @@ program
 
     const parsed = await parseAllSessions(range, opts.provider)
     await reportUnmatchedProjectPatterns(parsed, opts.project, opts.exclude, () => cachedProjectIdentitiesForRange(range))
+    await reportExcludedGatewayCost(range, opts.provider)
     const projects = filterProjectsByBillingRoute(
       filterProjectsByName(parsed, opts.project, opts.exclude),
       { route: opts.route, billing: opts.billing },

@@ -49,6 +49,14 @@ So gateway spend is:
 - **unaffected** under `--provider vercel-gateway`, which reports the full
   amount so you can inspect it.
 
+The exclusion is one rule in one place (`parseAllSessions`), so every surface
+follows it: the report, the interactive dashboard, the menubar payload, `models`,
+`sessions`, `export`, `compare`, `compare-periods`, `spend`, `yield`, `audit`,
+`budget`, and the Teams sync push (which would otherwise hand the backend the
+same double count). The session cache and the daily cache are the deliberate
+exception — they keep storing the gateway slice, because a past day's aggregate
+row can never be fetched again.
+
 To include it in totals instead:
 
 ```
