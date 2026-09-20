@@ -975,6 +975,17 @@ export function clearLoadCacheMemo(): void {
   clearShardMemo()
 }
 
+/// Is this in-memory cache still the one the published envelope describes? A
+/// holder that deferred its publish (see the coalescing window in parser.ts)
+/// asks before writing: if another process has published since, this object is
+/// a stale pre-image and saving it could drop that process's entries. Dropping
+/// the deferred write instead costs a re-parse, never a wrong number.
+export async function isCacheCurrent(cache: SessionCache): Promise<boolean> {
+  if (!cacheMemo || cacheMemo.cache !== cache) return false
+  const live = await readEnvelope(cacheMemo.dir)
+  return live?.nonce === cacheMemo.nonce
+}
+
 /** Months (UTC `YYYY-MM`, inclusive) a query can possibly report on. The load
  *  widens this by one month BELOW `fromMonth` and none above (see
  *  shardInScope): every cross-range carry in the report reads BACKWARDS from the

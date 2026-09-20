@@ -393,6 +393,9 @@ async function getConfigFingerprint(): Promise<string | null> {
 /// generation; a root absent at setup is rechecked by the parser's hard cap.
 type RootWatcherState = {
   startedAt: number
+  /// The roots actually armed. A path outside them has no event source, so the
+  /// incremental sweep must not trust anything it remembered about it.
+  roots: string[]
   lastEventAt: () => number
   changedSince: (sinceTs: number) => string[] | null
   healthy: () => boolean
@@ -478,6 +481,7 @@ async function startRootWatchers(): Promise<RootWatcherState | null> {
   let healthy = true
   let closed = false
   const watchers: FSWatcher[] = []
+  const armedRoots: string[] = []
   // Changed paths, newest write per path, for day-scoped invalidation. An event
   // that arrives without a filename, or one past the tracking bound, leaves
   // `unscopedAt` behind: from then on nothing older than it can be day-scoped.
@@ -541,6 +545,7 @@ async function startRootWatchers(): Promise<RootWatcherState | null> {
         const watcher = watch(root, { recursive: info.isDirectory() }, (_event, filename) => { note(root, filename) })
         watcher.on('error', () => { healthy = false })
         watchers.push(watcher)
+        armedRoots.push(root)
       } catch {
         // stat proved this input exists, so failing to arm it invalidates the
         // global quiet predicate even when other roots remain watched.
@@ -560,6 +565,7 @@ async function startRootWatchers(): Promise<RootWatcherState | null> {
   const startedAt = Date.now()
   return {
     startedAt,
+    roots: armedRoots,
     lastEventAt: () => lastEventAt,
     changedSince,
     healthy: () => healthy && !closed,
@@ -586,6 +592,11 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
   // `complete: true` — so a consumer never has to infer completeness from a
   // missing field within a single source.
   process.env[SERVE_HYDRATION_ENV] = '1'
+  // Shard publication is coalesced for this process only: one-shot CLI runs
+  // keep writing the cache immediately. The flush below is the shutdown half
+  // of that contract.
+  const { setShardPublishCoalescing } = await import('./parser.js')
+  setShardPublishCoalescing(true)
   // Event-driven reuse: while no watched session root has changed, a previous
   // parse stays valid past the burst window (capped in parser.ts, so a missed
   // filesystem event self-heals within minutes). This is what turns a warm
@@ -600,7 +611,7 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
   const watcherSetup = startRootWatchers().then(async (w) => {
     watcherLifecycle.state = w
     if (!w) return
-    const { setParseReuseValidator } = await import('./parser.js')
+    const { setParseReuseValidator, setSweepWatchSource } = await import('./parser.js')
     // Clean means: the watchers were already armed when the parse happened,
     // and no filesystem event has landed since. lastEventAt of 0 is a quiet
     // system (clean for anything parsed after arming), not an unknown.
@@ -612,7 +623,11 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
     }, range)
     rootReuseValidation = validate
     setParseReuseValidator(validate)
-    watcherLifecycle.resetValidator = () => setParseReuseValidator(null)
+    // Same watcher, finer grain: the discovery sweep reuses the listing and
+    // fingerprint of every path no event has named, instead of re-reading the
+    // whole corpus on each poll.
+    setSweepWatchSource({ startedAt: w.startedAt, roots: w.roots, healthy: w.healthy, changedSince: w.changedSince })
+    watcherLifecycle.resetValidator = () => { setParseReuseValidator(null); setSweepWatchSource(null) }
   }).catch(() => {
     watcherLifecycle.state?.close()
     watcherLifecycle.state = null
@@ -877,6 +892,16 @@ export async function runStdioServe(buildProgram: () => Command): Promise<void> 
     let drainTimer: ReturnType<typeof setTimeout> | undefined
     await Promise.race([queue, new Promise<void>(resolve => { drainTimer = setTimeout(resolve, drainMs) })])
     clearTimeout(drainTimer)
+    // Publish whatever the coalescing window still holds. Bounded for the same
+    // reason the drain is, and non-fatal: an unpublished window costs the next
+    // start a re-parse of those appends, never a wrong number.
+    let flushTimer: ReturnType<typeof setTimeout> | undefined
+    const { flushPendingShardPublish } = await import('./parser.js')
+    await Promise.race([
+      flushPendingShardPublish().catch(() => undefined),
+      new Promise<void>(resolve => { flushTimer = setTimeout(resolve, drainMs) }),
+    ])
+    clearTimeout(flushTimer)
     // Bounded and non-fatal for the same reason the drain is: the app is gone,
     // and cleanup that hangs (watcher discovery on a stalled mount) or throws
     // must not stop this child from reaching its exit.

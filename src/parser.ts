@@ -24,6 +24,7 @@ import {
   type CachedCall,
   type CachedFile,
   type CachedTurn,
+  type FileFingerprint,
   type ProviderSection,
   type SessionCache,
   beginColdHydration,
@@ -32,6 +33,7 @@ import {
   DURABLE_PROVIDER_NAMES,
   fingerprintFile,
   isCacheComplete,
+  isCacheCurrent,
   isCacheDirty,
   loadCache,
   markCacheDirty,
@@ -2020,8 +2022,12 @@ async function scanProjectDirs(
   // order: the reconcile loop feeds order-sensitive state (changedFiles order
   // drives the worker-result pairing, seenMsgIds pre-seeding), so only the
   // syscalls are allowed to overlap.
+  const gate = openSweepGate()
+  const sweptAt = Date.now()
   const walked = await mapWithConcurrency(dirs, FS_SCAN_CONCURRENCY, async ({ path: dirPath }) => {
-    const jsonlFiles = await collectJsonlFiles(dirPath)
+    const remembered = sweepDirFiles(gate, dirPath)
+    const jsonlFiles = remembered ?? await collectJsonlFiles(dirPath)
+    if (!remembered) rememberSweepDir(dirPath, jsonlFiles, sweptAt)
     dirsDone++
     await discoverProgress.tick(dirsDone)
     return jsonlFiles
@@ -2031,7 +2037,13 @@ async function scanProjectDirs(
     const { name: dirName, source } = dirs[i]!
     for (const filePath of walked[i]!) discovered.push({ filePath, dirName, source })
   }
-  const fingerprints = await mapWithConcurrency(discovered, FS_SCAN_CONCURRENCY, e => fingerprintFile(e.filePath))
+  const fingerprints = await mapWithConcurrency(discovered, FS_SCAN_CONCURRENCY, async (e) => {
+    const remembered = sweepFingerprint(gate, e.filePath)
+    if (remembered) return remembered
+    const fp = await fingerprintFile(e.filePath)
+    rememberSweepFingerprint(e.filePath, fp, sweptAt)
+    return fp
+  })
   for (const [i, { filePath, dirName, source }] of discovered.entries()) {
     allDiscoveredFiles.add(filePath)
     const fp = fingerprints[i]
@@ -3418,9 +3430,17 @@ export async function parseProviderSources(
   // discovery order. Network sources on a write run never reach fingerprintFile
   // (they take the synthetic-fingerprint branch below), so they are skipped here.
   const skipFingerprint = provider.network && !readOnly
+  const gate = openSweepGate()
+  const sweptAt = Date.now()
   const sourceFingerprints = skipFingerprint
     ? []
-    : await mapWithConcurrency(sources, FS_SCAN_CONCURRENCY, s => fingerprintFile(s.path))
+    : await mapWithConcurrency(sources, FS_SCAN_CONCURRENCY, async (s) => {
+      const remembered = sweepFingerprint(gate, s.path)
+      if (remembered) return remembered
+      const fp = await fingerprintFile(s.path)
+      rememberSweepFingerprint(s.path, fp, sweptAt)
+      return fp
+    })
 
   for (const [sourceIndex, source] of sources.entries()) {
     allDiscoveredFiles.add(source.path)
@@ -4440,6 +4460,152 @@ const VALIDATED_REUSE_CAP_MS = 5 * 60 * 1000
 
 export function setParseReuseValidator(validator: ParseReuseValidator | null): void {
   parseReuseValidator = validator
+}
+
+// ── Incremental discovery sweep (resident process only) ──────────────────────
+// Discovery re-readdirs every project directory and re-stats every transcript
+// on every parse. In a resident process the root watchers already know which
+// paths moved, so a directory listing / file fingerprint the watcher proved
+// untouched is reused instead of re-read. Nothing DERIVED is reused: only
+// dev/ino/mtime/size, and `reconcileFile` still runs for every file.
+export type SweepWatchSource = {
+  /** When watcher coverage began; anything remembered before it is unproven. */
+  startedAt: number
+  /** The roots actually armed. A path outside them is never event-covered. */
+  roots: readonly string[]
+  healthy: () => boolean
+  /** Paths changed since `sinceTs`, or null when coverage was unscoped. */
+  changedSince: (sinceTs: number) => string[] | null
+}
+// Held a little shorter than the watcher's own path retention so a remembered
+// entry can never outlive the event record that would have invalidated it.
+const SWEEP_MEMO_MAX_AGE_MS = VALIDATED_REUSE_CAP_MS - 30_000
+// A wall-clock jump this much larger than elapsed monotonic time means the
+// process was suspended (sleep/wake) and events could have been missed.
+const SWEEP_SUSPEND_SLACK_MS = 2_000
+let sweepWatchSource: SweepWatchSource | null = null
+let sweepDirMemo = new Map<string, { files: string[]; at: number }>()
+let sweepFpMemo = new Map<string, { fp: FileFingerprint; at: number }>()
+let sweepClockMark: { wall: number; mono: number } | null = null
+
+export function setSweepWatchSource(source: SweepWatchSource | null): void {
+  sweepWatchSource = source
+  sweepDirMemo = new Map()
+  sweepFpMemo = new Map()
+  sweepClockMark = null
+}
+
+type SweepGate = { minAt: number; changed: Set<string>; touched: Set<string>; roots: readonly string[] }
+
+/// The per-parse decision. Null means "sweep exactly as before": no watcher,
+/// degraded coverage, an unscoped event, a suspend, or a first parse.
+function openSweepGate(): SweepGate | null {
+  const src = sweepWatchSource
+  const now = Date.now()
+  for (const [key, entry] of sweepDirMemo) if (entry.at < now - SWEEP_MEMO_MAX_AGE_MS) sweepDirMemo.delete(key)
+  for (const [key, entry] of sweepFpMemo) if (entry.at < now - SWEEP_MEMO_MAX_AGE_MS) sweepFpMemo.delete(key)
+  const mark = sweepClockMark
+  const mono = Math.trunc(performance.now())
+  sweepClockMark = { wall: now, mono }
+  // A wall clock that moved backwards would keep extending `minAt` backwards
+  // too, so treat it the same way a forward jump is treated.
+  if (mark && Math.abs((now - mark.wall) - (mono - mark.mono)) > SWEEP_SUSPEND_SLACK_MS) {
+    // Nothing remembered before the gap is trustworthy, and the gap is only
+    // visible once — so drop it all rather than let the next gate bless it.
+    sweepDirMemo.clear()
+    sweepFpMemo.clear()
+    return null
+  }
+  if (!src || !src.healthy()) return null
+  const minAt = Math.max(now - SWEEP_MEMO_MAX_AGE_MS, src.startedAt)
+  const changed = src.changedSince(minAt)
+  if (!changed) return null
+  // A changed path invalidates its own fingerprint and every directory listing
+  // that could contain it — the path itself (a renamed directory) and every
+  // ancestor, so a created or deleted file is seen by the next readdir.
+  const touched = new Set<string>()
+  for (const path of changed) {
+    for (let dir = path; ;) {
+      touched.add(dir)
+      const parent = dirname(dir)
+      if (parent === dir) break
+      dir = parent
+    }
+  }
+  return { minAt, changed: new Set(changed), touched, roots: src.roots }
+}
+
+function sweepCovers(gate: SweepGate, path: string): boolean {
+  // WSL/UNC roots are reached over a network redirector fs.watch does not cover,
+  // and a path outside every armed root has no event source at all.
+  if (isWslUncPath(path)) return false
+  return gate.roots.some(root => path === root || path.startsWith(root.endsWith(sep) ? root : root + sep))
+}
+
+function sweepDirFiles(gate: SweepGate | null, dirPath: string): string[] | null {
+  if (!gate || gate.touched.has(dirPath) || !sweepCovers(gate, dirPath)) return null
+  const hit = sweepDirMemo.get(dirPath)
+  return hit && hit.at >= gate.minAt ? hit.files : null
+}
+
+function sweepFingerprint(gate: SweepGate | null, path: string): FileFingerprint | null {
+  // Only plain transcripts. A SQLite source folds its `-wal` sibling in, and a
+  // virtual-suffix source (`<db>#cursor-ws=…`, `<db>:<session>`) fingerprints
+  // the underlying database — in both cases the watcher would name a path that
+  // is not this key, so no event could ever invalidate the entry.
+  if (!path.endsWith('.jsonl')) return null
+  if (!gate || gate.changed.has(path) || !sweepCovers(gate, path)) return null
+  const hit = sweepFpMemo.get(path)
+  return hit && hit.at >= gate.minAt ? hit.fp : null
+}
+
+/// Remember what this sweep read. `at` is captured BEFORE the syscall, so an
+/// event that lands while the sweep runs still invalidates the entry.
+function rememberSweepDir(dirPath: string, files: string[], at: number): void {
+  if (sweepWatchSource) sweepDirMemo.set(dirPath, { files, at })
+}
+
+function rememberSweepFingerprint(path: string, fp: FileFingerprint | null, at: number): void {
+  // A null fingerprint means the file was missing or unreadable; remembering
+  // that would hide its later appearance behind a quiet watcher.
+  if (sweepWatchSource && fp && path.endsWith('.jsonl')) sweepFpMemo.set(path, { fp, at })
+}
+
+// ── Coalesced shard publication (resident process only) ─────────────────────
+// One appended transcript dirties one month bucket, and publishing that bucket
+// rewrites the whole month — the single most expensive thing on the live poll
+// path. A resident process publishes at most once per window and always on
+// clean shutdown. A skipped publish writes NOTHING, so the on-disk cache stays
+// exactly as consistent as it already was; the cost of losing a window is that
+// the next start re-parses those appends, never a wrong number.
+// Longer than the desktop's slowest poll (60s), or a window exactly as long as
+// the cadence would expire before every poll and coalesce nothing.
+const SHARD_PUBLISH_COALESCE_MS = 90_000
+let shardPublishCoalescing = false
+let lastShardPublishAt = 0
+let pendingShardPublish: SessionCache | null = null
+
+export function setShardPublishCoalescing(on: boolean): void {
+  shardPublishCoalescing = on
+  pendingShardPublish = null
+  lastShardPublishAt = 0
+}
+
+export function hasPendingShardPublish(): boolean {
+  return pendingShardPublish !== null
+}
+
+export async function flushPendingShardPublish(): Promise<void> {
+  const cache = pendingShardPublish
+  pendingShardPublish = null
+  if (!cache) return
+  lastShardPublishAt = Date.now()
+  // Unlike the deferral itself — which is published by a later refresh under
+  // that refresh's own fence — this one runs outside the lock, so it checks
+  // that nothing has been published since instead.
+  try {
+    if (await isCacheCurrent(cache)) await saveCache(cache)
+  } catch { /* a lost publish only costs a re-parse */ }
 }
 
 function burstReuse(dateRange: DateRange, sig: string): ProjectSummary[] | null {
@@ -5980,7 +6146,20 @@ async function runParseInner(
     }
   }
   if (!readOnly && (isCacheDirty(diskCache) || completenessChanged)) {
-    try {
+    // A superseded pre-image is dropped rather than carried: another process
+    // published, so this object's months were reloaded into a different one,
+    // and what the old one held is simply re-parsed.
+    if (pendingShardPublish && pendingShardPublish !== diskCache) pendingShardPublish = null
+    if (shardPublishCoalescing && !completenessChanged && !isCold
+      && Date.now() - lastShardPublishAt < SHARD_PUBLISH_COALESCE_MS) {
+      // Held, not lost: the entries stay in this cache object — the one the
+      // next load memo hands back, dirty flags and all — until a later refresh
+      // publishes them under its own fence, or the shutdown flush does.
+      pendingShardPublish = diskCache
+      traceTiming('save', ' coalesced')
+    } else try {
+      pendingShardPublish = null
+      lastShardPublishAt = Date.now()
       const published = await saveCache(diskCache, refreshLock?.verifyStillOwner)
       if (!published) throw new RefreshFenceLostError()
     } catch (err) {
