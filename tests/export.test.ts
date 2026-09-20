@@ -369,6 +369,16 @@ describe('exportJson', () => {
     expect(await readFile(join(tmpDir, 'unrelated.txt'), 'utf-8')).toBe('keep me')
   })
 
+  it('creates a folder named with a trailing separator and writes inside it', async () => {
+    const periods: PeriodExport[] = [{ label: '30 Days', projects: [makeProject('app')] }]
+    const folder = join(tmpDir, 'new-exports')
+
+    const saved = await exportJson(periods, `${folder}/`)
+
+    expect(saved.startsWith(join(folder, 'codeburn-export-'))).toBe(true)
+    expect(JSON.parse(await readFile(saved, 'utf-8')).schema).toBe('codeburn.export.v2')
+  })
+
   it('still appends .json to a destination that is not a folder', async () => {
     const periods: PeriodExport[] = [{ label: '30 Days', projects: [makeProject('app')] }]
     const saved = await exportJson(periods, join(tmpDir, 'report'))

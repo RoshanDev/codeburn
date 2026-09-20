@@ -456,9 +456,11 @@ export async function exportJson(periods: PeriodExport[], outputPath: string): P
 
   // The desktop app (and any `-o <existing dir>`) hands us a real folder, not a slot to
   // fill: appending `.json` to it wrote a sibling *of* the folder. Name a dated file
-  // inside it instead, the same name exportCsv gives its dated subfolder.
+  // inside it instead, the same name exportCsv gives its dated subfolder. A path written
+  // with a trailing separator says folder just as plainly, whether or not it exists yet.
+  const namedAsFolder = /[\\/]$/.test(outputPath)
   let target = resolve(outputPath)
-  if ((await stat(target).catch(() => null))?.isDirectory()) {
+  if (namedAsFolder || (await stat(target).catch(() => null))?.isDirectory()) {
     target = join(target, `codeburn-export-${new Date().toISOString().slice(0, 10)}.json`)
   } else if (!target.toLowerCase().endsWith('.json')) {
     target = `${target}.json`

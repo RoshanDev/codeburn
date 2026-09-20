@@ -214,6 +214,11 @@ export class Telemetry {
   /** Total CPU seconds across the Electron processes, when the platform reports
    *  it cumulatively. Null on a build that only reports instantaneous percent. */
   private cpuSeconds: number | null = null
+  /** What the counters already stood at when this session's clock started. Both are
+   *  cumulative since their process began, and the wall time below is measured from here,
+   *  so only the growth since this point can be divided by it. */
+  private cpuSecondsAtOpen: number | null = null
+  private serveCpuSecAtOpen: number | null = null
   private cpuPercentSamples: number[] = []
   private peakMemMb = 0
 
@@ -221,6 +226,7 @@ export class Telemetry {
     this.deps = deps
     this.state = this.load()
     this.openedAt = Date.now()
+    this.sampleResources()
   }
 
   private stateFile(): string {
@@ -341,9 +347,18 @@ export class Telemetry {
         const workingSet = metric.memory?.workingSetSize
         if (typeof workingSet === 'number' && Number.isFinite(workingSet)) workingSetKb += workingSet
       }
-      if (hasCumulative) this.cpuSeconds = cumulativeSec
-      else if (hasPercent) this.cpuPercentSamples.push(percent)
+      if (hasCumulative) {
+        this.cpuSeconds = cumulativeSec
+        this.cpuSecondsAtOpen ??= cumulativeSec
+      } else if (hasPercent) this.cpuPercentSamples.push(percent)
       this.peakMemMb = Math.max(this.peakMemMb, workingSetKb / 1024)
+      // Sampled here, not at close, because close is the only place the figure is read and
+      // a baseline taken then would be the reading itself. A serve child that restarted
+      // counts from zero again, so a reading below the baseline rebases to it.
+      const serveCpuSec = this.deps.getServeUsage?.()?.cpuSec
+      if (typeof serveCpuSec === 'number' && Number.isFinite(serveCpuSec)) {
+        if (this.serveCpuSecAtOpen === null || serveCpuSec < this.serveCpuSecAtOpen) this.serveCpuSecAtOpen = serveCpuSec
+      }
     } catch { /* resource metrics are never worth a thrown quit */ }
   }
 
@@ -357,15 +372,18 @@ export class Telemetry {
       const wallSeconds = (Date.now() - this.openedAt) / 1000
       const cpuMeasurable = wallSeconds >= MIN_CPU_WALL_SECONDS
       if (cpuMeasurable) {
-        if (this.cpuSeconds !== null) props.cpu = cpuBucket((this.cpuSeconds / wallSeconds) * 100)
-        else if (this.cpuPercentSamples.length > 0) {
+        if (this.cpuSeconds !== null && this.cpuSecondsAtOpen !== null) {
+          props.cpu = cpuBucket(((this.cpuSeconds - this.cpuSecondsAtOpen) / wallSeconds) * 100)
+        } else if (this.cpuPercentSamples.length > 0) {
           props.cpu = cpuBucket(this.cpuPercentSamples.reduce((a, b) => a + b, 0) / this.cpuPercentSamples.length)
         }
       }
       if (this.peakMemMb > 0) props.mem = memBucket(this.peakMemMb)
       const serve = this.deps.getServeUsage?.() ?? null
       if (serve) {
-        if (cpuMeasurable && Number.isFinite(serve.cpuSec)) props.serveCpu = cpuBucket((serve.cpuSec / wallSeconds) * 100)
+        if (cpuMeasurable && Number.isFinite(serve.cpuSec)) {
+          props.serveCpu = cpuBucket(((serve.cpuSec - (this.serveCpuSecAtOpen ?? serve.cpuSec)) / wallSeconds) * 100)
+        }
         if (serve.rssMb > 0) props.serveMem = memBucket(serve.rssMb)
       }
     } catch { /* best effort: a partial answer beats none, and none beats a throw */ }

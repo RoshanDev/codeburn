@@ -10,11 +10,18 @@ import AppKit
 /// system starts each as its own process and each registers its own login
 /// item, which is how both come up at once at login.
 ///
-/// One instance wins outright. Asking only *strictly older* copies to go left
-/// two simultaneous launches each finding nothing older than itself, and both
-/// stayed up. The winner is the newest launch — the right way round while
-/// developing, and what a self-relaunch needs (`AppRelaunch`) — with ties
-/// broken on pid so both sides of a tie pick the same winner.
+/// One instance wins outright: the newest start — the right way round while
+/// developing, and what a self-relaunch needs (`AppRelaunch`).
+///
+/// The order is read from the kernel (`KERN_PROC_PID` → `p_starttime`), not from
+/// `NSRunningApplication.launchDate`, and not from the pid. Both sides read the
+/// same kernel value for the same process, so they agree on the order by
+/// observation rather than by each side reasoning from what it can see; a pid is
+/// only the tie-break, and pids are reused, so a pid that wrapped around says
+/// nothing about which copy started first. A start time the kernel will not
+/// report leaves that copy out of the comparison entirely — it is neither
+/// retired nor able to retire — so the worst case is two flames, which a person
+/// can see and fix, and never zero.
 ///
 /// "Keep Both" is Finder's copy dialog, not a setting this app stores: it is a
 /// choice about files on disk, and this is about processes. `--keep-both` on
@@ -34,24 +41,38 @@ enum SingleInstanceGuard {
         case yieldToNewer
     }
 
+    /// `startedAt` is `kernelStartTime(pid:)` for each copy, self included; nil for a
+    /// process the kernel would not answer for.
     static func decide(
-        running: [(pid: pid_t, launchDate: Date?)],
+        running: [(pid: pid_t, startedAt: UInt64?)],
         ownPID: pid_t,
-        ownLaunchDate: Date?
+        ownStartedAt: UInt64?
     ) -> Decision {
-        // A peer whose launch date macOS does not report only counts — to be retired
-        // as much as to outrank us — when its pid is lower than ours. Ranking it as
-        // oldest unconditionally let two copies that each read the other's date as nil
-        // both call themselves newest, and each retired the other: zero left.
-        let others = running.filter { $0.pid != ownPID && ($0.launchDate != nil || $0.pid < ownPID) }
-        // Our own date unreadable means we cannot claim to be newest at all, so retire
-        // lower pids only and stand down for nobody: the side with the higher pid keeps
-        // the field, and a disagreement leaves one copy up rather than none.
-        guard let ownLaunchDate else {
-            return .retire(running.filter { $0.pid < ownPID }.map(\.pid))
+        // With no start time of our own we have no place in the order at all: stay up,
+        // and take nobody with us.
+        guard let ownStartedAt else { return .retire([]) }
+        // A peer the kernel would not place is left out both ways round. Guessing in
+        // either direction is what lets two copies each conclude the other should go.
+        let ranked = running.compactMap { peer -> (pid: pid_t, startedAt: UInt64)? in
+            guard peer.pid != ownPID, let startedAt = peer.startedAt else { return nil }
+            return (pid: peer.pid, startedAt: startedAt)
         }
-        let outranked = others.contains { ($0.launchDate ?? .distantPast, $0.pid) > (ownLaunchDate, ownPID) }
-        return outranked ? .yieldToNewer : .retire(others.map(\.pid))
+        let outranked = ranked.contains { ($0.startedAt, $0.pid) > (ownStartedAt, ownPID) }
+        return outranked ? .yieldToNewer : .retire(ranked.map(\.pid))
+    }
+
+    /// When the kernel says a process started, in microseconds since the epoch. Readable
+    /// for any process of the same user, and the same number whichever process asks,
+    /// which is the whole point: the two copies rank each other off one shared fact.
+    static func kernelStartTime(pid: pid_t) -> UInt64? {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        guard sysctl(&mib, u_int(mib.count), &info, &size, nil, 0) == 0,
+              size == MemoryLayout<kinfo_proc>.stride else { return nil }
+        let started = info.kp_proc.p_starttime
+        guard started.tv_sec > 0 else { return nil }
+        return UInt64(started.tv_sec) * 1_000_000 + UInt64(started.tv_usec)
     }
 
     /// False when this launch has stood down for a copy that is already up, in
@@ -60,10 +81,11 @@ enum SingleInstanceGuard {
     static func enforceSingleInstance() -> Bool {
         guard !CommandLine.arguments.contains(keepBothFlag) else { return true }
         let peers = runningPeers()
+        let ownPID = ProcessInfo.processInfo.processIdentifier
         let decision = decide(
-            running: peers.map { (pid: $0.processIdentifier, launchDate: $0.launchDate) },
-            ownPID: ProcessInfo.processInfo.processIdentifier,
-            ownLaunchDate: NSRunningApplication.current.launchDate
+            running: peers.map { (pid: $0.processIdentifier, startedAt: kernelStartTime(pid: $0.processIdentifier)) },
+            ownPID: ownPID,
+            ownStartedAt: kernelStartTime(pid: ownPID)
         )
         guard case .retire(let doomed) = decision else {
             NSLog("CodeBurn: a newer instance is already running - quitting this one")

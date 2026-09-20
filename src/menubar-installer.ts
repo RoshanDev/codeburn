@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createWriteStream, constants as fsConstants } from 'node:fs'
-import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir, platform, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
@@ -236,10 +236,11 @@ function macApplicationsDirs(): string[] {
 export type MacInstallTarget = {
   /// The bundle path the install writes.
   targetPath: string
-  /// True when a copy was already installed somewhere, whether or not it is the target.
-  existed: boolean
-  /// Copies that will still be there afterwards, for the user to move to the Trash.
-  leftovers: string[]
+  /// The copy that is already installed, or null. Not the same as targetPath when the
+  /// folder it sits in cannot be written: then it is opened and left alone, not replaced.
+  installedPath: string | null
+  /// Every copy found, in precedence order. Whichever one is not kept gets the notice.
+  found: string[]
 }
 
 /// Replace a copy where it already lives, so a user with CodeBurnMenubar.app in
@@ -255,7 +256,12 @@ export async function resolveMacInstallTarget(dirs: string[] = macApplicationsDi
   const chosen = present[0]
   const writable = chosen ? await access(dirname(chosen), fsConstants.W_OK).then(() => true, () => false) : false
   const targetPath = chosen && writable ? chosen : join(dirs[0]!, APP_BUNDLE_NAME)
-  return { targetPath, existed: present.length > 0, leftovers: present.filter(path => path !== targetPath) }
+  return { targetPath, installedPath: chosen ?? null, found: present }
+}
+
+/// The copies the user is told about: everything except the one being kept.
+function otherCopies(found: string[], kept: string): string[] {
+  return found.filter(path => path !== kept)
 }
 
 /// Injected by the tests: the placement below has to be driven through failures a real
@@ -264,7 +270,61 @@ export type BundlePlacementHooks = {
   rename?: (from: string, to: string) => Promise<void>
   copy?: (from: string, to: string) => Promise<void>
   verify?: (appPath: string) => Promise<void>
+  isLivePid?: (pid: number) => boolean
   log?: (line: string) => void
+}
+
+/// The two names a placement can leave in the target directory, each carrying the pid of the
+/// install that made it. Dot-prefixed, so neither is a second launchable .app.
+const ASIDE_PREFIX = `.${APP_BUNDLE_NAME}.old-`
+const STAGED_PREFIX = `.${APP_BUNDLE_NAME}.new-`
+
+function placementPid(name: string): number | null {
+  const prefix = [ASIDE_PREFIX, STAGED_PREFIX].find(p => name.startsWith(p))
+  if (!prefix) return null
+  const pid = Number(name.slice(prefix.length))
+  return Number.isInteger(pid) && pid > 0 ? pid : null
+}
+
+/// EPERM means the pid is taken by a process we may not signal, which is still a live pid.
+function pidIsLive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+/// What an install finds of the installs before it. One question answers all of it: is the
+/// pid in the name still alive. A live one means a second install is running right now, and
+/// this one stops before touching anything; a dead one left its files behind, and if the
+/// real name is free its aside copy *is* the user's app, waiting to be put back. Run before
+/// the target is resolved, or a killed install into /Applications would look like no install
+/// at all and the app would quietly move to ~/Applications.
+export async function recoverPlacements(dirs: string[], hooks: BundlePlacementHooks = {}): Promise<void> {
+  const move = hooks.rename ?? rename
+  const isLive = hooks.isLivePid ?? pidIsLive
+  const orphans: Array<{ dir: string; name: string; pid: number }> = []
+  for (const dir of dirs) {
+    for (const name of await readdir(dir).catch(() => [] as string[])) {
+      const pid = placementPid(name)
+      if (pid !== null && pid !== process.pid) orphans.push({ dir, name, pid })
+    }
+  }
+  const active = orphans.find(orphan => isLive(orphan.pid))
+  if (active) {
+    throw new Error(
+      `Another CodeBurn Menubar install (pid ${active.pid}) is working in ${active.dir}. ` +
+      `Nothing was changed; try again once it has finished.`
+    )
+  }
+  for (const { dir, name } of orphans) {
+    const orphan = join(dir, name)
+    const target = join(dir, APP_BUNDLE_NAME)
+    if (name.startsWith(ASIDE_PREFIX) && !(await exists(target))) await move(orphan, target)
+    else await rm(orphan, { recursive: true, force: true }).catch(() => {})
+  }
 }
 
 /// Put the staged bundle at targetPath, leaving the user with a working app whatever fails.
@@ -286,7 +346,7 @@ export async function placeMenubarBundle(
   const log = hooks.log ?? console.log
 
   const dir = dirname(targetPath)
-  const aside = join(dir, `.${basename(targetPath)}.old-${process.pid}`)
+  const aside = join(dir, `${ASIDE_PREFIX}${process.pid}`)
   const replacing = await exists(targetPath)
   if (replacing) await move(targetPath, aside)
 
@@ -298,7 +358,7 @@ export async function placeMenubarBundle(
       // Staging is on another volume, so the move has to be a copy. Copy into a sibling of
       // the target and rename that into place: a rename within one directory is atomic, and
       // nothing half-copied is ever visible under the real name.
-      const sibling = join(dir, `.${basename(targetPath)}.new-${process.pid}`)
+      const sibling = join(dir, `${STAGED_PREFIX}${process.pid}`)
       try {
         await rm(sibling, { recursive: true, force: true })
         await copy(stagedApp, sibling)
@@ -313,7 +373,11 @@ export async function placeMenubarBundle(
     }
   } catch (err) {
     await rm(targetPath, { recursive: true, force: true }).catch(() => {})
-    if (replacing) await move(aside, targetPath).catch(() => {})
+    if (replacing) {
+      await move(aside, targetPath).catch(() => {
+        log(`The menu bar app could not be put back. It is at ${aside}; rename it to ${targetPath} to restore it.`)
+      })
+    }
     throw err
   }
 
@@ -655,9 +719,14 @@ export async function hasRunnableRecordedCli(recordPath: string = PERSISTED_CLI_
   }
 }
 
+/// `-x`, not `-f`: the executable inside the bundle is named exactly CodeBurnMenubar, and
+/// matching the whole command line instead would also hit an editor with the bundle's
+/// Info.plist open, or a tail on a log path. The name is the same from either Applications
+/// folder, so a copy running from the other one is still matched. killRunningApp must use
+/// the same matcher, or this reports a process that was never signalled.
 async function isAppRunning(): Promise<boolean> {
   return new Promise((resolve) => {
-    const proc = spawn('/usr/bin/pgrep', ['-f', APP_PROCESS_NAME])
+    const proc = spawn('/usr/bin/pgrep', ['-x', APP_PROCESS_NAME])
     proc.on('close', (code) => resolve(code === 0))
     proc.on('error', () => resolve(false))
   })
@@ -665,7 +734,7 @@ async function isAppRunning(): Promise<boolean> {
 
 async function killRunningApp(): Promise<void> {
   await new Promise<void>((resolve) => {
-    const proc = spawn('/usr/bin/pkill', ['-f', APP_PROCESS_NAME])
+    const proc = spawn('/usr/bin/pkill', ['-x', APP_PROCESS_NAME])
     proc.on('close', () => resolve())
     proc.on('error', () => resolve())
   })
@@ -1423,14 +1492,17 @@ export async function installMenubarApp(options: InstallOptions = {}): Promise<I
   await ensureSupportedPlatform()
   await persistCodeburnPath()
 
-  const { targetPath, existed: alreadyInstalled, leftovers } = await resolveMacInstallTarget()
+  await recoverPlacements(macApplicationsDirs())
+  const { targetPath, installedPath, found } = await resolveMacInstallTarget()
 
-  if (alreadyInstalled && !options.force) {
+  if (installedPath && !options.force) {
+    // The copy that is actually there, which is not targetPath when its folder cannot be
+    // written: `open` on a path with nothing at it fails the command for no reason.
     if (!(await isAppRunning())) {
-      await runCommand('/usr/bin/open', [targetPath])
+      await runCommand('/usr/bin/open', [installedPath])
     }
-    reportLeftoverBundles(leftovers)
-    return { installedPath: targetPath, launched: true }
+    reportLeftoverBundles(otherCopies(found, installedPath))
+    return { installedPath, launched: true }
   }
 
   const cliVersion = options.cliVersion ? normalizeCliVersion(options.cliVersion) : ''
@@ -1456,9 +1528,9 @@ export async function installMenubarApp(options: InstallOptions = {}): Promise<I
     }
 
     await mkdir(dirname(targetPath), { recursive: true })
-    if (alreadyInstalled) {
+    if (installedPath) {
       // Kill the running copy before replacing its bundle so `mv` can proceed cleanly and the
-      // user ends up on the new version. pkill matches the process name, so a copy running
+      // user ends up on the new version. The match is on the process name, so a copy running
       // from the other Applications folder is asked to go too.
       await killRunningApp()
     }
@@ -1469,7 +1541,7 @@ export async function installMenubarApp(options: InstallOptions = {}): Promise<I
 
     console.log('Launching CodeBurn Menubar...')
     await runCommand('/usr/bin/open', [targetPath])
-    reportLeftoverBundles(leftovers)
+    reportLeftoverBundles(otherCopies(found, targetPath))
     return { installedPath: targetPath, launched: true }
   } finally {
     await rm(stagingDir, { recursive: true, force: true })

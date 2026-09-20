@@ -332,6 +332,10 @@ describe('resource usage buckets', () => {
 
 describe('app_close resource usage', () => {
   const SESSION_MS = 10 * 60_000
+  const OPENED_AT = Date.parse('2026-09-19T09:00:00Z')
+  /// Both counters are cumulative since their own process started, so the mocks below grow
+  /// with the clock and carry a head start from before telemetry was constructed.
+  const elapsedSec = () => (Date.now() - OPENED_AT) / 1000
 
   afterEach(() => { vi.useRealTimers() })
 
@@ -350,14 +354,26 @@ describe('app_close resource usage', () => {
 
   it('carries app and serve buckets when both report metrics', async () => {
     const props = await closeWith({
-      // 30 CPU-seconds over a 600s session is 5% of one core; 600MB of working set.
+      // 30 CPU-seconds over a 600s session is 5% of one core; 600MB of working set. The
+      // 400 and 100 already on the clocks belong to the time before this session.
       getAppMetrics: () => [
-        { cpu: { cumulativeCPUUsage: 20, percentCPUUsage: 0 }, memory: { workingSetSize: 400 * 1024 } },
-        { cpu: { cumulativeCPUUsage: 10, percentCPUUsage: 0 }, memory: { workingSetSize: 200 * 1024 } },
+        { cpu: { cumulativeCPUUsage: 400 + elapsedSec() * 0.03, percentCPUUsage: 0 }, memory: { workingSetSize: 400 * 1024 } },
+        { cpu: { cumulativeCPUUsage: 100 + elapsedSec() * 0.02, percentCPUUsage: 0 }, memory: { workingSetSize: 200 * 1024 } },
       ],
-      getServeUsage: () => ({ cpuSec: 120, rssMb: 1200 }),
+      getServeUsage: () => ({ cpuSec: 900 + elapsedSec() * 0.2, rssMb: 1200 }),
     })
     expect(props).toEqual({ sessionMinutes: 10, cpu: '5-15', mem: '500-1k', serveCpu: '15-40', serveMem: '1-3k' })
+  })
+
+  // The counters run from each process's own start, the wall clock from telemetry's: a
+  // desktop app that had been open for hours read as pinned CPU for a session that did
+  // nothing at all.
+  it('reports the CPU spent during the session, not what was already on the clock', async () => {
+    const props = await closeWith({
+      getAppMetrics: () => [{ cpu: { cumulativeCPUUsage: 500, percentCPUUsage: 0 }, memory: { workingSetSize: 300 * 1024 } }],
+      getServeUsage: () => ({ cpuSec: 900, rssMb: 300 }),
+    })
+    expect(props).toMatchObject({ cpu: '<1', serveCpu: '<1' })
   })
 
   it('averages sampled percentages when the platform reports no cumulative CPU', async () => {
