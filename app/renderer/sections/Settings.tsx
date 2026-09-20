@@ -377,7 +377,7 @@ function ProjectsPane({ refreshToken, onConfigMutated }: { refreshToken: number;
   const orphans = report.data ? filter.exclude.filter(entry => !projects.some(project => projectMatches(project, entry))) : []
   const hiddenCount = projects.filter(project => !projectVisible(project, filter)).length
 
-  return <section className="set-p on">
+  return <section className="set-p set-p-wide on">
     <div><h3 className="set-h">{t('settings.projects.heading')}</h3><p className="set-sub">{t('settings.projects.subtitle')}</p></div>
     {filter.project.length > 0 && <div className="card"><div className="about-row">
       <span className="tx">{t('settings.projects.matchingPrefix')} <span className="set-mono">{filter.project.join(', ')}</span></span>
@@ -430,7 +430,7 @@ function AliasesPane({ refreshToken, onConfigMutated }: { refreshToken: number; 
     setActionNonce(value => value + 1)
     onConfigMutated?.()
   }
-  return <section className="set-p on">
+  return <section className="set-p set-p-wide on">
     <div><h3 className="set-h">{t('settings.aliases.heading')}</h3><p className="set-sub">{t('settings.aliases.subtitle')}</p></div>
     <div className="card"><div className="about-sec set-last-sec">
       {aliases.error ? <SettingsErrorText error={aliases.error} /> : !aliases.data ? <p className="set-cap">{t('settings.aliases.loading')}</p> : aliases.data.length === 0 ? <p className="set-cap set-alias-empty">{t('settings.aliases.empty')}</p> : aliases.data.map(alias => <div className="set-alias" key={alias.from}><span className="set-mono">{alias.from}</span><span className="set-alias-ar">→</span><span className="set-mono set-alias-to">{alias.to}</span><button className="btnp" onClick={() => void codeburn.removeAlias(alias.from).then(result => complete(result))}>{t('settings.action.remove')}</button></div>)}
@@ -489,7 +489,7 @@ function PricingPane({ refreshToken, onConfigMutated }: { refreshToken: number; 
     void codeburn.setPriceOverride(model.trim(), rates).then(result => complete(result, true))
   }
 
-  return <section className="set-p on">
+  return <section className="set-p set-p-wide on">
     <div><h3 className="set-h">{t('settings.pricing.heading')}</h3><p className="set-sub">{t('settings.pricing.subtitle')}</p></div>
     <div className="card"><div className="about-sec set-last-sec">
       {overrides.error ? <SettingsErrorText error={overrides.error} /> : !overrides.data ? <p className="set-cap">{t('settings.pricing.loading')}</p> : overrides.data.overrides.length === 0 ? <p className="set-cap set-alias-empty">{t('settings.pricing.empty')}</p> : overrides.data.overrides.map(override => <div className="set-price-row" key={override.model}><span className="set-mono">{override.model}</span><span className="set-price-rates">{priceRateSummary(override)}</span><ConfirmButton label={t('settings.action.remove')} prompt={t('settings.confirm.removePrompt')} onConfirm={() => void codeburn.removePriceOverride(override.model).then(result => complete(result))} /></div>)}
@@ -662,7 +662,7 @@ function PrivacyPane({ onPane }: { onPane: (pane: Pane) => void }) {
     clearOverviewHeadlines()
     showToast(t('settings.privacy.snapshotsCleared'), 'ok')
   }
-  return <section className="set-p set-p-bound on">
+  return <section className="set-p on">
     <div><h3 className="set-h">{t('settings.privacy.heading')}</h3><p className="set-sub">{t('settings.privacy.subtitle')}</p></div>
     <div className="card"><div className="about-sec set-last-sec set-rows">
       <TelemetryRow />

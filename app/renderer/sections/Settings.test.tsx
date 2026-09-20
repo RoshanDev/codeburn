@@ -389,8 +389,9 @@ describe('Settings', () => {
     // Exactly one control per row, all in the right-hand block, and no per-row icons.
     expect(rows.map(row => row.querySelector('.r')!.children.length)).toEqual([1, 1, 1, 1])
     expect(pane.querySelector('svg')).toBeNull()
-    // The pane owns its reading column; the rest of Settings keeps the full-width card.
-    expect(pane).toHaveClass('set-p-bound')
+    // Every pane reads at the shared bounded column, so Privacy carries no width modifier.
+    expect(pane).toHaveClass('set-p')
+    expect(pane.className).not.toMatch(/set-p-wide/)
   })
 
   it('reads the device-sharing row from the share status and opens the Devices pane', async () => {
