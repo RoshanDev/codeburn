@@ -479,11 +479,11 @@ body { overflow: hidden; background: var(--bg); color: var(--ink); }
 .tgl.on { background: var(--accent); }
 .tgl::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; }
 .tgl.on::after { left: 14px; }
-.set-claim { display: flex; gap: var(--sp-3); padding: var(--sp-3); border-top: 1px solid var(--line2); }
-.set-claim:first-child { border-top: 0; }
-.set-claim > svg { width: 18px; height: 18px; flex: 0 0 auto; color: var(--accent); margin-top: 1px; }
-.set-claim-t { font-size: var(--fs-body); font-weight: var(--fw-medium); color: var(--ink); }
-.set-claim-d { font-size: var(--fs-meta); color: var(--mut); line-height: 1.55; margin-top: 3px; }
+.set-p .card > .set-rows { padding: 0 var(--sp-5); }
+.set-rows > .about-row { padding: var(--sp-5) 0; border-top: 1px solid var(--line2); }
+.set-rows > .about-row:first-child { border-top: 0; }
+.set-rows .tx { font-weight: var(--fw-medium); }
+.set-rows .tx small { max-width: 54ch; color: var(--mut); line-height: 1.5; margin-top: var(--sp-1); }
 .set-p .seg { overflow: hidden; padding: 0; border-radius: 8px; }
 .set-p .seg button { border: 0; border-right: 1px solid var(--line2); background: transparent; padding: 5px 11px; font: inherit; font-size: var(--fs-body); color: var(--mut); cursor: pointer; }
 .set-p .seg button:last-child { border-right: 0; }
