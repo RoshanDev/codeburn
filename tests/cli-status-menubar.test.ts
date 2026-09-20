@@ -47,8 +47,12 @@ async function plantRender5MissingBasis(snapshotPath: string): Promise<string> {
 
 // Every case here spawns the real CLI and does genuine multi-provider parse
 // work; the 5s default is fine on a dev laptop and not on a shared 2-core
-// runner, where individual cases have been observed needing 6-8s.
-vi.setConfig({ testTimeout: 30_000 })
+// runner, where individual cases have been observed needing 6-8s. On
+// windows-latest a single spawn has been measured between 1.4s and 12s (run
+// 35474746411), so a two-spawn case reached 23.9s under the old 30s ceiling.
+// runCli caps each CLI at 30s itself, so a real hang still fails here with the
+// child's stderr rather than riding this number.
+vi.setConfig({ testTimeout: 60_000 })
 
 function runCli(args: string[], home: string, extraEnv: Record<string, string | undefined> = {}) {
   return spawnSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', ...args], {
@@ -805,6 +809,8 @@ describe('codeburn status --format menubar-json', () => {
     }
   })
 
+  // Four CLI spawns, the most in this file, against a windows-latest tail of
+  // ~12s per spawn: the file-wide 60s is not enough headroom for this one.
   it('serves a repeat identical query from the status snapshot, debounces a fresh change, then reflects it once settled', async () => {
     const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-snapshot-'))
 
@@ -869,7 +875,7 @@ describe('codeburn status --format menubar-json', () => {
     } finally {
       await rm(home, { recursive: true, force: true })
     }
-  })
+  }, 90_000)
 
   it('rejects a provider payload cached under the previous render contract', async () => {
     const home = await mkdtemp(join(tmpdir(), 'codeburn-menubar-provider-render-'))
