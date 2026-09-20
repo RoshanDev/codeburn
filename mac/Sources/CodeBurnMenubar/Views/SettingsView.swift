@@ -71,8 +71,8 @@ struct SettingsView: View {
         )
     }
 
-    private static let windowWidth: CGFloat = 880
-    private static let windowHeight: CGFloat = 620
+    static let windowWidth: CGFloat = 880
+    static let windowHeight: CGFloat = 620
     private static let sidebarWidth: CGFloat = 260
 
     var body: some View {
@@ -337,8 +337,6 @@ private final class SettingsWindowStyleView: NSView {
         applyStyle()
     }
 
-    private var didPlaceWindow = false
-
     func applyStyle() {
         guard let window else { return }
         // Full-size content lets the sidebar material extend behind the
@@ -351,16 +349,6 @@ private final class SettingsWindowStyleView: NSView {
         // Match System Settings: the window is named after the visible pane.
         window.title = paneTitle
         window.collectionBehavior.insert(.fullScreenPrimary)
-        // The frameAutosave may restore a position saved when the window was
-        // smaller, leaving the grown window hanging off the screen edge —
-        // recenter once whenever it does not fit fully on its screen.
-        if !didPlaceWindow {
-            didPlaceWindow = true
-            if let screen = window.screen ?? NSScreen.main,
-               !screen.visibleFrame.contains(window.frame) {
-                window.center()
-            }
-        }
     }
 }
 

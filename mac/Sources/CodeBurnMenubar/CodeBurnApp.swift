@@ -1825,22 +1825,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
             rootView: SettingsView().environment(store).environment(updateChecker)
         )
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 380),
+            // The view's own minimum, so the window is never positioned at a
+            // placeholder size that SwiftUI then grows away from the screen.
+            contentRect: NSRect(
+                x: 0,
+                y: 0,
+                width: SettingsView.windowWidth,
+                height: SettingsView.windowHeight
+            ),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         window.title = L("CodeBurn Settings")
         window.contentViewController = hosting
-        window.center()
         window.isReleasedWhenClosed = false
+        let savedFrame = window.setFrameUsingName(Self.settingsFrameAutosaveName) ? window.frame : nil
+        window.setFrameAutosaveName(Self.settingsFrameAutosaveName)
+        placeSettingsWindow(window, savedFrame: savedFrame)
         let controller = NSWindowController(window: window)
+        // Cascading would walk the window away from where we just put it.
+        controller.shouldCascadeWindows = false
         settingsWindowController = controller
         NSApp.activate(ignoringOtherApps: true)
         controller.showWindow(nil)
-        // SwiftUI resizes the window past the initial contentRect after first
-        // layout, which drifts the earlier center(). Re-center once that settles.
-        DispatchQueue.main.async { [weak window] in window?.center() }
+        // SwiftUI can still resize the window past the initial contentRect after
+        // first layout, and a resize keeps the top-left corner. Place it again
+        // once that settles, at whatever size it ended up.
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self, let window else { return }
+            self.placeSettingsWindow(window, savedFrame: savedFrame)
+        }
+    }
+
+    private static let settingsFrameAutosaveName = "CodeBurnMenubar.SettingsWindow"
+
+    private func placeSettingsWindow(_ window: NSWindow, savedFrame: NSRect?) {
+        // The popover's screen is the one the user is looking at.
+        let active = statusItem?.button?.window?.screen ?? NSScreen.main
+        guard let active else { return }
+        window.setFrameOrigin(SettingsWindowPlacement.origin(
+            savedFrame: savedFrame,
+            size: window.frame.size,
+            activeVisibleFrame: active.visibleFrame,
+            screenVisibleFrames: NSScreen.screens.map(\.visibleFrame)
+        ))
     }
 
     @objc private func refreshNowAction() {
