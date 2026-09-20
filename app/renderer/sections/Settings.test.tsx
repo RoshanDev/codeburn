@@ -249,6 +249,65 @@ describe('Settings', () => {
     expect(await screen.findByText('Updated')).toBeInTheDocument()
   })
 
+  // Every bridge setter is a rejectable envelope: a rejection that nobody
+  // catches leaves the control looking like it ignored the click. One test per
+  // pane, on one of that pane's setters.
+  describe('a rejected setter toasts instead of going quiet', () => {
+    const rejection = { kind: 'bad-args' as const, message: 'the CLI said no' }
+
+    it('currency (General)', async () => {
+      const user = userEvent.setup()
+      mocks.setCurrency.mockRejectedValue(rejection)
+      render(<Settings period="month" />)
+      await user.click(await screen.findByLabelText('Currency'))
+      await user.click(screen.getByRole('option', { name: 'CNY' }))
+      expect(await screen.findByText('the CLI said no')).toBeInTheDocument()
+    })
+
+    it('aliases', async () => {
+      const user = userEvent.setup()
+      mocks.removeAlias.mockRejectedValue(rejection)
+      render(<Settings period="month" />)
+      await user.click(screen.getByRole('button', { name: 'Model aliases' }))
+      expect(await screen.findByText('proxy-opus')).toBeInTheDocument()
+      await user.click(screen.getByRole('button', { name: 'Remove' }))
+      expect(await screen.findByText('the CLI said no')).toBeInTheDocument()
+    })
+
+    it('price overrides', async () => {
+      const user = userEvent.setup()
+      mocks.removePriceOverride.mockRejectedValue(rejection)
+      render(<Settings period="month" />)
+      await user.click(screen.getByRole('button', { name: 'Pricing' }))
+      expect(await screen.findByText('local/llama')).toBeInTheDocument()
+      await user.click(screen.getByRole('button', { name: 'Remove' }))
+      await user.click(screen.getByRole('button', { name: 'Confirm' }))
+      expect(await screen.findByText('the CLI said no')).toBeInTheDocument()
+    })
+
+    it('plans', async () => {
+      const user = userEvent.setup()
+      mocks.setPlan.mockRejectedValue(rejection)
+      render(<Settings period="month" />)
+      await user.click(screen.getByRole('button', { name: 'Plans' }))
+      await user.click(await screen.findByLabelText('Add a plan'))
+      await user.click(screen.getByRole('option', { name: 'Cursor Pro' }))
+      await user.click(screen.getByRole('button', { name: 'Add' }))
+      expect(await screen.findByText('the CLI said no')).toBeInTheDocument()
+    })
+
+    it('devices', async () => {
+      const user = userEvent.setup()
+      mocks.removeDevice.mockRejectedValue(rejection)
+      render(<Settings period="month" />)
+      await user.click(screen.getByRole('button', { name: 'Devices' }))
+      expect(await screen.findByText('studio-mini')).toBeInTheDocument()
+      await user.click(screen.getByRole('button', { name: 'Remove' }))
+      await user.click(screen.getByRole('button', { name: 'Confirm' }))
+      expect(await screen.findByText('the CLI said no')).toBeInTheDocument()
+    })
+  })
+
   it('reports settings, plan and export interactions as name-only events', async () => {
     const user = userEvent.setup()
     render(<Settings period="month" />)
@@ -304,6 +363,29 @@ describe('Settings', () => {
     expect(await screen.findByText('consent state could not be written')).toBeInTheDocument()
     // and the switch still reports what main last confirmed, never the click.
     expect(screen.getByRole('switch', { name: 'Anonymous usage statistics' })).toHaveAttribute('aria-checked', 'false')
+  })
+
+  it('says so when the consent decision only took in memory', async () => {
+    const user = userEvent.setup()
+    mocks.setTelemetryEnabled.mockResolvedValue({ ...telemetryOff, enabled: true, persisted: false })
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
+    await user.click(await screen.findByRole('switch', { name: 'Anonymous usage statistics' }))
+    expect(await screen.findByText('Saved for this session only: could not write the setting to disk.')).toBeInTheDocument()
+  })
+
+  it('re-reads consent from main every time the Privacy pane is opened', async () => {
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
+    expect(await screen.findByRole('switch', { name: 'Anonymous usage statistics' })).toHaveAttribute('aria-checked', 'false')
+
+    // The pane is conditionally rendered, so leaving unmounts it. Main changed
+    // the answer meanwhile (the menu bar app writes the same file).
+    mocks.telemetryStatus.mockResolvedValue({ ...telemetryOff, enabled: true })
+    await user.click(screen.getByRole('button', { name: 'Plans' }))
+    await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
+    expect(await screen.findByRole('switch', { name: 'Anonymous usage statistics' })).toHaveAttribute('aria-checked', 'true')
   })
 
   it('sends nothing when the write does not take, and nothing on the way out', async () => {
@@ -585,7 +667,7 @@ describe('Settings', () => {
     render(<Settings period="month" />)
     await user.click(screen.getByRole('button', { name: 'Plans' }))
     await screen.findByText('Detected subscriptions')
-    await user.click(screen.getByRole('button', { name: 'Connect' }))
+    await user.click(screen.getByRole('button', { name: 'How to connect' }))
     expect(screen.getByText('codex login')).toBeInTheDocument()
     mocks.getQuota.mockClear()
     await user.click(screen.getByRole('button', { name: 'Refresh' }))

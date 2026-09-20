@@ -35,6 +35,24 @@ describe('QuotaService', () => {
     expect(fetchers.antigravity).toHaveBeenCalledWith({ signal: expect.any(AbortSignal), allowKeychain: false })
   })
 
+  it('holds a live connection through an unchecked-keychain background poll', async () => {
+    const fetchers = noopFetchers()
+    let now = 1000
+    const service = new QuotaService({
+      ...fetchers, grokbotInstalled: () => true, now: () => now,
+      readFile: vi.fn(async () => null), writeFile: vi.fn(async () => undefined),
+    })
+    // Forced: the keychain was read, Claude is connected.
+    await service.getQuota({ force: true, allowKeychain: true })
+    // The next background poll cannot see a keychain-only credential, so it
+    // reports "not checked". That must not flap a live card to the check-now
+    // state — only a forced refresh can change the answer.
+    fetchers.claude.mockResolvedValue({ quota: { ...quota('claude'), connection: 'keychainUnchecked' } })
+    now += 10 * 60_000
+    const results = await service.getQuota({})
+    expect(results.find(row => row.provider === 'claude')?.connection).toBe('connected')
+  })
+
   // The snap declares no Codex credential path, because the live gauge would
   // need write access to the Codex CLI's own auth.json to rotate the token.
   // Under $SNAP the Codex fetch must not run at all; Claude is unaffected.

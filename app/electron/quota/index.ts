@@ -130,7 +130,7 @@ export class QuotaService {
         // Keychain-only credentials are invisible to a background (keychain-less)
         // poll; keep showing the live connection rather than flapping to
         // disconnected. A forced refresh re-reads the keychain and reveals truth.
-        if (!allowKeychain && (next.connection === 'disconnected' || next.connection === 'accessDenied')) return previous
+        if (!allowKeychain && (next.connection === 'disconnected' || next.connection === 'keychainUnchecked' || next.connection === 'accessDenied')) return previous
         if (next.connection === 'transientFailure') return { ...previous, connection: 'transientFailure', rateLimited: next.rateLimited }
         return next
       }
