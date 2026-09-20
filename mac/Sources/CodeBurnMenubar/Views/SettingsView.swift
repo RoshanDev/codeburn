@@ -686,7 +686,7 @@ private struct PrivacySettingsSection: View {
             ))
             .disabled(status?.isLocked ?? true)
             if status?.isLocked == true {
-                Text(L("Controlled in the CodeBurn desktop app."))
+                Text(L("Managed by the CodeBurn desktop app. Change it there under Settings → Privacy & data."))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
