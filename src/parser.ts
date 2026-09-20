@@ -2555,51 +2555,34 @@ export function extractPrUrlsFromText(text: string): string[] {
   return [...new Set(text.match(PR_URL_IN_TEXT_RE) ?? [])].sort()
 }
 
-function providerCallToTurn(call: ParsedProviderCall): ParsedTurn {
-  const tools = call.tools
-  const usage: TokenUsage = {
-    inputTokens: call.inputTokens,
-    outputTokens: call.outputTokens,
-    cacheCreationInputTokens: call.cacheCreationInputTokens,
-    cacheReadInputTokens: call.cacheReadInputTokens,
-    cachedInputTokens: call.cachedInputTokens,
-    reasoningTokens: call.reasoningTokens,
-    webSearchRequests: call.webSearchRequests,
-  }
-
-  const apiCall: ParsedApiCall = applyLocalModelSavings({
-    provider: call.provider,
-    model: call.model,
-    usage,
-    costUSD: call.costUSD,
-    tools,
-    mcpTools: extractMcpTools(tools),
-    skills: call.skills ?? [],
-    subagentTypes: call.subagentTypes ?? [],
-    hasAgentSpawn: tools.includes('Agent'),
-    hasPlanMode: tools.includes('EnterPlanMode'),
-    speed: call.speed,
-    timestamp: call.timestamp,
-    bashCommands: call.bashCommands,
-    deduplicationKey: call.deduplicationKey,
-    isEstimated: call.costIsEstimated,
-    ...(call.nanoAiu != null ? { nanoAiu: call.nanoAiu } : {}),
-    ...(call.requestCount != null ? { requestCount: call.requestCount } : {}),
-    ...(call.route ? { route: call.route } : {}),
-    ...(call.billing ? { billing: call.billing } : {}),
-  })
-
-  const prRefs = extractPrUrlsFromText(call.userMessage)
-  return {
-    userMessage: call.userMessage,
-    assistantCalls: [apiCall],
-    timestamp: call.timestamp,
-    sessionId: call.sessionId,
-    ...(prRefs.length ? { prRefs } : {}),
-  }
-}
-
 // ── Cache Conversion ───────────────────────────────────────────────────
+
+// Providers whose every parsed call carries a cost the tool itself computed or
+// was billed, not one derived from that call's tokens. Their cost is stored on
+// the cached call and served verbatim; every other provider's is recomputed
+// from the cached tokens on read (cachedCallToApiCall), so a pricing update
+// still reaches it.
+//
+// A new provider should set `ParsedProviderCall.costFromBilling` instead of
+// joining this set. The flag decides per call, so a provider that reports a
+// cost for some calls and falls back to token pricing for the rest keeps that
+// fallback re-priceable; membership here is the whole-provider form of the
+// same rule, kept for the providers that adopted it before the flag existed.
+// Either way, adding a provider needs a `PROVIDER_PARSE_VERSIONS` bump: calls
+// cached before the change hold `costUSD: undefined` and would otherwise be
+// re-priced from tokens forever.
+export const REPORTED_COST_PROVIDERS: ReadonlySet<string> = new Set([
+  'mistral-vibe',
+  'antigravity',
+  'devin',
+  'vercel-gateway',
+  'hermes',
+  'kiro',
+  'codewhale',
+  'quickdesk',
+  'cline-cli',
+  'omp',
+])
 
 function providerCallToCachedCall(call: ParsedProviderCall): CachedCall {
   return {
@@ -2615,7 +2598,7 @@ function providerCallToCachedCall(call: ParsedProviderCall): CachedCall {
       webSearchRequests: call.webSearchRequests,
       cacheCreationOneHourTokens: 0,
     },
-    costUSD: (call.provider === 'mistral-vibe' || call.provider === 'antigravity' || call.provider === 'devin' || call.provider === 'vercel-gateway' || call.provider === 'hermes' || call.provider === 'kiro' || call.provider === 'codewhale' || call.provider === 'quickdesk' || call.provider === 'cline-cli' || call.provider === 'omp' || call.costFromBilling === true) ? call.costUSD : undefined,
+    costUSD: (REPORTED_COST_PROVIDERS.has(call.provider) || call.costFromBilling === true) ? call.costUSD : undefined,
     isEstimated: call.costIsEstimated || undefined,
     speed: call.speed,
     timestamp: call.timestamp,

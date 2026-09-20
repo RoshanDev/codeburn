@@ -8,7 +8,8 @@ import type { ParsedProviderCall } from '../../src/providers/types.js'
 import { classifyTurn } from '../../src/classifier.js'
 import type { ParsedApiCall, ParsedTurn } from '../../src/types.js'
 
-// Mirrors src/parser.ts providerCallToTurn so we can assert that a Pi call's
+// Mirrors the parsed-call -> turn shape src/parser.ts builds so we can assert
+// that a Pi call's
 // skills survive the classifier into `subCategory`, which is the sole input the
 // session summary reads to build the "Skills & Agents" breakdown (#588).
 function turnFromPiCall(call: ParsedProviderCall, userMessage = ''): ParsedTurn {

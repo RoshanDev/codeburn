@@ -177,8 +177,12 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         seenKeys.add(dedupKey)
 
         const u = call.usage
+        // OpenClaw writes what the call actually cost, per message (never a
+        // running session total), in USD. Absent or 0 means "not recorded":
+        // those fall back to token pricing and must stay re-priceable.
         const costFromProvider = u.cost?.total ?? 0
-        const costUSD = costFromProvider > 0
+        const isReported = costFromProvider > 0
+        const costUSD = isReported
           ? costFromProvider
           : calculateCost(call.model, u.input, u.output, u.cacheWrite, u.cacheRead, 0)
 
@@ -197,6 +201,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           reasoningTokens: 0,
           webSearchRequests: 0,
           costUSD,
+          ...(isReported ? { costFromBilling: true } : {}),
           tools: [...new Set(call.tools)],
           bashCommands: [...new Set(call.bashCommands)],
           timestamp: ts.toISOString(),

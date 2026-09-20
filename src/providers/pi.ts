@@ -320,7 +320,11 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         // xai-oauth calls, so the alias table and price overrides never apply.
         // A genuinely free call would recompute to a small nonzero number;
         // that is the trade-off we accept for fixing the OAuth zero.
-        const costUSD = typeof reportedCost === 'number' && Number.isFinite(reportedCost) && reportedCost !== 0
+        // Per-message USD, never a running session total (verified against
+        // real Pi transcripts: cost.total equals this message's own
+        // input+output+cacheRead+cacheWrite and does not increase monotonically).
+        const isReported = typeof reportedCost === 'number' && Number.isFinite(reportedCost) && reportedCost !== 0
+        const costUSD = isReported
           ? reportedCost
           : calculateCost(messageModel || resolvedModel || model, input, output, cacheWrite, cacheRead, 0)
         const timestamp = entry.timestamp || pendingUserTimestamp || sessionTimestamp || fileMtime
@@ -336,6 +340,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           reasoningTokens: 0,
           webSearchRequests: 0,
           costUSD,
+          ...(isReported ? { costFromBilling: true } : {}),
           tools,
           bashCommands,
           skills,

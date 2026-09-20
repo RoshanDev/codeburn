@@ -430,6 +430,11 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // `billing` (`included` -> subscription, `actual` -> metered). Cached calls
   // hold none, so they must re-parse.
   hermes: 'reasoning-output-accounting-v1-est-cost-routed-ids-workspace-pr-v5-cost-provenance-v3-billing-route-v1-billing-mode-v1',
+  // reported-cost-v1: OpenClaw's per-message `usage.cost.total` is now
+  // preserved through the cache via `costFromBilling`. This is OpenClaw's
+  // first parse version; adding it moves the provider's env fingerprint,
+  // which is what forces the one re-parse that lands the reported dollars.
+  openclaw: 'reported-cost-v1',
   'lingtai-tui': 'token-ledger-registry-activity-v3',
   'ibm-bob': 'worktree-project-grouping-v1',
   // project-path-v1: the parser now records the session's full working
@@ -456,7 +461,12 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // projectPath/workingDirectory instead of basename-only identity.
   // project-group-by-abs-v1 (#1260): parseProviderSources groups by abs
   // projectPath/workingDirectory so same-basename distinct roots stay apart.
-  pi: 'cwd-project-path-v1-project-group-by-abs-v1',
+  // reported-cost-v1: Pi writes a per-message `usage.cost.total`, which is now
+  // preserved through the cache via `costFromBilling` instead of being
+  // re-priced from tokens on every read. (omp, the same parser, has carried
+  // reported costs since reported-cost-v2 below.) Cached calls hold
+  // costUSD: undefined, so they must re-parse once.
+  pi: 'cwd-project-path-v1-project-group-by-abs-v1-reported-cost-v1',
   // project-group-by-abs-v1: shared Pi/OMP serve grouping uses abs identity.
   omp: 'nested-agent-v1-reported-cost-v2-cwd-project-path-v1-project-group-by-abs-v1',
   // archived-subtree-v1 (#1362): the subtree walk no longer filters
