@@ -41,6 +41,14 @@ export type ParsedProviderCall = {
   webSearchRequests: number
   costUSD: number
   costIsEstimated?: boolean
+  // True when `costUSD` came from the provider's OWN billing record (charged
+  // dollars, or metered credits at a published rate) instead of being priced
+  // from this call's tokens. Such a cost is preserved through the session
+  // cache (parser.ts providerCallToCachedCall); a call without it stores no
+  // cost and is re-priced from its cached tokens on every read, so a pricing
+  // update still reaches it. Orthogonal to `costIsEstimated`: a credit rate is
+  // an estimate of dollars, but it is still billing-derived.
+  costFromBilling?: boolean
   tools: string[]
   bashCommands: string[]
   // Subagent types spawned in this call (e.g. 'general-purpose'). Feeds the

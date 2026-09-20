@@ -484,7 +484,13 @@ export const PROVIDER_PARSE_VERSIONS: Record<string, string> = {
   // billing-routes-v2: its warm cache must move with both shared route fields.
   'kilo-code': 'worktree-project-grouping-v1-session-model-v1-archived-subtree-v1-billing-routes-v2',
   'roo-code': 'worktree-project-grouping-v1',
-  warp: 'worktree-project-grouping-v1-est-cost',
+  // billing-cost-v1: Warp's own billing record (total_provider_cost_in_cents,
+  // total_charged_usage, credits_spent) now rides on each call as
+  // `costFromBilling` and is preserved by providerCallToCachedCall. Entries
+  // cached before this hold costUSD: undefined and are re-priced from the
+  // token floor on every read, so they must re-parse once for the real dollars
+  // to land.
+  warp: 'worktree-project-grouping-v1-est-cost-billing-cost-v1',
   antigravity: 'worktree-project-grouping-v6',
 }
 

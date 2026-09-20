@@ -190,7 +190,15 @@ import type { DateRange, ProjectSummary } from './types.js'
 // which re-derive to the same rows for direct calls and to "(Bedrock)" rows
 // for Bedrock-shaped ids, but its Hermes column routes are unrecoverable
 // without a re-parse, so hermes joins PENDING_REDERIVE_PROVIDER_VERSIONS.
-export const DAILY_CACHE_VERSION = 33
+// v34: Warp cost accounting changed the same way kiro's did at v11 - Warp's
+// own billing record (provider cost / charged usage / metered credits) now
+// passes through the session cache instead of being re-priced from the token
+// floor, which understated or overstated every Warp day. Days finalized at v33
+// carry the floor figure; the bump re-derives those whose Warp conversations
+// still exist (Warp's sqlite is durable, so effectively all of them) and
+// carries the rest forward untouched. Call counts are unchanged, so no
+// PENDING_REDERIVE entry is needed and the partial-survival guard is unaffected.
+export const DAILY_CACHE_VERSION = 34
 const MIN_SUPPORTED_VERSION = 28
 
 /// Providers whose per-day CALL COUNT means something different at

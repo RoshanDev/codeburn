@@ -491,6 +491,9 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
             webSearchRequests: 0,
             costUSD: allocatedCosts ? (allocatedCosts[index] ?? 0) : calculateCost(model, inputTokens, 0, 0, 0, 0),
             costIsEstimated: conversationCost ? conversationCost.estimated : true,
+            // Rungs (a)-(c) are Warp's own billing record; keep them through
+            // the cache. Rung (d) is the token floor, which stays re-priceable.
+            ...(conversationCost ? { costFromBilling: true } : {}),
             tools: exchangeTools.tools,
             bashCommands: exchangeTools.bashCommands,
             timestamp,
