@@ -8,7 +8,7 @@ import { formatCost, formatTokens, markEstimated, carriedCostNote, excludedGatew
 import { maxOf } from './math-utils.js'
 import { formatSessionCount } from './session-count-label.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
-import { parseAllSessions, filterProjectsByDateRange, filterProjectsByName, setInteractiveScanUI, withSinglePassParse, withColdFirstPaintFloor, filesParsedFromSourceCount, isCompleteSessionSnapshotAvailable } from './parser.js'
+import { parseAllSessions, excludeAggregateOnlyProjects, filterProjectsByDateRange, filterProjectsByName, setInteractiveScanUI, withSinglePassParse, withColdFirstPaintFloor, filesParsedFromSourceCount, isCompleteSessionSnapshotAvailable } from './parser.js'
 import { findUnpricedModels, isExpectedFreeModel, loadPricing } from './models.js'
 import { aggregateModelTotals } from './model-breakdown.js'
 import { buildDurableOverviewFromNormalizedIndex, buildDurablePeriod, hydrateDailyCacheFromNormalizedProjects, type ExcludedGatewayTotals } from './usage-aggregator.js'
@@ -2375,7 +2375,8 @@ export function selectDashboardHistoryIndex(
   period: Period,
 ): { projects: ProjectSummary[]; durable: DurableOverview } {
   const filtered = filterProjectsByName(index.normalizedProjects, index.projectFilter, index.excludeFilter)
-  const projects = filterProjectsByDateRange(filtered, getPeriodRange(period))
+  // The index holds the whole corpus for the cache fill; the panels follow the headline.
+  const projects = excludeAggregateOnlyProjects(filterProjectsByDateRange(filtered, getPeriodRange(period)), index.provider)
   const durable = buildDurableOverviewFromNormalizedIndex(
     { range: getPeriodRange(period), label: PERIOD_LABELS[period] },
     index.normalizedProjects,
