@@ -333,14 +333,30 @@ export function polledMemoTimestamp(key: string): number | null {
  * parallel full-history parse per section.
  *
  * `memoKey` opts into the instant-switch memo above.
+ *
+ * `cadence` picks the refresh speed. 'live' (the default, and what every caller
+ * that passes nothing gets) is the user's chosen cadence from Settings.
+ * `{ slowMs }` is a SLOW request: mount, deps change and refresh() still fetch
+ * immediately, but the timer runs at `slowMs` — never faster than the live
+ * cadence, and never at all under Manual, where the user asked for no timer.
  */
 export function usePolled<T>(
   fetcher: () => Promise<T>,
   deps: unknown[],
-  opts: { intervalMs?: number | null; enabled?: boolean; memoKey?: string } = {},
+  opts: {
+    intervalMs?: number | null
+    enabled?: boolean
+    memoKey?: string
+    cadence?: 'live' | { slowMs: number }
+  } = {},
 ): Polled<T> {
   const cadence = useContext(RefreshCadenceContext)
-  const intervalMs = opts.intervalMs !== undefined ? opts.intervalMs : cadence.intervalMs
+  const slow = opts.cadence && opts.cadence !== 'live' ? opts.cadence.slowMs : null
+  const intervalMs = opts.intervalMs !== undefined
+    ? opts.intervalMs
+    : slow == null || cadence.intervalMs == null
+      ? cadence.intervalMs
+      : Math.max(slow, cadence.intervalMs)
   const enabled = opts.enabled ?? true
   const memoKey = opts.memoKey
   const [data, setData] = useState<T | null>(() => (memoKey ? memoGet<T>(memoKey)?.value ?? null : null))

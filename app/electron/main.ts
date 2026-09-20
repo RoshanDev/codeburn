@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, shell, type MenuItemConstructorOptions } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, powerMonitor, shell, type MenuItemConstructorOptions } from 'electron'
 import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -7,6 +7,7 @@ import path from 'node:path'
 import { CliError, DESKTOP_COLD_TIMEOUT_MS, PROGRESS_LINE_PREFIX, reapOrphanServe, resolveCodeburnPath, serveUsage, shutdownAll, spawnCli, spawnCliAction, startServe, type ActionResult, type SpawnPriority } from './cli'
 import { MenubarCompanion, readDockEnabled, STARTUP_APPS_SETTINGS_URL, type CompanionStatus } from './menubar'
 import { MacMenubar, NO_MAC_MENUBAR, type InstallPhase } from './mac-menubar'
+import { readOptimizeSnapshot, writeOptimizeSnapshot, type OptimizeBlock, type OptimizeSnapshot } from './optimize-store'
 import { getQuota, sanitizeError } from './quota'
 import { Telemetry } from './telemetry'
 import { createUpdateChecker, type UpdateChecker, type UpdateStatus } from './updates'
@@ -482,6 +483,13 @@ type Deps = {
   > | null
   /** The macOS menubar app, as the Plugins page sees it; absent off darwin and under tests. */
   macMenubar?: Pick<MacMenubar, 'status' | 'install' | 'open' | 'setDockEnabled' | 'setLanguage' | 'quit' | 'uninstall' | 'settings'> | null
+  /** Where the daily optimize scan is cached (app userData). Absent = no cache. */
+  stateDir?: string
+  /** Stamped into a cached scan so a build whose finding shapes changed never
+   *  reads the previous build's cache. */
+  appVersion?: string
+  /** Electron's powerMonitor, for the on-battery live cadence. */
+  isOnBatteryPower?: () => boolean
 }
 
 type Handler = (...args: any[]) => Promise<Envelope>
@@ -515,7 +523,7 @@ export function exportedPath(stdout: string): string | null {
   return null
 }
 
-export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, resolveCodeburnPath, getQuota, emitProgress: broadcastProgress, telemetry: telemetryInstance, getUpdateStatus: () => updateChecker ? updateChecker.getStatus() : Promise.resolve(NO_UPDATE_STATUS), companion: companion, macMenubar: macMenubar }): Record<string, Handler> {
+export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, resolveCodeburnPath, getQuota, emitProgress: broadcastProgress, telemetry: telemetryInstance, getUpdateStatus: () => updateChecker ? updateChecker.getStatus() : Promise.resolve(NO_UPDATE_STATUS), companion: companion, macMenubar: macMenubar, stateDir: app.getPath('userData'), appVersion: app.getVersion(), isOnBatteryPower: () => powerMonitor.isOnBatteryPower() }): Record<string, Handler> {
   const emitProgress = deps.emitProgress ?? (() => {})
   const telemetry = deps.telemetry ?? null
   // Flips true after the first overview fetch succeeds. Until then, every
@@ -589,16 +597,60 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
   // A project filter cannot be dropped the same way: the hidden projects would
   // come back inside the combined total. The renderer already picks local while
   // a filter is set; this keeps a stale caller off the rejected argv.
-  const buildOverviewArgs = (period: string, provider: string, range?: DateRange, configSource?: string | null, scope?: string): string[] => {
+  //
+  // The optimize scan is OFF this argv (`--no-optimize`): it is the one part of
+  // the payload that reads mutable project files, so it defeats the snapshot
+  // fast path (src/main.ts `useSnapshot = !queryScope.optimize`) and costs a
+  // fresh ~0.2s scan on every poll. The three figures the UI takes from it come
+  // from the once-a-day cache below (`codeburn:getOptimizeSnapshot`), which
+  // runs this same argv WITHOUT the flag, so no displayed number changes value.
+  const buildOverviewArgs = (period: string, provider: string, range?: DateRange, configSource?: string | null, scope?: string, optimize = false): string[] => {
     const vScopeValue = vScope(scope)
     const filterArgs = projectArgs()
     const combined = vScopeValue === 'combined' && filterArgs.length === 0
     return [
       'status', '--format', 'menubar-json', '--period', vPeriod(period), '--no-timeline',
+      ...(optimize ? [] : ['--no-optimize']),
       ...(combined ? ['--scope', 'combined'] : providerArgs(vProvider(provider))),
       ...filterArgs,
       ...rangeArgs(vRange(range)), ...configSourceArgs(vConfigSource(configSource)),
     ]
+  }
+
+  // The optimize scan is a DAILY figure: recomputed when nothing is cached for
+  // this scope, when the cache is older than `maxAgeMs` (24h by default), or
+  // when the renderer forces it (the Optimize page, manual refresh). Never on a
+  // poll tick. The cache key is the full argv, so a period/provider/project/
+  // config/scope change is a different entry and one scope's savings can never
+  // be served for another.
+  const OPTIMIZE_MAX_AGE_MS = 24 * 60 * 60 * 1000
+  const getOptimizeSnapshot: Handler = async (period: string, provider: string, range?: DateRange, configSource?: string | null, scope?: string, maxAgeMs?: number) => {
+    const argv = buildOverviewArgs(period, provider, range, configSource, scope, true)
+    const key = argv.join(' ')
+    const appVersion = deps.appVersion ?? '0'
+    const maxAge = typeof maxAgeMs === 'number' && maxAgeMs >= 0 ? maxAgeMs : OPTIMIZE_MAX_AGE_MS
+    if (deps.stateDir) {
+      const cached = readOptimizeSnapshot(deps.stateDir, key, appVersion)
+      // An unparseable computedAt yields NaN, which fails this test and
+      // recomputes — the safe direction.
+      if (cached && Date.now() - Date.parse(cached.computedAt) < maxAge) return { ok: true, value: cached }
+    }
+    try {
+      // Background priority: this must never take a CLI slot from the live
+      // headline poll or a click.
+      const payload = await deps.spawnCli(argv, { ...(readOpts() ?? {}), priority: 'background' })
+      const optimize = (payload as { optimize?: OptimizeBlock } | null)?.optimize
+      if (!optimize || !Array.isArray(optimize.topFindings)) {
+        return { ok: false, error: { kind: 'nonzero', message: 'No optimize findings in the payload.' } }
+      }
+      const snapshot: OptimizeSnapshot = { scope: key, computedAt: new Date().toISOString(), appVersion, optimize }
+      if (deps.stateDir) writeOptimizeSnapshot(deps.stateDir, snapshot)
+      return { ok: true, value: snapshot }
+    } catch (err) {
+      const error = coldError(err)
+      telemetry?.track('cli_error', cliErrorProps(err, 'status'))
+      return { ok: false, error }
+    }
   }
 
   // `background` (renderer prefetch only) drops this fetch to background priority
@@ -642,6 +694,11 @@ export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, re
       catch (error) { return { ok: false, error: { kind: 'nonzero', message: sanitizeError(error) } } }
     },
     'codeburn:getOverview': getOverview,
+    'codeburn:getOptimizeSnapshot': getOptimizeSnapshot,
+    'codeburn:powerStatus': async () => {
+      try { return { ok: true, value: deps.isOnBatteryPower ? deps.isOnBatteryPower() : false } }
+      catch { return { ok: true, value: false } }
+    },
     // Timeline variant for the Spend punchcard only: identical payload WITH
     // history.timeline (every other fetch keeps --no-timeline lean).
     'codeburn:getTimeline': run((period: string, provider: string, range?: DateRange) => [
@@ -1158,6 +1215,14 @@ function bootstrap(): void {
       },
     })
     registerHandlers()
+    // Power source, pushed to the renderer so the live cadence halves on
+    // battery and restores on AC.
+    const broadcastPower = () => {
+      const onBattery = powerMonitor.isOnBatteryPower()
+      for (const win of BrowserWindow.getAllWindows()) win.webContents.send('codeburn:power', onBattery)
+    }
+    powerMonitor.on('on-battery', broadcastPower)
+    powerMonitor.on('on-ac', broadcastPower)
     installApplicationMenu()
     // Seed the preload-readable app locale before any window loads. app.getLocale()
     // needs the ready state, so this runs inside bootstrap's whenReady.

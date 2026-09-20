@@ -143,6 +143,28 @@ export type HydrationState = {
   totalFiles: number
 }
 
+/** The optimize scan's figures. Carried by a full menubar payload, and — since
+ *  the poll runs with --no-optimize — cached on disk between daily recomputes. */
+export type OptimizeBlock = {
+  findingCount: number
+  savingsUSD: number
+  topFindings: Array<{
+    title: string
+    impact: 'high' | 'medium' | 'low'
+    savingsUSD: number
+  }>
+}
+
+/** A cached optimize scan: the figures plus WHEN and FOR WHICH query scope they
+ *  were computed, so a stored number is never shown as live or under another
+ *  period/provider/filter. */
+export type OptimizeSnapshot = {
+  scope: string
+  computedAt: string
+  appVersion: string
+  optimize: OptimizeBlock
+}
+
 export type MenubarPayload = {
   generated: string
   /** Consecutive active days across every provider, independent of the selected
@@ -322,15 +344,7 @@ export type MenubarPayload = {
       unattributedCost?: number
     }
   }
-  optimize: {
-    findingCount: number
-    savingsUSD: number
-    topFindings: Array<{
-      title: string
-      impact: 'high' | 'medium' | 'low'
-      savingsUSD: number
-    }>
-  }
+  optimize: OptimizeBlock
   history: {
     daily: DailyHistoryEntry[]
     // Granular per-bucket timeline. Present only on the punchcard's dedicated
@@ -1155,6 +1169,14 @@ export interface CodeburnBridge {
   /** Spend per canonical project × branch (`spend --format branch-json`). */
   getBranchSpend(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<BranchSpendReport>
   getOptimizeReport(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<OptimizeJsonReport>
+  /** The once-a-day optimize scan for this query scope, cached on disk.
+   *  `maxAgeMs` 0 forces a recompute. Optional so an older preload degrades to
+   *  no coach figures rather than throwing. */
+  getOptimizeSnapshot?(period: Period, provider: string, range?: DateRange, configSource?: string | null, scope?: string, maxAgeMs?: number): Promise<OptimizeSnapshot>
+  /** Whether the machine is on battery. Optional: an older preload reads as AC. */
+  powerStatus?(): Promise<boolean>
+  /** Subscribe to power-source changes; returns an unsubscribe fn. */
+  onPowerStatus?(cb: (onBattery: boolean) => void): () => void
   getDevices(period: Period): Promise<CombinedUsage>
   getDevicesScan(): Promise<DeviceScanResult>
   getShareStatus(): Promise<ShareStatus>

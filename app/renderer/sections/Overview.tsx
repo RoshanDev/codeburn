@@ -9,8 +9,9 @@ import { ListRow } from '../components/ListRow'
 import { SectionSkeleton } from '../components/Skeleton'
 import { StaleBanner } from '../components/StaleBanner'
 import { DUR, motionEnabled, useBarGrowIn } from '../lib/motion'
+import { useOptimizeSnapshot } from '../hooks/useOptimizeSnapshot'
 import { type Polled, usePolled } from '../hooks/usePolled'
-import { formatCompact, formatCount, formatUsd, formatUsdWithCurrency } from '../lib/format'
+import { asOfLabel, formatCompact, formatCount, formatUsd, formatUsdWithCurrency } from '../lib/format'
 import { Usd, sumTokens, tokensOf, useUsdPop } from '../components/Usd'
 import { codeburn } from '../lib/ipc'
 import {
@@ -32,6 +33,7 @@ import type {
   DailyHistoryEntry,
   DateRange,
   MenubarPayload,
+  OptimizeBlock,
   Period,
   Scope,
   YieldJsonReport,
@@ -202,7 +204,7 @@ function CostPerOutcome({ outcome }: { outcome: Polled<YieldJsonReport> }) {
 
   return (
     <div className="ov-card ov-panel">
-      <div className="ov-panel-head"><Icon name="scale" /><h3>{t('overview.outcome.title')}</h3><span className="r">{t('overview.outcome.yieldChip')}</span></div>
+      <div className="ov-panel-head"><Icon name="scale" /><h3>{t('overview.outcome.title')}</h3><span className="r">{asOfLabel(outcome.lastSuccessAt) ?? t('overview.outcome.yieldChip')}</span></div>
       <div className="ov-panel-body">
         {body}
         <p className="ov-widget-caption">{t('overview.outcome.caption')}</p>
@@ -303,7 +305,7 @@ export type SignalGroups = { wins: Signal[]; improvements: Signal[]; risks: Sign
  * mirror the Swift; the desktop-only weekday-spike anomaly is absorbed as a risk.
  * Week-over-week and month-projection rules are suppressed for a custom range.
  */
-export function deriveSignals(data: MenubarPayload, now: Date, rangeActive: boolean): SignalGroups {
+export function deriveSignals(data: MenubarPayload, now: Date, rangeActive: boolean, topFindings: OptimizeBlock['topFindings'] = []): SignalGroups {
   const daily = data.history.daily
   const current = data.current
   const wins: Signal[] = []
@@ -361,7 +363,7 @@ export function deriveSignals(data: MenubarPayload, now: Date, rangeActive: bool
   }
 
   // ————— Improvements —————
-  for (const finding of data.optimize.topFindings.slice(0, 3)) {
+  for (const finding of topFindings.slice(0, 3)) {
     improvements.push({ text: finding.title, trailing: formatUsd(finding.savingsUSD) })
   }
   if (current.cacheHitPercent > 0 && current.cacheHitPercent < 50) {
@@ -934,6 +936,13 @@ export function Overview({ period, provider }: { period: Period; provider: strin
   return <OverviewContent period={period} provider={provider} overview={overview} />
 }
 
+// Slow tiers. Neither report moves minute to minute, and each costs a full CLI
+// spawn (`act report --json` is not served by the resident child at all), so
+// they refresh on mount, on a manual refresh, and on these timers — never on a
+// live tick.
+const ACT_SLOW_MS = 600_000
+const YIELD_SLOW_MS = 300_000
+
 /** Combined-scope hero footer: a per-device cost breakdown plus a reachable/
  *  total device count, mirroring the menubar's combined view. An unreachable
  *  device (powered off, off-network) shows its error in place of a cost. */
@@ -960,6 +969,8 @@ export function OverviewContent({
   onInvestigate,
   ready = true,
   scope = 'local',
+  configSource = null,
+  refreshToken = 0,
   headlineSnapshot = null,
 }: {
   period: Period
@@ -971,6 +982,11 @@ export function OverviewContent({
   onInvestigate?: (request: InvestigateRequest) => void
   ready?: boolean
   scope?: Scope
+  /** Scoped Claude config, part of the optimize cache key so a scan computed
+   *  under one config is never shown under another. */
+  configSource?: string | null
+  /** Bumped by the shell's manual refresh: forces the slow and daily tiers. */
+  refreshToken?: number
   headlineSnapshot?: OverviewHeadlineSnapshot | null
 }) {
   const { data, error, lastSuccessAt } = overview
@@ -1001,8 +1017,16 @@ export function OverviewContent({
     else if (overview.data != null) setTimeoutBlocked(false)
   }, [overview.data, overview.error?.kind])
   const detailsReady = ready && !timeoutBlocked && overview.error?.kind !== 'timeout'
-  const actReport = usePolled<ActReportJson>(() => codeburn.getActReport(), [], { enabled: detailsReady, memoKey: 'overview-act' })
-  const yieldReport = usePolled<YieldJsonReport>(() => codeburn.getYield(period, provider), [period, provider], { enabled: detailsReady, memoKey: reportMemoKey('yield', period, provider) })
+  const actReport = usePolled<ActReportJson>(() => codeburn.getActReport(), [refreshToken], { enabled: detailsReady, memoKey: 'overview-act', cadence: { slowMs: ACT_SLOW_MS } })
+  const yieldReport = usePolled<YieldJsonReport>(() => codeburn.getYield(period, provider), [period, provider, refreshToken], { enabled: detailsReady, memoKey: reportMemoKey('yield', period, provider), cadence: { slowMs: YIELD_SLOW_MS } })
+  // Daily tier: the live poll runs --no-optimize, so the coach figures below
+  // come from the on-disk scan for this exact scope, with their age on screen.
+  const optimizeSnapshot = useOptimizeSnapshot(
+    { period, provider, range, configSource, scope },
+    { enabled: detailsReady, refreshToken },
+  )
+  const optimizeBlock = optimizeSnapshot.data?.optimize ?? null
+  const optimizeAge = asOfLabel(optimizeSnapshot.data?.computedAt ?? null)
   const modelIndex = useMemo(() => data ? buildModelIndex(data) : new Map<string, string>(), [data])
 
   if (!data) {
@@ -1119,8 +1143,14 @@ export function OverviewContent({
   const saved = actReport.data?.totals?.realizedCostUSD ?? 0
   const applied = saved > 0 ? (actReport.data?.totals?.measuredActions ?? 0) : 0
   const localSaved = data.current.localModelSavings.totalUSD
+  const actAge = asOfLabel(actReport.lastSuccessAt)
+  // Until the daily scan has produced a figure for THIS scope the clause is
+  // omitted entirely: a $0 here would read as "nothing to recover".
+  const recoverable = optimizeBlock
+    ? <> <span className="num">{formatUsd(optimizeBlock.savingsUSD)}</span>{t('overview.coach.recoverableSuffix')}{optimizeAge ? <small className="ov-coach-age"> ({optimizeAge})</small> : null}</>
+    : null
   // A custom range has no meaningful "vs last week" or month-to-date baseline.
-  const signals = deriveSignals(data, now, rangeActive)
+  const signals = deriveSignals(data, now, rangeActive, optimizeBlock?.topFindings ?? [])
   // Drill-through entry points. An expensive-session row can only open the
   // exact session when the payload carries its identity (provider + id);
   // otherwise the row keeps the plain "See all" navigation, never a guess.
@@ -1159,7 +1189,7 @@ export function OverviewContent({
                 : (
                   <>
                     {saved > 0 && (
-                      <div className="ov-saved-line"><span>{t('overview.hero.savedByFixes')}</span><strong>{formatUsd(saved)}</strong><small>{t('overview.hero.across')} {formatCount(applied, 'fix', 'fixes')}</small></div>
+                      <div className="ov-saved-line"><span>{t('overview.hero.savedByFixes')}</span><strong>{formatUsd(saved)}</strong><small>{t('overview.hero.across')} {formatCount(applied, 'fix', 'fixes')}{actAge ? ` · ${actAge}` : ''}</small></div>
                     )}
                     {localSaved > 0 && (
                       <div className="ov-saved-line"><span>{t('overview.hero.savedViaLocal')}</span><strong>{formatUsd(localSaved)}</strong><small>{t('overview.hero.localModelRouting')}</small></div>
@@ -1234,8 +1264,8 @@ export function OverviewContent({
             <Icon name="trending-up" />
             <div className="ov-coach-tx">
               {rangeActive
-                ? <>{topModel ? <><span className="num">{topModel.name}</span>{t('overview.coach.driverSuffixRange')}</> : t('overview.coach.noDriverRange')}. <span className="num">{formatUsd(data.optimize.savingsUSD)}</span>{t('overview.coach.recoverableSuffix')}</>
-                : <>{weeklyPct === null ? <>{t('overview.coach.noBaseline')}</> : <>{t('overview.coach.pacingLead')}<span className="num">{t('overview.coach.pacingClause', { percent: weeklyPct, direction: t(weekNow >= weekPrior ? 'overview.coach.higher' : 'overview.coach.lower') })}</span></>}{topModel ? <>; <span className="num">{topModel.name}</span>{t('overview.coach.alsoDriverSuffix')}</> : ''}. <span className="num">{formatUsd(data.optimize.savingsUSD)}</span>{t('overview.coach.recoverableSuffix')}</>}
+                ? <>{topModel ? <><span className="num">{topModel.name}</span>{t('overview.coach.driverSuffixRange')}</> : t('overview.coach.noDriverRange')}.{recoverable}</>
+                : <>{weeklyPct === null ? <>{t('overview.coach.noBaseline')}</> : <>{t('overview.coach.pacingLead')}<span className="num">{t('overview.coach.pacingClause', { percent: weeklyPct, direction: t(weekNow >= weekPrior ? 'overview.coach.higher' : 'overview.coach.lower') })}</span></>}{topModel ? <>; <span className="num">{topModel.name}</span>{t('overview.coach.alsoDriverSuffix')}</> : ''}.{recoverable}</>}
             </div>
             <button className="ov-coach-cta" type="button" onClick={() => onNavigate?.('optimize')}>{t('overview.coach.reviewCta')}</button>
           </div>
