@@ -295,6 +295,17 @@ describe('Settings', () => {
     expect(tracked).toBeGreaterThan(mocks.setTelemetryEnabled.mock.invocationCallOrder[0]!)
   })
 
+  it('toasts when the telemetry setter rejects instead of failing silently', async () => {
+    const user = userEvent.setup()
+    mocks.setTelemetryEnabled.mockRejectedValue({ kind: 'nonzero', message: 'consent state could not be written' })
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
+    await user.click(await screen.findByRole('switch', { name: 'Anonymous usage statistics' }))
+    expect(await screen.findByText('consent state could not be written')).toBeInTheDocument()
+    // and the switch still reports what main last confirmed, never the click.
+    expect(screen.getByRole('switch', { name: 'Anonymous usage statistics' })).toHaveAttribute('aria-checked', 'false')
+  })
+
   it('sends nothing when the write does not take, and nothing on the way out', async () => {
     const user = userEvent.setup()
     // A settings write that failed leaves telemetry off, so there is no opt-in to report.
@@ -617,6 +628,41 @@ describe('Settings', () => {
     // The toast names what the CLI wrote, not the folder that was picked: the
     // CLI nests a dated folder (CSV) or appends the extension (JSON).
     expect(await screen.findByText('Exported to /Users/x/Exports/codeburn-export-2026-09-19')).toBeInTheDocument()
+  })
+
+  it('exports the internal provider id, not the display name the payload map is keyed on', async () => {
+    mocks.getOverview.mockResolvedValue({
+      current: {
+        providers: { 'grok build': 8.1, claude: 12.34 },
+        providerDetails: [
+          { id: 'grok', label: 'Grok Build', cost: 8.1 },
+          { id: 'claude', label: 'Claude', cost: 12.34 },
+        ],
+      },
+    } as unknown as MenubarPayload)
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
+    await user.click(screen.getByRole('button', { name: 'Choose folder…' }))
+    expect(await screen.findByText('/Users/x/Exports')).toBeInTheDocument()
+    await user.click(screen.getByLabelText('Provider'))
+    await user.click(screen.getByRole('option', { name: 'Grok Build' }))
+    await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
+    // 'grok build' is a lowercased display name; the CLI only accepts the id.
+    expect(mocks.exportData).toHaveBeenCalledWith('csv', 'grok', '/Users/x/Exports')
+  })
+
+  it('toasts when the export bridge rejects instead of failing silently', async () => {
+    mocks.exportData.mockRejectedValue({ kind: 'bad-args', message: 'invalid provider' })
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
+    await user.click(screen.getByRole('button', { name: 'Choose folder…' }))
+    expect(await screen.findByText('/Users/x/Exports')).toBeInTheDocument()
+    await user.click(screen.getAllByRole('button', { name: 'Export' }).at(-1)!)
+    expect(await screen.findByText('invalid provider')).toBeInTheDocument()
+    // and the button comes back, rather than staying stuck on "Exporting…"
+    expect(screen.getAllByRole('button', { name: 'Export' }).at(-1)!).toBeEnabled()
   })
 
   it('renders real device status and removes paired devices without fake pairing controls', async () => {

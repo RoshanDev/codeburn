@@ -13,7 +13,7 @@ import { updateDownloadUrl, useUpdateStatus } from '../hooks/useUpdateStatus'
 import { version as appVersion } from '../../package.json'
 import { readDailyBudget } from '../lib/budget'
 import { formatConverted, formatCount, formatUsd, shortenProjectPath } from '../lib/format'
-import { codeburn } from '../lib/ipc'
+import { codeburn, normalizeCliError } from '../lib/ipc'
 import { t, useLocale, type LocaleChoice } from '../i18n'
 import { projectMatches, projectPattern } from '../lib/projectMatch'
 import { shortcutLabel } from '../lib/platform'
@@ -609,7 +609,10 @@ function ExportPane({ period, refreshToken }: { period: Period; refreshToken: nu
   const [provider, setProvider] = useState('all')
   const [destination, setDestination] = useState<string | null>(null)
   const [exporting, setExporting] = useState(false)
-  const providers = Object.keys(overview.data?.current.providers ?? {})
+  // Ids, never the `current.providers` keys: that map is keyed on the lowercased
+  // display name, so "Cursor Agent" arrives as "cursor agent" and the main
+  // process rejects it as an invalid provider.
+  const providers = detectedProviders(overview.data?.current)
 
   const chooseDirectory = async () => {
     const selected = await codeburn.chooseDirectory()
@@ -624,6 +627,10 @@ function ExportPane({ period, refreshToken }: { period: Period; refreshToken: nu
       trackEvent('export', { format, provider })
       const result = await codeburn.exportData(format, provider, destination)
       showToast(result.ok ? t('settings.export.exported', { destination: result.savedPath ?? destination }) : (result.stderr || t('settings.export.failed')), result.ok ? 'ok' : 'error')
+    } catch (err) {
+      // A rejected envelope (a bad argument, a CLI that is not there) must still
+      // answer the click: without this the button simply goes quiet.
+      showToast(normalizeCliError(err).message || t('settings.export.failed'), 'error')
     } finally {
       setExporting(false)
     }
@@ -634,7 +641,7 @@ function ExportPane({ period, refreshToken }: { period: Period; refreshToken: nu
     <div className="card">
       <div className="about-sec">
         <div className="about-row"><span className="tx">{t('settings.export.formatLabel')}</span><span className="r"><span className="seg"><button className={format === 'csv' ? 'on' : undefined} aria-pressed={format === 'csv'} onClick={() => setFormat('csv')}>CSV</button><button className={format === 'json' ? 'on' : undefined} aria-pressed={format === 'json'} onClick={() => setFormat('json')}>JSON</button></span></span></div>
-        <div className="about-row"><label className="tx" htmlFor="settings-export-provider">{t('settings.export.providerLabel')}</label><span className="r"><Dropdown id="settings-export-provider" ariaLabel={t('settings.export.providerLabel')} value={provider} options={[{ value: 'all', label: t('settings.export.allProviders') }, ...providers.map(value => ({ value, label: value.charAt(0).toUpperCase() + value.slice(1) }))]} onChange={setProvider} width={150} /></span></div>
+        <div className="about-row"><label className="tx" htmlFor="settings-export-provider">{t('settings.export.providerLabel')}</label><span className="r"><Dropdown id="settings-export-provider" ariaLabel={t('settings.export.providerLabel')} value={provider} options={[{ value: 'all', label: t('settings.export.allProviders') }, ...providers.map(entry => ({ value: entry.id, label: entry.label }))]} onChange={setProvider} width={150} /></span></div>
         <div className="about-row"><span className="tx">{t('settings.export.destinationLabel')}</span><span className="r set-export-destination"><span className="set-mono">{destination ?? t('settings.export.noDestination')}</span><button className="btnp" onClick={() => void chooseDirectory()}>{t('settings.export.chooseFolder')}</button></span></div>
       </div>
       <div className="about-sec set-last-sec"><div className="about-row"><span className="tx" /><span className="r"><button className="btnp btnp-primary" disabled={!destination || exporting} onClick={() => void exportNow()}>{exporting ? t('settings.export.exporting') : t('settings.export.exportButton')}</button></span></div></div>
@@ -719,7 +726,9 @@ function TelemetryRow() {
     codeburn.setTelemetryEnabled(optingIn).then(value => {
       setStatus(value)
       if (optingIn && value?.enabled) trackEvent('settings_change', { setting: 'telemetry', value: true })
-    }).catch(() => {})
+      // A rejected setter leaves the switch reporting what main last confirmed,
+      // which is right — but it has to say so, or the click reads as ignored.
+    }).catch(err => showToast(normalizeCliError(err).message, 'error'))
   }
   const detail = <>
     {t('settings.privacy.telemetry.detail')}
