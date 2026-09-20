@@ -33,6 +33,18 @@ export function useOptimizeSnapshot(
 ): { data: OptimizeSnapshot | null; loading: boolean; error: CliError | null } {
   const [state, setState] = useState<OptimizeSnapshotState>({ data: null, loading: true, error: null })
   const lastToken = useRef<number | null>(null)
+  // The local calendar day, read at RENDER time and used as an effect
+  // dependency. Every period this scan is computed for is anchored to the local
+  // day, so an app left open past midnight must re-ask rather than keep
+  // yesterday's figure under "Today". The live headline poll re-renders this
+  // tree every cadence tick, so the first render after midnight flips this key
+  // and re-requests; main then recomputes because its stored row is from
+  // another day (app/electron/optimize-store.ts sameLocalDay). Deliberately a
+  // plain request, not a forced one — the same-day rule main-side is what
+  // decides. Under the Manual cadence nothing re-renders, so this does not fire
+  // until the next interaction; acceptable, because the headline beside it is
+  // not refreshing either and the age label carries the date once it is stale.
+  const localDay = new Date().toDateString()
 
   useEffect(() => {
     const forced = alwaysFresh || (lastToken.current !== null && lastToken.current !== refreshToken)
@@ -57,7 +69,7 @@ export function useOptimizeSnapshot(
         .catch(err => { if (!cancelled) setState({ data: null, loading: false, error: normalizeCliError(err) }) })
     }, 0)
     return () => { cancelled = true; clearTimeout(handle) }
-  }, [period, provider, range?.from, range?.to, configSource, scope, enabled, alwaysFresh, refreshToken])
+  }, [period, provider, range?.from, range?.to, configSource, scope, enabled, alwaysFresh, refreshToken, localDay])
 
   return state
 }

@@ -1437,3 +1437,80 @@ describe('Overview stored-figure honesty', () => {
     expect(head).toHaveTextContent(`exact at ${time}`)
   })
 })
+
+describe('Overview across local midnight', () => {
+  beforeEach(() => {
+    setActiveCurrency({ code: 'USD', symbol: '$', rate: 1 })
+    getOverview.mockReset()
+    getActReport.mockReset().mockResolvedValue({ totals: { realizedCostUSD: 0, measuredActions: 0 } })
+    getYield.mockReset().mockResolvedValue(makeYieldReport())
+    getOptimizeSnapshot.mockReset()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+    __resetGeneration()
+  })
+
+  // An app left open past midnight must re-ask: every period the scan is
+  // computed for is anchored to the local day, so yesterday's figure would
+  // otherwise sit under "Today" until a remount or a manual refresh. Main's
+  // same-day rule only helps once something asks.
+  it('re-asks for the scan once on the first render of a new local day', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date(2026, 8, 18, 23, 58, 0))
+      const yesterday = snapshot(
+        { findingCount: 2, savingsUSD: 31.5, topFindings: [] },
+        new Date(2026, 8, 18, 23, 58, 0).toISOString(),
+      )
+      getOptimizeSnapshot.mockResolvedValue(yesterday)
+      const overview = polled(makePayload(new Date()))
+      const view = () => <OverviewContent period="today" provider="all" overview={overview} />
+
+      const { container, rerender } = render(view())
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      const coach = () => container.querySelector('.ov-coach') as HTMLElement
+      expect(getOptimizeSnapshot).toHaveBeenCalledTimes(1)
+      expect(within(coach()).getByText('$31.50')).toBeInTheDocument()
+
+      // 23:59 — a live headline tick re-renders the tree. Same local day, so
+      // nothing is re-asked and the figure on screen never blinks.
+      vi.setSystemTime(new Date(2026, 8, 18, 23, 59, 0))
+      await act(async () => { rerender(view()) })
+      expect(within(coach()).getByText('$31.50')).toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(getOptimizeSnapshot).toHaveBeenCalledTimes(1)
+      expect(within(coach()).getByText('$31.50')).toBeInTheDocument()
+
+      // 00:01 — the day flipped. Exactly one new request, and NOT a forced one:
+      // the stored row is simply from another day, which main decides.
+      vi.setSystemTime(new Date(2026, 8, 19, 0, 1, 0))
+      let release: (value: OptimizeSnapshot) => void = () => {}
+      getOptimizeSnapshot.mockImplementation(() => new Promise<OptimizeSnapshot>(resolve => { release = resolve }))
+      await act(async () => { rerender(view()) })
+      // Yesterday's figure is dropped the moment the day changes, the same way
+      // a period switch behaves — it is never painted as today's.
+      expect(within(coach()).queryByText('$31.50')).not.toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(getOptimizeSnapshot).toHaveBeenCalledTimes(2)
+      expect(getOptimizeSnapshot.mock.calls[1]![5]).toBeUndefined()
+      expect(within(coach()).queryByText('$31.50')).not.toBeInTheDocument()
+
+      await act(async () => {
+        release(snapshot({ findingCount: 1, savingsUSD: 4.25, topFindings: [] }, new Date(2026, 8, 19, 0, 1, 0).toISOString()))
+      })
+      expect(within(coach()).getByText('$4.25')).toBeInTheDocument()
+      const time = new Date(2026, 8, 19, 0, 1, 0).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+      expect(within(coach()).getByText(`(as of ${time})`)).toBeInTheDocument()
+
+      // Later the same day a further re-render asks for nothing more.
+      vi.setSystemTime(new Date(2026, 8, 19, 8, 0, 0))
+      await act(async () => { rerender(view()) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(getOptimizeSnapshot).toHaveBeenCalledTimes(2)
+      expect(within(coach()).getByText('$4.25')).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
