@@ -76,9 +76,9 @@ export const EVENT_NAMES = new Set([
   'settings_change',
 ])
 
-/// CPU seconds accumulate from process start while the wall clock below runs from telemetry
-/// init, so a session shorter than this divides a whole launch's CPU by a few seconds and
-/// always reads '40+'. Under the floor the figure is omitted rather than sent wrong.
+/// A few seconds of wall time is too short a base for a percent: one burst of startup work
+/// lands the whole session in a top bucket that says nothing about how the build runs. Under
+/// the floor the figure is omitted rather than sent as noise.
 const MIN_CPU_WALL_SECONDS = 30
 
 const MAX_QUEUE = 200

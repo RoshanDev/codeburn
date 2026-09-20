@@ -271,6 +271,7 @@ export type BundlePlacementHooks = {
   copy?: (from: string, to: string) => Promise<void>
   verify?: (appPath: string) => Promise<void>
   isLivePid?: (pid: number) => boolean
+  now?: () => number
   log?: (line: string) => void
 }
 
@@ -286,13 +287,20 @@ function placementPid(name: string): number | null {
   return Number.isInteger(pid) && pid > 0 ? pid : null
 }
 
-/// EPERM means the pid is taken by a process we may not signal, which is still a live pid.
-function pidIsLive(pid: number): boolean {
+/// How long a placement whose pid is still live is taken at face value. A placement outlives
+/// its install whenever the last cleanup fails or the process is killed, and pids are reused,
+/// so without a window one recycled pid would refuse every install on that machine from then
+/// on. Ten minutes is far longer than a placement takes and far shorter than a pid cycle.
+const ACTIVE_PLACEMENT_WINDOW_MS = 10 * 60_000
+
+/// Only a pid we can signal is an install of ours: a second `codeburn menubar` runs as the
+/// same user, so EPERM means the pid has been recycled by somebody else's process.
+export function pidIsLive(pid: number): boolean {
   try {
     process.kill(pid, 0)
     return true
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === 'EPERM'
+  } catch {
+    return false
   }
 }
 
@@ -305,25 +313,36 @@ function pidIsLive(pid: number): boolean {
 export async function recoverPlacements(dirs: string[], hooks: BundlePlacementHooks = {}): Promise<void> {
   const move = hooks.rename ?? rename
   const isLive = hooks.isLivePid ?? pidIsLive
-  const orphans: Array<{ dir: string; name: string; pid: number }> = []
+  const now = hooks.now ?? Date.now
+  const log = hooks.log ?? console.log
+  const orphans: Array<{ path: string; dir: string; name: string; pid: number }> = []
   for (const dir of dirs) {
     for (const name of await readdir(dir).catch(() => [] as string[])) {
       const pid = placementPid(name)
-      if (pid !== null && pid !== process.pid) orphans.push({ dir, name, pid })
+      if (pid !== null && pid !== process.pid) orphans.push({ path: join(dir, name), dir, name, pid })
     }
   }
-  const active = orphans.find(orphan => isLive(orphan.pid))
-  if (active) {
+  for (const orphan of orphans) {
+    if (!isLive(orphan.pid)) continue
+    // ctime, not mtime: renaming a bundle aside leaves its own mtime at whenever the app was
+    // last written, which can be months back, while ctime is the moment of the rename.
+    const placed = (await stat(orphan.path).catch(() => null))?.ctimeMs
+    if (placed === undefined || now() - placed > ACTIVE_PLACEMENT_WINDOW_MS) continue
     throw new Error(
-      `Another CodeBurn Menubar install (pid ${active.pid}) is working in ${active.dir}. ` +
-      `Nothing was changed; try again once it has finished.`
+      `Another CodeBurn Menubar install (pid ${orphan.pid}) is working on ${orphan.path}. ` +
+      `Nothing was changed; try again once it has finished, or delete that file if no install is running.`
     )
   }
-  for (const { dir, name } of orphans) {
-    const orphan = join(dir, name)
+  for (const { path, dir, name } of orphans) {
     const target = join(dir, APP_BUNDLE_NAME)
-    if (name.startsWith(ASIDE_PREFIX) && !(await exists(target))) await move(orphan, target)
-    else await rm(orphan, { recursive: true, force: true }).catch(() => {})
+    try {
+      if (name.startsWith(ASIDE_PREFIX) && !(await exists(target))) await move(path, target)
+      else await rm(path, { recursive: true, force: true })
+    } catch {
+      // A folder we cannot write to is not a reason to stop: the install either lands
+      // somewhere else or fails on its own terms, with its own message.
+      log(`Could not clear ${path}, left by an earlier install. Delete it by hand when you can.`)
+    }
   }
 }
 

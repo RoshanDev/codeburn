@@ -27,9 +27,14 @@ function harness(opts: {
   flakyOpen?: number
   /** A menubar that takes the relaunch command, goes down, and never starts itself again. */
   relaunchDies?: boolean
+  /** A menubar that takes the relaunch command and stays exactly as it was: the process
+   *  that answered is still the one running, so nothing was actually restarted. */
+  relaunchStalls?: boolean
 } = {}) {
   const present = new Set(opts.present ?? [])
   let running = Boolean(opts.running)
+  // A restart is a new process, and that is what a relaunch has to be confirmed by.
+  let pid = 4242
   let opensToIgnore = opts.flakyOpen ?? 0
   // The command the menubar has not taken out of its defaults yet. A menubar that watches the
   // key consumes it as it acts, which is what settings() waits for.
@@ -40,7 +45,7 @@ function harness(opts: {
     calls.push([command, args])
     if (command.endsWith('mdfind')) return opts.mdfind ?? ''
     if (command.endsWith('PlistBuddy')) return opts.version ?? '9.9.9'
-    if (command.endsWith('pgrep')) return running ? '4242' : null
+    if (command.endsWith('pgrep')) return running ? String(pid) : null
     if (command.endsWith('pkill')) { running = false; return '' }
     if (command.endsWith('defaults') && args[0] === 'read') {
       return args[2] === REMOTE_COMMAND_KEY ? pendingCommand : (opts.dock ?? null)
@@ -51,6 +56,7 @@ function harness(opts: {
         if (opts.honoursRemoteCommand === false) pendingCommand = args[4]
         else if (args[4] === 'quit' || args[4] === 'uninstall') running = false
         else if (opts.relaunchDies && args[4] === 'relaunch') running = false
+        else if (args[4] === 'relaunch' && !opts.relaunchStalls) pid += 1
       }
       return ''
     }
@@ -59,7 +65,7 @@ function harness(opts: {
       return ''
     }
     if (command.endsWith('osascript')) { running = false; return '' }
-    if (command.endsWith('open')) { if (opensToIgnore > 0) opensToIgnore--; else running = true; return '' }
+    if (command.endsWith('open')) { if (opensToIgnore > 0) opensToIgnore--; else { running = true; pid += 1 } ; return '' }
     return null
   })
   const runCli = vi.fn(async (args: string[]) => {
@@ -340,6 +346,14 @@ describe('MacMenubar.settings', () => {
     await menubar.setLanguage('ja')
     expect(calls.some(([cmd, args]) => cmd.endsWith('open') && args[0] === USER_APP)).toBe(true)
     expect(isRunning()).toBe(true)
+  })
+
+  // The old process still answers pgrep while it is tearing itself down, so waiting for
+  // "something is running" passed instantly and a relaunch that never happened looked fine.
+  it('opens the menu bar itself when the process that took the relaunch never gives way', async () => {
+    const { menubar, calls } = harness({ present: [USER_APP], running: true, relaunchStalls: true })
+    await menubar.setLanguage('ja')
+    expect(calls.some(([cmd, args]) => cmd.endsWith('open') && args[0] === USER_APP)).toBe(true)
   })
 
   it('clears the override for System and never quits a menu bar that is down', async () => {

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   buildPersistentCodeburnLookupPath,
   downloadToFile,
@@ -10,6 +10,7 @@ import {
   hasRunnableRecordedCli,
   isMissingDirectAssetError,
   resolveLatestMenubarReleaseAssets,
+  pidIsLive,
   placeMenubarBundle,
   recoverPlacements,
   resolveMacInstallTarget,
@@ -677,14 +678,48 @@ describe.skipIf(process.platform === 'win32')('recoverPlacements', () => {
   }
 
   beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'codeburn-menubar-recover-')) })
-  afterEach(async () => { await rm(dir, { recursive: true, force: true }) })
+  afterEach(async () => {
+    await chmod(dir, 0o755).catch(() => {})
+    await rm(dir, { recursive: true, force: true })
+  })
 
   it('refuses to run while another install holds the directory, and changes nothing', async () => {
     await bundleAt(aside(DEAD), 'old')
     await bundleAt(staged(777), 'half-copied')
-    await expect(recoverPlacements([dir], { isLivePid: pid => pid === 777 })).rejects.toThrow(/pid 777/)
+    const refusal = recoverPlacements([dir], { isLivePid: pid => pid === 777 })
+    await expect(refusal).rejects.toThrow(/pid 777/)
+    // Naming the file is the difference between a user who can unstick themselves and one who cannot.
+    await expect(refusal).rejects.toThrow(staged(777))
     // The dead-pid orphan is still there: the abort happens before anything is touched.
     expect((await readdir(dir)).sort()).toEqual(['.CodeBurnMenubar.app.new-777', `.CodeBurnMenubar.app.old-${DEAD}`])
+  })
+
+  // A placement outlives its install whenever the last cleanup fails, and pids get reused.
+  // Without an age limit, one recycled pid refuses every install on that machine forever.
+  it('treats a placement whose pid was recycled long ago as dead, and recovers from it', async () => {
+    await bundleAt(aside(DEAD), 'the users app')
+    const anHourOn = Date.now() + 60 * 60_000
+    await recoverPlacements([dir], { isLivePid: () => true, now: () => anHourOn })
+    expect(await readFile(join(app(), 'Contents', 'marker'), 'utf-8')).toBe('the users app')
+    expect(await readdir(dir)).toEqual(['CodeBurnMenubar.app'])
+  })
+
+  it('still refuses when the live pid put its placement there just now', async () => {
+    await bundleAt(staged(777), 'half-copied')
+    await expect(recoverPlacements([dir], { isLivePid: () => true, now: () => Date.now() }))
+      .rejects.toThrow(/is working on/)
+  })
+
+  // An Applications folder we cannot write to is not a reason to fail the whole install:
+  // the install either lands somewhere else or fails later with a message of its own.
+  it('carries on, saying so, when an orphan cannot be cleared', async () => {
+    await bundleAt(aside(DEAD), 'old')
+    await chmod(dir, 0o555)
+    const said: string[] = []
+    await recoverPlacements([dir], { isLivePid: () => false, log: (line) => { said.push(line) } })
+    expect(said).toHaveLength(1)
+    expect(said[0]).toContain(aside(DEAD))
+    await chmod(dir, 0o755)
   })
 
   it('puts the app back when an install was killed between the two renames', async () => {
@@ -723,5 +758,29 @@ describe.skipIf(process.platform === 'win32')('recoverPlacements', () => {
     await writeFile(join(dir, '.DS_Store'), '', 'utf-8')
     await recoverPlacements([join(dir, 'missing'), dir], { isLivePid: () => false })
     expect((await readdir(dir)).sort()).toEqual(['.DS_Store', 'CodeBurnMenubar.app'])
+  })
+})
+
+describe('pidIsLive', () => {
+  it('is true for a pid we can signal', () => {
+    expect(pidIsLive(process.pid)).toBe(true)
+  })
+
+  // Sending nothing (signal 0) to a pid nobody holds.
+  it('is false for a pid that is not running', () => {
+    expect(pidIsLive(2 ** 31 - 1)).toBe(false)
+  })
+
+  // A second `codeburn menubar` runs as the same user, so a pid we may not signal is not
+  // one of ours: it has been recycled by somebody else's process.
+  it('is false for a pid we are not allowed to signal', () => {
+    const denied = vi.spyOn(process, 'kill').mockImplementation(() => {
+      throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' })
+    })
+    try {
+      expect(pidIsLive(4242)).toBe(false)
+    } finally {
+      denied.mockRestore()
+    }
   })
 })

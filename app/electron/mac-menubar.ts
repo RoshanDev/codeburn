@@ -297,11 +297,12 @@ export class MacMenubar {
     if (!path) return this.open()
     const executable = join(path, 'Contents', 'MacOS', 'CodeBurnMenubar')
     if ((await this.status()).running) {
+      const before = await this.runningPids(executable)
       await this.run('/usr/bin/defaults', ['write', MENUBAR_BUNDLE_ID, REMOTE_COMMAND_KEY, '-string', 'relaunch'])
       if (await this.waitForConsumed(EXIT_TIMEOUT_MS)) {
-        // It took the command and went down, but never came back: open it ourselves
-        // rather than leave the menu bar gone for the sake of the permission prompt.
-        if (!(await this.waitForRunning(executable, RELAUNCH_TIMEOUT_MS))) return this.open()
+        // It took the command but never came back up: open it ourselves rather than leave
+        // the menu bar gone for the sake of the permission prompt.
+        if (!(await this.waitForReplacement(executable, before, RELAUNCH_TIMEOUT_MS))) return this.open()
         return this.status()
       }
       // Nobody consumed it, so it would relaunch the next launch instead.
@@ -430,6 +431,26 @@ export class MacMenubar {
     const deadline = this.now() + timeoutMs
     for (;;) {
       if (!(await this.run('/usr/bin/pgrep', ['-f', executable]))) return true
+      if (this.now() >= deadline) return false
+      await new Promise(resolve => setTimeout(resolve, EXIT_POLL_MS))
+    }
+  }
+
+  /** The pids running from this bundle, as pgrep reports them. */
+  private async runningPids(executable: string): Promise<Set<string>> {
+    const found = await this.run('/usr/bin/pgrep', ['-f', executable])
+    return new Set((found ?? '').split('\n').map(line => line.trim()).filter(Boolean))
+  }
+
+  /** True once a menubar process appears that is not one of `before`. A self-relaunch is
+   *  only done when the *replacement* is up: the old process still matches pgrep while it
+   *  tears itself down, so "something is running" would pass instantly and every relaunch
+   *  that silently failed would look like it worked. */
+  private async waitForReplacement(executable: string, before: Set<string>, timeoutMs: number): Promise<boolean> {
+    const deadline = this.now() + timeoutMs
+    for (;;) {
+      const pids = await this.runningPids(executable)
+      if ([...pids].some(pid => !before.has(pid))) return true
       if (this.now() >= deadline) return false
       await new Promise(resolve => setTimeout(resolve, EXIT_POLL_MS))
     }

@@ -72,7 +72,7 @@ enum SingleInstanceGuard {
               size == MemoryLayout<kinfo_proc>.stride else { return nil }
         let started = info.kp_proc.p_starttime
         guard started.tv_sec > 0 else { return nil }
-        return UInt64(started.tv_sec) * 1_000_000 + UInt64(started.tv_usec)
+        return UInt64(started.tv_sec) * 1_000_000 + UInt64(max(0, started.tv_usec))
     }
 
     /// False when this launch has stood down for a copy that is already up, in
