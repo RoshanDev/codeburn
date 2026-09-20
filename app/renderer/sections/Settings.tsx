@@ -662,7 +662,7 @@ function PrivacyPane({ onPane }: { onPane: (pane: Pane) => void }) {
     clearOverviewHeadlines()
     showToast(t('settings.privacy.snapshotsCleared'), 'ok')
   }
-  return <section className="set-p on">
+  return <section className="set-p set-p-bound on">
     <div><h3 className="set-h">{t('settings.privacy.heading')}</h3><p className="set-sub">{t('settings.privacy.subtitle')}</p></div>
     <div className="card"><div className="about-sec set-last-sec set-rows">
       <TelemetryRow />
@@ -722,8 +722,8 @@ function TelemetryRow() {
     }).catch(() => {})
   }
   const detail = <>
-    {t('settings.privacy.telemetry.detail')}{' '}
-    <button type="button" className="set-text-button" onClick={() => { void codeburn.openExternal?.(TELEMETRY_DOC_URL) }}>{t('settings.privacy.telemetry.learnMore')}</button>
+    {t('settings.privacy.telemetry.detail')}
+    <button type="button" className="set-text-button set-row-link" onClick={() => { void codeburn.openExternal?.(TELEMETRY_DOC_URL) }}>{t('settings.privacy.telemetry.learnMore')}<span aria-hidden="true"> →</span></button>
   </>
   return <SettingRow
     title={t('settings.privacy.telemetry.title')}

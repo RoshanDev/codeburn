@@ -479,11 +479,24 @@ body { overflow: hidden; background: var(--bg); color: var(--ink); }
 .tgl.on { background: var(--accent); }
 .tgl::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; }
 .tgl.on::after { left: 14px; }
-.set-p .card > .set-rows { padding: 0 var(--sp-5); }
+/* Bounded reading column: a wide window must not strand the controls a screen away
+   from the rows they belong to. Left-aligned on the pane's edge, never centred. */
+.set-p-bound { --set-measure: 392px; }
+.set-p-bound > * { max-width: 760px; }
+.set-p-bound .set-sub { max-width: var(--set-measure); }
+.set-p .card > .set-rows { padding: 0 var(--sp-5); container-type: inline-size; }
 .set-rows > .about-row { padding: var(--sp-5) 0; border-top: 1px solid var(--line2); }
 .set-rows > .about-row:first-child { border-top: 0; }
 .set-rows .tx { font-weight: var(--fw-medium); }
-.set-rows .tx small { max-width: 54ch; color: var(--mut); line-height: 1.5; margin-top: var(--sp-1); }
+.set-rows .tx small { max-width: var(--set-measure); color: var(--mut); line-height: 1.5; margin-top: var(--sp-1); }
+.set-rows .r .btnp { white-space: nowrap; }
+.set-row-link { display: block; width: fit-content; margin-top: var(--sp-2); }
+/* The window floors at 800px (.win) and 900px (Electron minWidth), so the viewport media
+   query below can never reach these rows: drop the control under the text on row width. */
+@container (max-width: 540px) {
+  .set-rows > .about-row { flex-direction: column; align-items: flex-start; }
+  .set-rows > .about-row .r { margin-left: 0; }
+}
 .set-p .seg { overflow: hidden; padding: 0; border-radius: 8px; }
 .set-p .seg button { border: 0; border-right: 1px solid var(--line2); background: transparent; padding: 5px 11px; font: inherit; font-size: var(--fs-body); color: var(--mut); cursor: pointer; }
 .set-p .seg button:last-child { border-right: 0; }

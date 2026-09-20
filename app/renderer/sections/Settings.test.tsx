@@ -363,7 +363,7 @@ describe('Settings', () => {
     render(<Settings period="month" />)
     await user.click(screen.getByRole('button', { name: 'Privacy & data' }))
     expect(screen.getByText('Local report snapshots')).toBeInTheDocument()
-    expect(screen.getByText(/Calculated usage and cost reports/)).toBeInTheDocument()
+    expect(screen.getByText(/Calculated usage reports are kept on this machine/)).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Clear snapshots Local report snapshots' }))
     expect([...stored.keys()].some(key => key.startsWith('codeburn.reportSnapshot.v1.'))).toBe(false)
     expect(stored.has('codeburn.overview-headlines.v2')).toBe(false)
@@ -389,6 +389,8 @@ describe('Settings', () => {
     // Exactly one control per row, all in the right-hand block, and no per-row icons.
     expect(rows.map(row => row.querySelector('.r')!.children.length)).toEqual([1, 1, 1, 1])
     expect(pane.querySelector('svg')).toBeNull()
+    // The pane owns its reading column; the rest of Settings keeps the full-width card.
+    expect(pane).toHaveClass('set-p-bound')
   })
 
   it('reads the device-sharing row from the share status and opens the Devices pane', async () => {
