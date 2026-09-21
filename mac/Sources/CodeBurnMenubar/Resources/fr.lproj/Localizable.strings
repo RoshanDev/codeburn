@@ -344,7 +344,7 @@
 "Tracked spend (last %lld days)" = "Dépense suivie (%lld derniers jours)";
 "Costliest session" = "Session la plus coûteuse";
 "Retry tax" = "Coût des réessais";
-"%1$lld retries across %2$lld edits" = "%1$lld réessais sur %2$lld modifs";
+"%1$lld retries across %2$lld retried edits" = "%1$lld réessais sur %2$lld modifs avec réessai";
 "%@ ret/edit" = "%@ réess./modif";
 "Hides session details" = "Masque les détails de session";
 "Shows session details" = "Affiche les détails de session";

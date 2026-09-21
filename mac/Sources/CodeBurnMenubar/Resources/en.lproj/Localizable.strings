@@ -351,7 +351,7 @@
 "Tracked spend (last %lld days)" = "Tracked spend (last %lld days)";
 "Costliest session" = "Costliest session";
 "Retry tax" = "Retry tax";
-"%1$lld retries across %2$lld edits" = "%1$lld retries across %2$lld edits";
+"%1$lld retries across %2$lld retried edits" = "%1$lld retries across %2$lld retried edits";
 "%@ ret/edit" = "%@ ret/edit";
 "Hides session details" = "Hides session details";
 "Shows session details" = "Shows session details";
