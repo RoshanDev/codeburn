@@ -346,18 +346,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     }
 
     /// Re-point `L(_:)` and refresh everything that is not rebuilt on demand.
-    /// The popover and the right-click menu are both built from scratch each
-    /// time they open, and the Settings window and Capacity Dock rail rebuild
-    /// their SwiftUI content off `LanguageGeneration`, which `L10n.use` bumps.
-    /// That leaves the status item, whose title and tooltip are set once per
-    /// refresh tick and would otherwise sit in the old language until the next.
+    /// The right-click menu is built from scratch each time it opens, and the
+    /// Settings window and Capacity Dock rail rebuild their SwiftUI content off
+    /// `LanguageGeneration`, which `L10n.use` bumps. That leaves the status item,
+    /// whose title and tooltip are set once per refresh tick, and the popover,
+    /// whose content is built once and kept until it closes.
     @MainActor
     private func applyLanguage() {
+        // A language change rebuilds the rail's SwiftUI view, which destroys a
+        // DragGesture in flight before it can report its end. Settle it first,
+        // or the controller stays stuck mid-drag.
+        capacityDockController?.settleActiveDrag()
         L10n.use(LanguagePreference.current())
+        if popover?.isShown == true {
+            // refreshStatusButton() refuses to touch the title while the popover
+            // is anchored to the button, and the popover's own content was built
+            // in the old language, so close it: popoverDidClose drops the content
+            // view and refreshes the button.
+            popover.performClose(nil)
+        } else {
+            // setupPopover builds the content once at launch and popoverDidClose
+            // drops it, so the only stale copy is one that has never been shown.
+            popover?.contentViewController = nil
+        }
         refreshStatusButton()
-        // setupPopover builds the content once at launch and popoverDidClose
-        // drops it, so the only stale copy is one that has never been shown.
-        if popover?.isShown == false { popover.contentViewController = nil }
     }
 
     @MainActor

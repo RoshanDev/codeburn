@@ -500,10 +500,11 @@ private struct GeneralSettingsTab: View {
                 }
                 .pickerStyle(.menu)
                 .onChange(of: language) { _, choice in
-                    // Persisted so the next launch agrees, and applied here so
-                    // this one switches without going away and coming back.
+                    // The write is the whole switch: it persists the choice for
+                    // the next launch, and the app's own AppleLanguages observer
+                    // applies it to this one. Applying it here as well would
+                    // rebuild this window twice for one pick.
                     LanguagePreference.apply(choice)
-                    L10n.use(choice)
                 }
                 Text(L("Follows System Settings > Language & Region unless you pick one here."))
                     .font(.system(size: 11))

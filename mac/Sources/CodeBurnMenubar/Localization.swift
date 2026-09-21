@@ -61,13 +61,24 @@ enum L10n {
         }
     }
 
-    /// Point every later `L(_:)` at `preference`'s table. Called for the app's
-    /// own picker and from the `AppleLanguages` observer, so the desktop app
-    /// writing the preference has the same effect.
+    /// Point every later `L(_:)` at `preference`'s table.
+    ///
+    /// The `AppleLanguages` observer is the only caller in the app: the picker
+    /// persists the preference and the observer applies it, so one pick is one
+    /// rebuild. A write that does not move the resolved language — the picker
+    /// re-choosing what is already in force, or a global-domain change while an
+    /// override is set — returns without bumping, because a bump tears the
+    /// Settings window and the dock rail down and builds them again.
+    @MainActor
     static func use(_ preference: LanguagePreference) {
         let bundle = subbundle(for: preference)
-        lock.withLock { resolved = bundle }
-        Task { @MainActor in LanguageGeneration.shared.bump() }
+        let changed = lock.withLock { () -> Bool in
+            guard resolved?.bundlePath != bundle.bundlePath else { return false }
+            resolved = bundle
+            return true
+        }
+        guard changed else { return }
+        LanguageGeneration.shared.bump()
     }
 
     /// The OS language order, read straight from the global domain. Neither
@@ -115,6 +126,14 @@ enum L10n {
         return lproj(chosen, in: base) ?? lproj(development, in: base) ?? base
     }
 
+    /// The lookup `L(_:)` performs, with the bundle named rather than taken from
+    /// `active`. Tests assert a language's table through this, so checking what
+    /// French renders as never has to repoint the process-wide bundle that every
+    /// other suite is reading at the same time.
+    static func lookup(_ key: String, in bundle: Bundle) -> String {
+        bundle.localizedString(forKey: key, value: key, table: table)
+    }
+
     /// SwiftPM writes the resource bundle's directories all lowercase, so
     /// `zh-Hans.lproj` in the source tree is `zh-hans.lproj` in the build
     /// product. `path(forResource:ofType:)` matches the name literally where
@@ -146,7 +165,7 @@ final class LanguageGeneration {
 /// Localized copy for `key`, falling back to the key (its English text) when a
 /// translation is missing.
 func L(_ key: String) -> String {
-    L10n.active.localizedString(forKey: key, value: key, table: L10n.table)
+    L10n.lookup(key, in: L10n.active)
 }
 
 /// Localized format string for `key`, filled with `arguments`.

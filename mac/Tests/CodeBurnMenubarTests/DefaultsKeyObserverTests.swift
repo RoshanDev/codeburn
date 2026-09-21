@@ -67,6 +67,26 @@ struct DefaultsKeyObserverTests {
         _ = observer
     }
 
+    /// The picker persists the choice and the observer applies it. One write has
+    /// to mean one apply: applying it in the picker too rebuilt the Settings
+    /// window and the dock rail twice for a single pick.
+    @Test("one preference write drives exactly one apply")
+    func oneWriteOneApply() throws {
+        let (defaults, name) = suite()
+        defer { TestDefaults.forget(name) }
+
+        let applied = Counter()
+        let observer = DefaultsKeyObserver(defaults: defaults, key: LanguagePreference.defaultsKey) {
+            applied.bump()
+        }
+
+        LanguagePreference.apply(.french, defaults: defaults)
+        #expect(applied.value == 1)
+        LanguagePreference.apply(.system, defaults: defaults)
+        #expect(applied.value == 2)
+        _ = observer
+    }
+
     @Test("a released observer stops watching, so a torn-down dock leaves nothing behind")
     func stopsAfterRelease() throws {
         let (defaults, name) = suite()
