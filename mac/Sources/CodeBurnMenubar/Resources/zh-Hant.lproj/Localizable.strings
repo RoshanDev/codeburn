@@ -344,7 +344,7 @@
 "Tracked spend (last %lld days)" = "已追蹤支出（最近 %lld 天）";
 "Costliest session" = "花費最高的會話";
 "Retry tax" = "重試成本";
-"%1$lld retries across %2$lld edits" = "%1$lld 次重試，涉及 %2$lld 次編輯";
+"%1$lld retries across %2$lld retried edits" = "%2$lld 次需要重試的編輯中共 %1$lld 次重試";
 "%@ ret/edit" = "%@ 次重試/編輯";
 "Hides session details" = "隱藏會話詳情";
 "Shows session details" = "顯示會話詳情";

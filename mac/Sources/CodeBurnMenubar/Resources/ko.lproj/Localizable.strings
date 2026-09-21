@@ -344,7 +344,7 @@
 "Tracked spend (last %lld days)" = "추적된 지출 (최근 %lld일)";
 "Costliest session" = "가장 비용이 큰 세션";
 "Retry tax" = "재시도 비용";
-"%1$lld retries across %2$lld edits" = "편집 %2$lld건 중 재시도 %1$lld회";
+"%1$lld retries across %2$lld retried edits" = "재시도한 편집 %2$lld건에서 재시도 %1$lld회";
 "%@ ret/edit" = "편집당 재시도 %@회";
 "Hides session details" = "세션 상세 정보 숨기기";
 "Shows session details" = "세션 상세 정보 표시";

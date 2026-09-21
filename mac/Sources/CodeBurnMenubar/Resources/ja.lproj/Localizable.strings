@@ -344,7 +344,7 @@
 "Tracked spend (last %lld days)" = "追跡された支出（過去%lld日間）";
 "Costliest session" = "最も費用のかかったセッション";
 "Retry tax" = "リトライコスト";
-"%1$lld retries across %2$lld edits" = "%2$lld件の編集で%1$lld回のリトライ";
+"%1$lld retries across %2$lld retried edits" = "リトライした%2$lld件の編集で%1$lld回のリトライ";
 "%@ ret/edit" = "%@回/編集";
 "Hides session details" = "セッションの詳細を非表示";
 "Shows session details" = "セッションの詳細を表示";
