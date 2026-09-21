@@ -334,6 +334,39 @@ describe('MacMenubar.settings', () => {
     expect(isRunning()).toBe(false)
   })
 
+  // A menubar older than OLDEST_ASKABLE does not watch AppleLanguages and reads it
+  // only at launch, so it is the one case that still costs a restart. Leaving it in
+  // the old language while the desktop says the menu bar follows is worse.
+  it('restarts a menu bar too old to watch the key', async () => {
+    const { menubar, calls, isRunning } = harness({ present: [USER_APP], running: true, version: '0.9.24' })
+    await menubar.setLanguage('ja')
+    const writeIdx = calls.findIndex(([cmd, args]) => cmd.endsWith('defaults') && args[0] === 'write' && args[2] === 'AppleLanguages')
+    const quitIdx = calls.findIndex(([cmd]) => cmd.endsWith('osascript'))
+    const openIdx = calls.findIndex(([cmd, args]) => cmd.endsWith('open') && args[0] === USER_APP)
+    expect(writeIdx).toBeGreaterThanOrEqual(0)
+    expect(quitIdx).toBeGreaterThan(writeIdx)
+    expect(openIdx).toBeGreaterThan(quitIdx)
+    // Exactly one open: the restart is confirmed by waiting, not by opening again.
+    expect(calls.filter(([cmd, args]) => cmd.endsWith('open') && args[0] === USER_APP).length).toBe(1)
+    expect(isRunning()).toBe(true)
+  })
+
+  it('does not restart an old menu bar that is not running', async () => {
+    const { menubar, calls, isRunning } = harness({ present: [USER_APP], running: false, version: '0.9.24' })
+    await menubar.setLanguage('ja')
+    expect(calls.some(([cmd, args]) => cmd.endsWith('defaults') && args[0] === 'write' && args[2] === 'AppleLanguages')).toBe(true)
+    expect(calls.some(([cmd]) => cmd.endsWith('osascript'))).toBe(false)
+    expect(calls.some(([cmd]) => cmd.endsWith('open'))).toBe(false)
+    expect(isRunning()).toBe(false)
+  })
+
+  it('leaves a menu bar at the floor alone', async () => {
+    const { menubar, calls } = harness({ present: [USER_APP], running: true, version: OLDEST_ASKABLE })
+    await menubar.setLanguage('ja')
+    expect(calls.some(([cmd]) => cmd.endsWith('osascript'))).toBe(false)
+    expect(calls.some(([cmd]) => cmd.endsWith('open'))).toBe(false)
+  })
+
   it('does nothing when nothing is installed', async () => {
     const { menubar, calls } = harness()
     const result = await menubar.settings()

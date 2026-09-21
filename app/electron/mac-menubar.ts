@@ -53,6 +53,8 @@ export function installPhase(line: string): InstallPhase | null {
  *  a menubar that cannot be asked is one the card refuses to drive at all (see OLDEST_ASKABLE). */
 const EXIT_TIMEOUT_MS = 5000
 const EXIT_POLL_MS = 250
+/** How long a restarted menubar is given to come back up before the card reports what it sees. */
+const RESTART_TIMEOUT_MS = 3000
 
 /**
  * The first menubar version that watches its own defaults: it acts on a Capacity Dock change
@@ -294,17 +296,30 @@ export class MacMenubar {
    * its own defaults domain. A concrete Apple tag (en/ja/ko/fr, or zh-Hans/zh-Hant)
    * overrides; null (System) clears the override so the OS language decides.
    *
-   * Writing the key is the whole switch. The menu bar watches it with KVO, which
-   * carries a write made by another process, and re-points its own string lookups
-   * in place. Nothing is started, quit or reopened here: it used to be restarted
-   * to pick the language up, and every restart re-asked a Warp user for "access
-   * data from other apps", because that consent lasts exactly as long as the
-   * process does. A menu bar that is not running reads the key at its next launch,
-   * so there is nothing to do for it either.
+   * For a current menu bar the write is the whole switch: it watches the key with
+   * KVO, which carries a write made by another process, and re-points its own
+   * string lookups in place. Nothing is started, quit or reopened, because every
+   * restart re-asked a Warp user for "access data from other apps" — that consent
+   * lasts exactly as long as the process does (WWDC23 session 10053).
+   *
+   * Observing the key arrived in the same release as {@link OLDEST_ASKABLE}, so
+   * `outdated` is the floor for this too rather than a second version to keep in
+   * step. An older menu bar reads AppleLanguages only at launch, so for it — and
+   * only for it — the change still costs a restart and the prompt that comes with
+   * one; leaving it in the old language while the desktop says the menu bar
+   * follows would be worse. One that is not running reads the key at its own next
+   * launch either way, so there is nothing to do for it.
    */
   async setLanguage(appleLang: string | null): Promise<MacMenubarStatus> {
     if (appleLang) await this.run('/usr/bin/defaults', ['write', MENUBAR_BUNDLE_ID, 'AppleLanguages', '-array', appleLang])
     else await this.run('/usr/bin/defaults', ['delete', MENUBAR_BUNDLE_ID, 'AppleLanguages'])
+    const status = await this.status()
+    if (!status.outdated || !status.running || !status.path) return status
+    const executable = join(status.path, 'Contents', 'MacOS', 'CodeBurnMenubar')
+    await this.run('/usr/bin/osascript', ['-e', 'quit app "CodeBurnMenubar"'])
+    await this.waitForExit(executable, EXIT_TIMEOUT_MS)
+    await this.run('/usr/bin/open', [status.path])
+    await this.waitForRunning(executable, RESTART_TIMEOUT_MS)
     return this.status()
   }
 
@@ -419,6 +434,16 @@ export class MacMenubar {
     const deadline = this.now() + timeoutMs
     for (;;) {
       if (!(await this.run('/usr/bin/pgrep', ['-f', executable]))) return true
+      if (this.now() >= deadline) return false
+      await new Promise(resolve => setTimeout(resolve, EXIT_POLL_MS))
+    }
+  }
+
+  /** True once the menubar process is up, so the one restart path can confirm it took. */
+  private async waitForRunning(executable: string, timeoutMs: number): Promise<boolean> {
+    const deadline = this.now() + timeoutMs
+    for (;;) {
+      if (await this.run('/usr/bin/pgrep', ['-f', executable])) return true
       if (this.now() >= deadline) return false
       await new Promise(resolve => setTimeout(resolve, EXIT_POLL_MS))
     }
