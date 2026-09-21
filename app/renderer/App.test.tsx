@@ -951,13 +951,111 @@ describe('overview idle warming', () => {
       expect(mocks.getOverview.mock.calls.filter(call => call[4] === true)).toEqual([])
       expect(mocks.getSessions.mock.calls.filter(call => call[3] === true)).toEqual([])
 
+      // `visibilitychange` is what wakes the hold — while hidden it waits on the
+      // event, never on a timer that would spin the renderer every couple of
+      // seconds for a window nobody is looking at. The short delay after the
+      // event is the busy-hold yielding to the visibility catch-up poll.
       setVisibility('visible')
       await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
-      await act(async () => { await vi.advanceTimersByTimeAsync(240_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
       expect(mocks.getSessions.mock.calls.some(call => call[0] === '30days' && call[3] === true)).toBe(true)
+      await act(async () => { await vi.advanceTimersByTimeAsync(240_000) })
       expect(mocks.getOverview.mock.calls.some(call => call[4] === true)).toBe(true)
     } finally {
       setVisibility('visible')
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps a warm that outlives a poll cycle, and never re-issues it', async () => {
+    vi.useFakeTimers()
+    try {
+      setVisibility('visible')
+      // A fresh payload object per poll, as a real CLI sends: the provider
+      // entries the picker derives from it are new objects every cadence tick.
+      mocks.getOverview.mockImplementation(async () => manyProviderPayload())
+      let resolveSessions!: (rows: unknown) => void
+      let sessionWarms = 0
+      mocks.getSessions.mockImplementation((_period: string, _provider: string, _range, background) => {
+        if (background !== true) return Promise.resolve([])
+        sessionWarms++
+        return new Promise(resolve => { resolveSessions = resolve })
+      })
+
+      render(<App />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(sessionWarms).toBe(1)
+
+      // Two full 30s poll cycles go by with the warm still in flight. The sweep
+      // must not be torn down and restarted underneath it.
+      await act(async () => { await vi.advanceTimersByTimeAsync(90_000) })
+      expect(sessionWarms).toBe(1)
+
+      await act(async () => { resolveSessions([]); await Promise.resolve() })
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+      // Landed once, under its own key, and never asked for again.
+      expect(sessionWarms).toBe(1)
+      expect(hasPolledMemo(reportMemoKey('sessions', '30days', 'all'))).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('skips a report the user visited while the sweep was parked', async () => {
+    vi.useFakeTimers()
+    try {
+      setVisibility('hidden')
+      render(<App />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+      expect(mocks.getSpendFlow.mock.calls.filter(call => call[3] === true)).toEqual([])
+
+      // The hold is unbounded, so the memo has to be re-tested on the way out:
+      // a section visited meanwhile is already warm and must not be re-parsed.
+      primePolledMemo(reportMemoKey('spendflow', '30days', 'all'), { period: { label: '', start: '', end: '' }, models: [], projects: [], links: [] })
+      setVisibility('visible')
+      await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(240_000) })
+      expect(mocks.getSessions.mock.calls.some(call => call[3] === true)).toBe(true)
+      expect(mocks.getSpendFlow.mock.calls.filter(call => call[3] === true)).toEqual([])
+    } finally {
+      setVisibility('visible')
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not mark a partially hydrated provider warm, and retries it later', async () => {
+    vi.useFakeTimers()
+    try {
+      setVisibility('visible')
+      let claudeWarms = 0
+      mocks.getOverview.mockImplementation(async (period: string, provider: string, _range, _config, background) => {
+        const payload = manyProviderPayload()
+        if (provider === 'claude' && background === true) {
+          claudeWarms++
+          // A cold corpus can answer before the parse is complete; that is not an
+          // answer worth remembering as warm.
+          if (claudeWarms === 1) return { ...payload, hydration: { complete: false } } as MenubarPayload
+        }
+        return payload
+      })
+
+      render(<App />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+      expect(claudeWarms).toBe(1)
+      expect(hasPolledMemo(overviewMemoKey('claude', '30days', null, null))).toBe(false)
+
+      // Leaving 30D and coming back re-arms the sweep: the key was never marked,
+      // so it is warmed again rather than left cold for the session.
+      fireEvent.click(screen.getByRole('tab', { name: '7D' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+      fireEvent.click(screen.getByRole('tab', { name: '30D' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+      expect(claudeWarms).toBeGreaterThan(1)
+      expect(hasPolledMemo(overviewMemoKey('claude', '30days', null, null))).toBe(true)
+    } finally {
       vi.useRealTimers()
     }
   })

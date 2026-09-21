@@ -674,6 +674,21 @@ describe('Settings', () => {
     await waitFor(() => expect(mocks.getQuota).toHaveBeenCalledWith(true, []))
   })
 
+  it('offers to read an unchecked Claude login, with the same keychain note the card shows', async () => {
+    mocks.getQuota.mockResolvedValue([
+      { provider: 'claude', connection: 'keychainUnchecked', primary: null, details: [], planLabel: null, footerLines: [] },
+    ])
+    const user = userEvent.setup()
+    render(<Settings period="month" />)
+    await user.click(screen.getByRole('button', { name: 'Plans' }))
+    expect(await screen.findByText(/CodeBurn has not read your Claude login yet\./)).toBeInTheDocument()
+    expect(screen.getByText(/macOS may ask once for keychain access\./)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'How to connect' })).not.toBeInTheDocument()
+    mocks.getQuota.mockClear()
+    await user.click(screen.getByRole('button', { name: 'Check now' }))
+    await waitFor(() => expect(mocks.getQuota).toHaveBeenCalledWith(true, []))
+  })
+
   it('offers only non-OAuth budget presets; Claude and Codex are excluded', async () => {
     const user = userEvent.setup()
     render(<Settings period="month" />)
