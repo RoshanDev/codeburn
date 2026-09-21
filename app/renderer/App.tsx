@@ -587,6 +587,13 @@ function AppMain() {
       ? [selectedProviderEntry]
       : [],
   [allProviderOverviewKey, detectedProviders, providerCatalog.key, selectedProviderEntry])
+  // The sweep needs only WHICH providers to warm. Their costs move on every
+  // poll, so depending on the entry objects tore the prefetch effect down and
+  // restarted it every cadence tick, discarding any warm still in flight and
+  // re-issuing it forever on a corpus where a warm outlives the interval.
+  const warmProviderIds = useMemo(
+    () => visibleProviderEntries.filter(entry => !entry.idle).map(entry => entry.id).join('\u0000'),
+    [visibleProviderEntries])
 
   useEffect(() => {
     const currency = overview.data?.currency
@@ -612,12 +619,13 @@ function AppMain() {
   // hasPolledMemo skips any result already warm (including one warmed by a real
   // visit).
   //
-  // `warmedKeys` is a session-lifetime once-per-key guard: each (provider,period)
-  // memo key is marked BEFORE its spawn, so an effect re-run — e.g. an overview
-  // poll that momentarily blanked `overview.data` — can never re-spawn work already
-  // warmed. New keys (a new provider id, or a period switch) still warm exactly
-  // once. Without this the prefetch re-fired every poll: redundant full-history
-  // CLI parses every 30s, forever.
+  // `warmedKeys` is a session-lifetime once-per-key guard: a (provider,period)
+  // memo key is marked once a usable result lands, so an effect re-run — e.g. an
+  // overview poll that momentarily blanked `overview.data` — can never re-spawn
+  // work already warmed. A warm that rejects or comes back partially hydrated
+  // marks nothing, so a later pass retries that key. New keys (a new provider
+  // id, or a period switch) still warm exactly once. Without this the prefetch
+  // re-fired every poll: redundant full-history CLI parses every 30s, forever.
   // Mirror the visible overview's fetch state into a ref so the prefetch can hold
   // for a user-triggered fetch without re-arming the whole loop on each toggle.
   const overviewBusyRef = useRef(false)
@@ -628,12 +636,25 @@ function AppMain() {
     // lifecycle and must not inherit local-corpus assumptions by accident.
     if (!ready || overview.data == null || customRange || claudeConfigSource || scope !== 'local') return
     let cancelled = false
+    // Pending hidden-window waiters, so teardown can release them instead of
+    // leaving the sweep parked on a listener forever.
+    const wakeups = new Set<() => void>()
     // Hold before every warm request: while a user-triggered fetch is in flight
     // (it takes priority) and while the window is hidden (nobody is waiting on a
-    // speculative result, so the sweep pauses and resumes on its own).
+    // speculative result, so the sweep pauses and resumes on its own). A hidden
+    // window can stay hidden for hours, so that half waits on the event rather
+    // than waking the renderer every couple of seconds for nothing.
     const holdWhileBusyOrHidden = async () => {
       while (!cancelled && (overviewBusyRef.current || document.visibilityState === 'hidden')) {
-        await new Promise(resolve => setTimeout(resolve, PREFETCH_STAGGER_MS))
+        if (document.visibilityState === 'hidden') {
+          await new Promise<void>(resolve => {
+            const wake = () => { document.removeEventListener('visibilitychange', wake); wakeups.delete(wake); resolve() }
+            document.addEventListener('visibilitychange', wake)
+            wakeups.add(wake)
+          })
+        } else {
+          await new Promise(resolve => setTimeout(resolve, PREFETCH_STAGGER_MS))
+        }
       }
     }
     const warm = async () => {
@@ -675,32 +696,43 @@ function AppMain() {
       ]
       for (const target of reportTargets) {
         if (cancelled) break
-        if (!hasPolledMemo(target.key)) {
-          await holdWhileBusyOrHidden()
-          try {
-            const configGeneration = configGenerationRef.current
-            const value = await target.load()
-            if (!cancelled && configGeneration === configGenerationRef.current) {
-              primePolledMemo(target.key, value)
-            }
-          } catch { /* on-demand visit will retry and surface the error */ }
-          if (!cancelled) await new Promise(resolve => setTimeout(resolve, REPORT_PREFETCH_STAGGER_MS))
-        }
+        if (hasPolledMemo(target.key)) continue
+        await holdWhileBusyOrHidden()
+        // The hold has no bound (a hidden window, a busy overview), so re-test
+        // both gates on the way out: never spend a heavy query on a sweep the
+        // user has already abandoned, nor on a section they visited meanwhile.
+        if (cancelled) break
+        if (hasPolledMemo(target.key)) continue
+        try {
+          const configGeneration = configGenerationRef.current
+          const value = await target.load()
+          // Deliberately NOT gated on `cancelled`: the memo key names its own
+          // period and provider, so a result that lands after this effect was
+          // torn down is still the right answer for its own key. Only a config
+          // change (new generation) makes it wrong.
+          if (configGeneration === configGenerationRef.current) primePolledMemo(target.key, value)
+        } catch { /* on-demand visit will retry and surface the error */ }
+        if (!cancelled) await new Promise(resolve => setTimeout(resolve, REPORT_PREFETCH_STAGGER_MS))
       }
 
       // Keep the current-main provider-switch contract while the shared Core
       // provider snapshot work is still held: warm the visible period for each
       // detected provider only after the higher-value report queue.
-      for (const targetProvider of visibleProviderEntries.filter(entry => !entry.idle).map(entry => entry.id)) {
-        if (cancelled || targetProvider === provider) continue
+      for (const targetProvider of warmProviderIds ? warmProviderIds.split('\u0000') : []) {
+        if (cancelled) break
+        if (targetProvider === provider) continue
         const key = overviewMemoKey(targetProvider, period, null, null)
         if (warmedKeys.current.has(key) || hasPolledMemo(key)) continue
         await holdWhileBusyOrHidden()
+        if (cancelled) break
+        if (warmedKeys.current.has(key) || hasPolledMemo(key)) continue
         try {
           const configGeneration = configGenerationRef.current
           const value = await codeburn.getOverview(period, targetProvider, undefined, undefined, true)
-          if (!cancelled
-            && configGeneration === configGenerationRef.current
+          // A result is kept, and the key marked warm, only when it is usable:
+          // computed under the current config and fully hydrated. A rejection or
+          // a partial parse marks nothing, so a later pass retries that key.
+          if (configGeneration === configGenerationRef.current
             && value.hydration?.complete !== false) {
             primePolledMemo(key, value)
             writeOverviewHeadline(key, value)
@@ -711,11 +743,11 @@ function AppMain() {
       }
     }
     const start = setTimeout(() => { void warm() }, PREFETCH_START_DELAY_MS)
-    return () => { cancelled = true; clearTimeout(start) }
+    return () => { cancelled = true; clearTimeout(start); for (const wake of [...wakeups]) wake() }
     // `overview.data == null` (a boolean) gates on first-resolution without
     // re-running every poll; the data content itself is intentionally not a dep.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, period, provider, visibleProviderEntries, customRange, claudeConfigSource, scope, snapshotRevision, overview.data == null])
+  }, [ready, period, provider, warmProviderIds, customRange, claudeConfigSource, scope, snapshotRevision, overview.data == null])
 
   const refreshVisible = useCallback(() => {
     refreshOverview()
