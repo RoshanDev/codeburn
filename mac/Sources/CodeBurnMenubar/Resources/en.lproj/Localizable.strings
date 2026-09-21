@@ -665,8 +665,6 @@
 /* MARK: Language picker */
 "Language" = "Language";
 "System" = "System";
-"Relaunch to apply." = "Relaunch to apply.";
-"Relaunch" = "Relaunch";
 "Follows System Settings > Language & Region unless you pick one here." = "Follows System Settings > Language & Region unless you pick one here.";
 
 /* MARK: Quota pace captions (#1267) */

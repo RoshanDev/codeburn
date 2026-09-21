@@ -658,8 +658,6 @@
 /* MARK: Language picker */
 "Language" = "언어";
 "System" = "시스템 설정 따름";
-"Relaunch to apply." = "적용하려면 다시 시작하세요.";
-"Relaunch" = "다시 시작";
 "Follows System Settings > Language & Region unless you pick one here." = "여기서 선택하지 않으면 “시스템 설정 > 언어 및 지역”을 따릅니다.";
 
 /* MARK: Quota pace captions (#1267) */

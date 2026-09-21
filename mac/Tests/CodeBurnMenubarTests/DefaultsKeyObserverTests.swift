@@ -47,6 +47,26 @@ struct DefaultsKeyObserverTests {
         _ = observer
     }
 
+    /// The desktop app's language switch writes nothing but AppleLanguages. Set
+    /// and removed (which is what "System" is) both have to wake the app, or it
+    /// would be back to restarting to pick the language up.
+    @Test("AppleLanguages is watchable, set and cleared")
+    func watchesAppleLanguages() throws {
+        let (defaults, name) = suite()
+        defer { TestDefaults.forget(name) }
+
+        let fired = Counter()
+        let observer = DefaultsKeyObserver(defaults: defaults, key: LanguagePreference.defaultsKey) {
+            fired.bump()
+        }
+
+        defaults.set(["fr"], forKey: LanguagePreference.defaultsKey)
+        #expect(fired.value == 1)
+        defaults.removeObject(forKey: LanguagePreference.defaultsKey)
+        #expect(fired.value == 2)
+        _ = observer
+    }
+
     @Test("a released observer stops watching, so a torn-down dock leaves nothing behind")
     func stopsAfterRelease() throws {
         let (defaults, name) = suite()

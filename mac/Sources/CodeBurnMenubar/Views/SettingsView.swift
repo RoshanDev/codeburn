@@ -97,6 +97,9 @@ struct SettingsView: View {
             SettingsWindowStyleAccessor(title: currentPaneTitle)
                 .allowsHitTesting(false)
         }
+        // Every label below was resolved by `L(_:)` when this body last ran, so
+        // a language change has to rebuild the window rather than redraw it.
+        .id(LanguageGeneration.shared.value)
     }
 
     private var sidebar: some View {
@@ -361,7 +364,6 @@ private struct GeneralSettingsTab: View {
     // millions). When custom is active the picker shows "Custom…" and a field
     // appears for an exact amount.
     @State private var language = LanguagePreference.current()
-    @State private var languageChanged = false
     @State private var costCustom = false
     @State private var tokenCustom = false
     @State private var costText = ""
@@ -498,24 +500,14 @@ private struct GeneralSettingsTab: View {
                 }
                 .pickerStyle(.menu)
                 .onChange(of: language) { _, choice in
+                    // Persisted so the next launch agrees, and applied here so
+                    // this one switches without going away and coming back.
                     LanguagePreference.apply(choice)
-                    languageChanged = true
+                    L10n.use(choice)
                 }
-                if languageChanged {
-                    // Inline rather than modal: the strings already loaded stay
-                    // as they are until the process restarts, and nothing is
-                    // lost by putting that off.
-                    HStack {
-                        Text(L("Relaunch to apply."))
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                        Button(L("Relaunch")) { AppRelaunch.now() }
-                    }
-                } else {
-                    Text(L("Follows System Settings > Language & Region unless you pick one here."))
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
+                Text(L("Follows System Settings > Language & Region unless you pick one here."))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
             }
 
             Section(L("Usage Refresh")) {

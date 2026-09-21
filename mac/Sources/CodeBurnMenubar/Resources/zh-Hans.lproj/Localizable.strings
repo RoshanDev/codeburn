@@ -656,8 +656,6 @@
 /* MARK: Language picker */
 "Language" = "语言";
 "System" = "跟随系统";
-"Relaunch to apply." = "重新启动后生效。";
-"Relaunch" = "重新启动";
 "Follows System Settings > Language & Region unless you pick one here." = "除非在此处选择，否则将跟随“系统设置 > 语言与地区”。";
 
 /* MARK: Quota pace captions (#1267) */

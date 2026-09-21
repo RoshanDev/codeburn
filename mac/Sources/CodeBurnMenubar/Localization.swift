@@ -1,8 +1,9 @@
 import Foundation
+import Observation
 
 /// Localization for the menubar app (#1219). No third-party library: one
 /// `Localizable.strings` table per locale, shipped as SwiftPM target resources
-/// and resolved by AppKit against the user's system language.
+/// and resolved against the chosen language by `L10n.use(_:)`.
 ///
 /// # Why every lookup is explicit
 ///
@@ -41,12 +42,111 @@ enum L10n {
     /// Locales shipped today. Mirrored by `CFBundleLocalizations` in the two
     /// packaging scripts and asserted by `LocalizationCatalogTests`.
     static let supportedLocalizations = ["en", "fr", "ja", "ko", "zh-Hans", "zh-Hant"]
+
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var resolved: Bundle?
+
+    /// The single `.lproj` sub-bundle `L(_:)` reads from. Naming the sub-bundle
+    /// rather than `bundle` is what makes a language change land without a
+    /// restart: CFBundle picks its localization once, the first time a table is
+    /// resolved, and never revisits it — so a live `AppleLanguages` change is
+    /// invisible to `bundle.localizedString(...)`, which is why the app used to
+    /// have to relaunch. An explicit sub-bundle has no such cache.
+    static var active: Bundle {
+        lock.withLock {
+            if let resolved { return resolved }
+            let bundle = subbundle(for: LanguagePreference.current())
+            resolved = bundle
+            return bundle
+        }
+    }
+
+    /// Point every later `L(_:)` at `preference`'s table. Called for the app's
+    /// own picker and from the `AppleLanguages` observer, so the desktop app
+    /// writing the preference has the same effect.
+    static func use(_ preference: LanguagePreference) {
+        let bundle = subbundle(for: preference)
+        lock.withLock { resolved = bundle }
+        Task { @MainActor in LanguageGeneration.shared.bump() }
+    }
+
+    /// The OS language order, read straight from the global domain. Neither
+    /// `Locale.preferredLanguages` nor `Bundle.preferredLocalizations` can be
+    /// used for this: both honour an `AppleLanguages` override in the app's own
+    /// domain, so with one set they would report the override as the system
+    /// language and "System" could never mean "follow the OS" again.
+    static var systemPreferredLanguages: [String] {
+        UserDefaults.standard.persistentDomain(forName: UserDefaults.globalDomain)?[LanguagePreference.defaultsKey] as? [String]
+            ?? Locale.preferredLanguages
+    }
+
+    /// The language whose `.lproj` should serve lookups. A language the bundle
+    /// does not ship falls back to the development language, which is English
+    /// and therefore the key text itself.
+    static func language(
+        for preference: LanguagePreference,
+        available: [String],
+        development: String,
+        systemPreferred: [String]
+    ) -> String {
+        guard preference == .system else {
+            return available.contains(preference.rawValue) ? preference.rawValue : development
+        }
+        return Bundle.preferredLocalizations(from: available, forPreferences: systemPreferred).first ?? development
+    }
+
+    static func subbundle(
+        for preference: LanguagePreference,
+        in base: Bundle = L10n.bundle,
+        systemPreferred: [String]? = nil
+    ) -> Bundle {
+        let development = base.developmentLocalization ?? "en"
+        let chosen = language(
+            for: preference,
+            // `supportedLocalizations`, not `base.localizations`: NSBundle
+            // lowercases what it reports, and `zh-hans` matches neither the
+            // preference's raw value nor the `zh-Hans.lproj` on disk. The two
+            // lists are held equal by `LocalizationCatalogTests`, and a
+            // disagreement only costs the fallback below.
+            available: supportedLocalizations,
+            development: development,
+            systemPreferred: systemPreferred ?? systemPreferredLanguages
+        )
+        return lproj(chosen, in: base) ?? lproj(development, in: base) ?? base
+    }
+
+    /// SwiftPM writes the resource bundle's directories all lowercase, so
+    /// `zh-Hans.lproj` in the source tree is `zh-hans.lproj` in the build
+    /// product. `path(forResource:ofType:)` matches the name literally where
+    /// CFBundle's own localization matching does not, so both spellings are
+    /// tried. Getting this wrong is silent: the lookup falls through to English.
+    private static func lproj(_ language: String, in base: Bundle) -> Bundle? {
+        for candidate in [language, language.lowercased()] {
+            if let path = base.path(forResource: candidate, ofType: "lproj"),
+               let resolved = Bundle(path: path) {
+                return resolved
+            }
+        }
+        return nil
+    }
+}
+
+/// Bumped whenever `L(_:)` starts answering in a different language. SwiftUI
+/// views that outlive a language change (the Settings window, the Capacity Dock
+/// rail) read it so their bodies re-run; the popover is rebuilt on every show
+/// and needs nothing.
+@MainActor
+@Observable
+final class LanguageGeneration {
+    static let shared = LanguageGeneration()
+    private(set) var value = 0
+    fileprivate func bump() { value += 1 }
 }
 
 /// Localized copy for `key`, falling back to the key (its English text) when a
 /// translation is missing.
 func L(_ key: String) -> String {
-    L10n.bundle.localizedString(forKey: key, value: key, table: L10n.table)
+    L10n.active.localizedString(forKey: key, value: key, table: L10n.table)
 }
 
 /// Localized format string for `key`, filled with `arguments`.

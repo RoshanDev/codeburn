@@ -59,6 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
     private var popover: NSPopover!
     private var capacityDockController: CapacityDockController?
     private var remoteCommandObserver: DefaultsKeyObserver?
+    private var languageObserver: DefaultsKeyObserver?
     private var rightClickMonitor: Any?
     private var lastContextMenuPresentedAt: Date = .distantPast
     /// Held only while the right-click menu is open. Cleared in menuDidClose so
@@ -332,6 +333,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         }
         // A command written while this app was not running is answered at launch, not ignored.
         handleRemoteCommand()
+
+        // The desktop app's language switch writes AppleLanguages into this app's
+        // domain and nothing else. KVO on UserDefaults carries a write made by
+        // another process (that is the whole reason the remote-command key works),
+        // so the switch lands here while the app keeps running. It used to restart
+        // instead, and every restart re-asked a Warp user for "access data from
+        // other apps": that consent lasts only as long as the process does.
+        languageObserver = DefaultsKeyObserver(defaults: .standard, key: LanguagePreference.defaultsKey) { [weak self] in
+            Task { @MainActor [weak self] in self?.applyLanguage() }
+        }
+    }
+
+    /// Re-point `L(_:)` and refresh everything that is not rebuilt on demand.
+    /// The popover and the right-click menu are both built from scratch each
+    /// time they open, and the Settings window and Capacity Dock rail rebuild
+    /// their SwiftUI content off `LanguageGeneration`, which `L10n.use` bumps.
+    /// That leaves the status item, whose title and tooltip are set once per
+    /// refresh tick and would otherwise sit in the old language until the next.
+    @MainActor
+    private func applyLanguage() {
+        L10n.use(LanguagePreference.current())
+        refreshStatusButton()
+        // setupPopover builds the content once at launch and popoverDidClose
+        // drops it, so the only stale copy is one that has never been shown.
+        if popover?.isShown == false { popover.contentViewController = nil }
     }
 
     @MainActor
@@ -351,10 +377,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         }
         if command == .settings {
             openSettings()
-            return
-        }
-        if command == .relaunch {
-            AppRelaunch.now()
             return
         }
         guard command.terminates else { return }

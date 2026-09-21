@@ -658,8 +658,6 @@
 /* MARK: Language picker */
 "Language" = "Langue";
 "System" = "Système";
-"Relaunch to apply." = "Relancez pour appliquer.";
-"Relaunch" = "Relancer";
 "Follows System Settings > Language & Region unless you pick one here." = "Suit Réglages Système > Langue et région, sauf sélection ici.";
 
 /* MARK: Quota pace captions (#1267) */
