@@ -896,30 +896,61 @@ fn spawn_program_in_terminal(_app: &AppHandle, cli: &CodeburnCli, subcommand: &[
 
     #[cfg(target_os = "linux")]
     {
-        let mut command_parts: Vec<String> = vec![cli.program.clone()];
-        command_parts.extend(cli.extra_args.clone());
-        command_parts.extend(subcommand.iter().map(|s| s.to_string()));
-        // Terminal emulators take the command as one string that a shell then parses
-        // (gnome-terminal explicitly hands it to `bash -lc`). `cli.program` reaches here
-        // from PATH resolution, not only from the allowlisted CODEBURN_BIN, so re-check
-        // every part before joining; anything a shell could reinterpret skips the terminal
-        // and goes through the argv-only detached spawn below.
-        if command_parts.iter().all(|p| is_safe_arg(p)) {
-            let composite = command_parts.join(" ");
-            let terminals: [&[&str]; 4] = [
-                &["x-terminal-emulator", "-e"],
-                &["gnome-terminal", "--", "bash", "-lc"],
-                &["konsole", "-e"],
-                &["xterm", "-e"],
+        let mut argv: Vec<String> = vec![cli.program.clone()];
+        argv.extend(cli.extra_args.clone());
+        argv.extend(subcommand.iter().map(|s| s.to_string()));
+        // Terminal emulators that take `-e` as one string will try to exec
+        // "node /path/cli.js report" as a single filename. Pass each token as its
+        // own argument instead. Every token is re-checked first: a shell is only
+        // involved for the quoted fallback below.
+        if argv.iter().all(|part| is_safe_arg(part)) {
+            let quoted = argv
+                .iter()
+                .map(|part| format!("'{}'", part.replace('\'', "'\\''")))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let attempts: Vec<Vec<String>> = vec![
+                {
+                    let mut cmd = vec!["ptyxis".into(), "--".into()];
+                    cmd.extend(argv.iter().cloned());
+                    cmd
+                },
+                {
+                    let mut cmd = vec!["x-terminal-emulator".into(), "--".into()];
+                    cmd.extend(argv.iter().cloned());
+                    cmd
+                },
+                {
+                    let mut cmd = vec!["gnome-terminal".into(), "--".into()];
+                    cmd.extend(argv.iter().cloned());
+                    cmd
+                },
+                {
+                    let mut cmd = vec!["kgx".into(), "--".into()];
+                    cmd.extend(argv.iter().cloned());
+                    cmd
+                },
+                {
+                    let mut cmd = vec!["konsole".into(), "-e".into()];
+                    cmd.extend(argv.iter().cloned());
+                    cmd
+                },
+                {
+                    let mut cmd = vec!["xterm".into(), "-e".into()];
+                    cmd.extend(argv.iter().cloned());
+                    cmd
+                },
+                vec!["ptyxis".into(), "--".into(), "bash".into(), "-lc".into(), quoted.clone()],
+                vec!["x-terminal-emulator".into(), "--".into(), "bash".into(), "-lc".into(), quoted],
             ];
-            for term in &terminals {
-                let program = term[0];
-                let extras = &term[1..];
-                if which::which(program).is_ok() {
-                    let mut cmd = std::process::Command::new(program);
-                    cmd.args(extras);
-                    cmd.arg(&composite);
-                    cmd.spawn().with_context(|| format!("failed to launch {}", program))?;
+            for attempt in &attempts {
+                let Some(program) = attempt.first() else { continue };
+                if which::which(program).is_err() {
+                    continue;
+                }
+                let mut cmd = std::process::Command::new(program);
+                cmd.args(&attempt[1..]);
+                if cmd.spawn().is_ok() {
                     return Ok(());
                 }
             }

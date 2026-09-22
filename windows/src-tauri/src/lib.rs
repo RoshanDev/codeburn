@@ -731,13 +731,20 @@ fn set_dock_enabled(app: &AppHandle, enabled: bool) {
         crate::log_line!("codeburn: failed to persist the Capacity Dock setting: {err}");
         return;
     }
-    if enabled {
-        if let Err(err) = dock::show(app) {
-            crate::log_line!("codeburn: failed to show the Capacity Dock: {err}");
+    // Settings saves from an async command, which runs off the GTK main thread.
+    // Building or anchoring the dock there panics inside GTK, so the switch
+    // flips and the rail never appears. The menu path is already on the main
+    // thread; `run_on_main_thread` runs the closure immediately in that case.
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if enabled {
+            if let Err(err) = dock::show(&handle) {
+                crate::log_line!("codeburn: failed to show the Capacity Dock: {err}");
+            }
+        } else {
+            dock::hide(&handle);
         }
-    } else {
-        dock::hide(app);
-    }
+    });
     #[cfg(not(target_os = "linux"))]
     if let Some(item) = DOCK_MENU_ITEM.get() {
         let _ = item.set_checked(enabled);
@@ -1238,7 +1245,7 @@ mod commands {
     pub fn dock_pointer_sample(app: AppHandle, x: f64, y: f64, down: bool, present: bool) {
         #[cfg(target_os = "linux")]
         if let Some(window) = app.get_webview_window(crate::dock::DOCK_LABEL) {
-            crate::dock::note_page_pointer(&window, x, y, down, present);
+            crate::dock::note_page_pointer(&app, &window, x, y, down, present);
         }
         #[cfg(not(target_os = "linux"))]
         let _ = (app, x, y, down, present);

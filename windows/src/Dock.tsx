@@ -116,7 +116,8 @@ type Interaction = {
   dragging: boolean
 }
 const REST: Interaction = { railHovered: false, detailHovered: false, pinned: false, collapseGrace: false, dragging: false }
-const isExpanded = (i: Interaction) => i.pinned || i.railHovered || i.detailHovered || i.collapseGrace
+const isExpanded = (i: Interaction) =>
+  i.pinned || i.railHovered || i.detailHovered || i.collapseGrace || i.dragging
 const canCollapse = (i: Interaction) => !i.pinned && !i.railHovered && !i.detailHovered && !i.collapseGrace && !i.dragging
 
 type DetailPhase = 'entering' | 'shown' | 'dismissing'
@@ -777,7 +778,7 @@ export function Dock() {
         schedule('detailShow', MOTION.detailShowDelay, () => showDetail(id))
       } else if (hoveredRef.current === id) {
         // Enough time to cross the transparent gap into the bubble.
-        schedule('detailExit', MOTION.detailExitDelay, () => {
+        schedule('detailExit', 40, () => {
           if (interactionRef.current.detailHovered) return
           hideDetail()
           scheduleCollapse()
@@ -796,6 +797,7 @@ export function Dock() {
         cancel('detailDismiss')
         setDetailPhase('shown')
       } else if (!hovering) {
+        if (!interactionRef.current.railHovered) hideDetail()
         scheduleCollapse()
       }
     },
@@ -857,7 +859,10 @@ export function Dock() {
       })
     }
     const move = (event: PointerEvent) => send(event, true)
-    const leave = (event: PointerEvent) => send(event, false)
+    const leave = (event: PointerEvent) => {
+      if (event.buttons & 1) return
+      send(event, false)
+    }
     window.addEventListener('pointermove', move)
     window.addEventListener('pointerdown', move)
     window.addEventListener('pointerup', move)
@@ -921,6 +926,7 @@ export function Dock() {
         track('dock_drag_end', { edge: next.edge })
         setFrame(next)
         setDrag(null)
+        setInteraction((i) => ({ ...i, dragging: false }))
         // Glide from centre to centre: the rail may have changed orientation on the way.
         setGlide({
           dx: from.x + from.w / 2 - (next.rail.x + next.rail.w / 2),
@@ -974,8 +980,19 @@ export function Dock() {
     // finger exactly where it was grabbed.
     void invoke('dock_begin_drag', { x: Math.round(start.x), y: Math.round(start.y) })
   }
-  const onPointerUp = () => {
+  const onPointerUp = (event: ReactPointerEvent) => {
+    const wasDragging = interactionRef.current.dragging
     press.current = null
+    if (!wasDragging) return
+    const rail = event.currentTarget as HTMLElement
+    const box = rail.getBoundingClientRect()
+    const inside =
+      event.clientX >= box.left &&
+      event.clientX <= box.right &&
+      event.clientY >= box.top &&
+      event.clientY <= box.bottom
+    setInteraction((i) => ({ ...i, dragging: false, railHovered: inside, collapseGrace: !inside }))
+    if (!inside) scheduleCollapse()
   }
 
   const onRowClick = (provider: Provider) => {

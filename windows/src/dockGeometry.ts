@@ -276,9 +276,9 @@ export const MOTION = {
   detailFollow: { duration: 220, curve: [0.25, 0.1, 0.25, 1] as const },
   detailDismiss: { duration: 140, curve: [0.4, 0, 1, 1] as const },
   railHoverOpenDelay: 80,
-  railHoverCloseDelay: 180,
-  detailShowDelay: 180,
-  detailExitDelay: 240,
+  railHoverCloseDelay: 70,
+  detailShowDelay: 80,
+  detailExitDelay: 50,
   detailAppearOffset: 10,
   dragThreshold: 3,
 } as const

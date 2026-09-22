@@ -338,6 +338,15 @@ pub fn layout(area: Rect, placement: &Placement, request: &LayoutRequest, m: &Me
         area_along + (area_along_len - rest_len) / 2
     };
     let rest_start = denormalize(along_norm, along_low, rest_high, rest_fallback);
+    // The stored offset is for the resting length. Pull it in far enough that the fully
+    // expanded rail, not just the resting one, still ends inside the work area.
+    let expanded_len = rail_length(
+        m,
+        request.total_rows.max(request.rows).max(1),
+        pad,
+    );
+    let expanded_high = (area_along + area_along_len - EDGE_INSET - expanded_len).max(along_low);
+    let rest_start = rest_start.clamp(along_low, expanded_high.min(rest_high));
 
     let anchor = anchor_for(area_along, area_along_len, rest_start, rest_len);
     let rail_along = |rows: u32| -> (i32, i32) {
@@ -453,6 +462,67 @@ fn attachment_candidate(rail: &Rect, area: &Rect) -> Option<(Edge, f64)> {
     Some((edge, (1.0 - distance as f64 / DOCK_SNAP_DISTANCE as f64).clamp(0.0, 1.0)))
 }
 
+/// Nearest edge, but sticky: at a corner the two distances are almost equal and the
+/// rail would swap orientation every frame. Stay on the edge we already have until the
+/// other one is clearly closer.
+fn sticky_edge(current: Edge, rail: &Rect, area: &Rect) -> Edge {
+    let dist = |edge: Edge| -> i32 {
+        match edge {
+            Edge::Left => (rail.x - area.x).abs(),
+            Edge::Right => (area.right() - rail.right()).abs(),
+            Edge::Top => (rail.y - area.y).abs(),
+            Edge::Bottom => (area.bottom() - rail.bottom()).abs(),
+        }
+    };
+    let nearest = nearest_edge(rail, area);
+    if nearest == current {
+        return current;
+    }
+    // 48 logical px of hysteresis. A corner no longer flips between top and right.
+    if dist(nearest) + 48 < dist(current) {
+        nearest
+    } else {
+        current
+    }
+}
+
+/// Pull the window toward `next` by at most one step. A corner used to swap
+/// orientation and land hundreds of pixels away in a single tick; a normal
+/// drag moves less than this in one poll, so it still tracks the pointer.
+fn smooth_window(prev: Rect, next: Rect) -> Rect {
+    fn step(from: i32, to: i32) -> i32 {
+        let delta = to - from;
+        const MAX_STEP: i32 = 48;
+        if delta.abs() <= MAX_STEP {
+            to
+        } else {
+            from + delta.signum() * MAX_STEP
+        }
+    }
+    Rect {
+        x: step(prev.x, next.x),
+        y: step(prev.y, next.y),
+        w: next.w,
+        h: next.h,
+    }
+}
+
+/// The edge a dropped rail belongs on. A drop always sticks: the along-edge position
+/// is kept and the other axis goes flush.
+fn nearest_edge(rail: &Rect, area: &Rect) -> Edge {
+    let distances = [
+        (Edge::Left, (rail.x - area.x).abs()),
+        (Edge::Right, (area.right() - rail.right()).abs()),
+        (Edge::Top, (rail.y - area.y).abs()),
+        (Edge::Bottom, (area.bottom() - rail.bottom()).abs()),
+    ];
+    distances
+        .into_iter()
+        .min_by_key(|(_, distance)| *distance)
+        .map(|(edge, _)| edge)
+        .unwrap_or(Edge::Right)
+}
+
 /// Placement for a rail released at `rail`: docked when an edge is in reach, else floating
 /// where it was dropped.
 ///
@@ -464,7 +534,7 @@ fn attachment_candidate(rail: &Rect, area: &Rect) -> Option<(Edge, f64)> {
 /// of it.
 fn placement_for_drop(rail: &Rect, rest_len: i32, screen: &Screen, current: &Placement) -> Placement {
     let area = &screen.area;
-    let docked = attachment_candidate(rail, area).map(|(edge, _)| edge);
+    let docked = Some(nearest_edge(rail, area));
     let attachment = docked.unwrap_or(current.attachment);
     let vertical = attachment.is_vertical();
 
@@ -709,6 +779,10 @@ struct DockState {
     /// The primary button while it is held, and whether the press began on the dock.
     press: Option<bool>,
     drag: Option<Drag>,
+    /// Set when the page starts a drag and cleared when it reports the button up.
+    /// XWayland's `XQueryPointer` button mask stays clear while the button is held,
+    /// and trusting that alone settled the drag on the next tick: the rail vanished.
+    drag_held: bool,
 }
 
 static STATE: Mutex<DockState> = Mutex::new(DockState {
@@ -736,6 +810,7 @@ static STATE: Mutex<DockState> = Mutex::new(DockState {
     ignoring: None,
     press: None,
     drag: None,
+    drag_held: false,
 });
 
 fn lock() -> std::sync::MutexGuard<'static, DockState> {
@@ -878,6 +953,13 @@ fn move_window(window: &tauri::WebviewWindow, target: Rect, scale: f64) {
 #[cfg(target_os = "linux")]
 fn place_linux(window: &tauri::WebviewWindow, target: Rect) {
     let _ = window.set_size(tauri::LogicalSize::new(target.w.max(1) as f64, target.h.max(1) as f64));
+    // Drag runs on the pointer thread. GTK, including the layer-shell support
+    // check, panics unless it is called on the main thread, which took the dock down.
+    if !gtk::is_initialized_main_thread() {
+        let _ = window.set_position(tauri::LogicalPosition::new(target.x as f64, target.y as f64));
+        sync_hit_shape(window);
+        return;
+    }
     if !gtk_layer_shell::is_supported() {
         let _ = std::fs::write(
             "/tmp/codeburn-dock-place.txt",
@@ -1049,6 +1131,7 @@ fn settle(app: &AppHandle, window: &tauri::WebviewWindow, placement: Placement, 
         state.placement = Some(placement);
         state.request.detail = None;
         state.drag = None;
+        state.drag_held = false;
     }
     publish(app, window, Some(from_rail));
 }
@@ -1109,6 +1192,9 @@ pub fn begin_drag(app: &AppHandle, anchor: (i32, i32)) {
         ay: grip(anchor.1, frame.rail.y, frame.rail.h),
         last: None,
     });
+    // The page only calls this with the button down. XWayland does not report
+    // that in the pointer mask, so the latch is what keeps the gesture alive.
+    state.drag_held = true;
     state.request.detail = None;
     drop(state);
     // Recorded the same way the tick does it, so a call that fails here leaves the state unknown
@@ -1142,6 +1228,8 @@ struct PagePointer {
     x: i32,
     y: i32,
     down: bool,
+    /// Where the button went down, in window pixels, if that press was on the rail.
+    press: Option<(f64, f64)>,
 }
 
 /// The Wayland pointer, as the dock page last saw it. XQueryPointer only follows the X11
@@ -1152,42 +1240,75 @@ static PAGE_POINTER: Mutex<Option<PagePointer>> = Mutex::new(None);
 
 #[cfg(target_os = "linux")]
 pub fn note_page_pointer(
-    window: &tauri::WebviewWindow,
+    app: &AppHandle,
+    _window: &tauri::WebviewWindow,
     local_x: f64,
     local_y: f64,
     down: bool,
     present: bool,
 ) {
-    let mut slot = PAGE_POINTER.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !present {
-        *slot = None;
-        return;
+    if !present || !down {
+        lock().drag_held = false;
     }
-    let scale = window.scale_factor().unwrap_or(1.0);
-    // Wayland does not tell a client where the compositor put it, so the layout origin
-    // is the position we asked for. outer_position() stays at the origin and the drag
-    // never leaves the corner.
-    let origin = {
-        let state = lock();
-        state
-            .frame
-            .map(|frame| (frame.window.x, frame.window.y))
-            .unwrap_or((0, 0))
-    };
-    *slot = Some(PagePointer {
-        x: ((origin.0 as f64 + local_x) * scale).round() as i32,
-        y: ((origin.1 as f64 + local_y) * scale).round() as i32,
-        down,
-    });
+    let mut start_drag = None;
+    {
+        let mut slot = PAGE_POINTER.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !present {
+            *slot = None;
+            return;
+        }
+        let (origin, scale, on_rail, dragging) = {
+            let state = lock();
+            let scale = if state.scale > 0.0 { state.scale } else { 1.0 };
+            let origin = state
+                .frame
+                .map(|frame| (frame.window.x, frame.window.y))
+                .unwrap_or((0, 0));
+            let on_rail = state.frame.is_some_and(|frame| {
+                let pad = 8;
+                let rail = padded(frame.rail, pad);
+                rail.contains(local_x.round() as i32, local_y.round() as i32)
+            });
+            (origin, scale, on_rail, state.drag.is_some())
+        };
+        let press = if !down {
+            None
+        } else if let Some(press) = slot.as_ref().and_then(|sample| sample.press) {
+            Some(press)
+        } else if on_rail {
+            Some((local_x, local_y))
+        } else {
+            None
+        };
+        // The rail element can miss the press when the hit region and the DOM
+        // box disagree. A press that started on the rail and then moved is a drag.
+        if down && !dragging {
+            if let Some((px, py)) = press {
+                let dx = local_x - px;
+                let dy = local_y - py;
+                if dx * dx + dy * dy > 9.0 {
+                    start_drag = Some((px.round() as i32, py.round() as i32));
+                }
+            }
+        }
+        *slot = Some(PagePointer {
+            x: ((origin.0 as f64 + local_x) * scale).round() as i32,
+            y: ((origin.1 as f64 + local_y) * scale).round() as i32,
+            down,
+            press,
+        });
+    }
+    if let Some(anchor) = start_drag {
+        begin_drag(app, anchor);
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn cursor_position() -> Option<(i32, i32)> {
-    PAGE_POINTER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()
-        .map(|sample| (sample.x, sample.y))
+    // Read the pointer from X11 every tick. The page only sends an event while the
+    // cursor is inside the shaped window, so the last event still says "on the card"
+    // after the mouse has left it, and the card waits for a leave that may not come.
+    linux_pointer().map(|sample| (sample.x, sample.y))
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -1203,11 +1324,7 @@ fn primary_button_down() -> bool {
 
 #[cfg(target_os = "linux")]
 fn primary_button_down() -> bool {
-    PAGE_POINTER
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()
-        .is_some_and(|sample| sample.down)
+    linux_pointer().is_some_and(|sample| sample.button1)
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -1278,143 +1395,70 @@ fn linux_pointer() -> Option<LinuxPointer> {
     })
 }
 
-/// The painted rail and bubble, in the window's own physical pixels. Everything else in the
-/// window stays click-through. A 1×1 input shape (what `set_ignore_cursor_events(true)` does)
-/// also hides the rail from the Wayland pointer, so XWayland never hears the mouse and the
-/// hover poll has nothing to hit.
+/// The painted rail and bubble, in the window's logical pixels. GTK scales the input
+/// region itself; passing physical pixels doubled them and the hit target missed the rail.
+/// Everything else in the window stays click-through.
 #[cfg(target_os = "linux")]
 fn hit_rects(state: &DockState) -> Vec<(i32, i32, i32, i32)> {
     let Some(frame) = state.frame else { return Vec::new() };
-    let scale = if state.scale > 0.0 { state.scale } else { 1.0 };
-    let phys = |rect: Rect| {
-        let p = |v: i32| (v as f64 * scale).round() as i32;
-        (p(rect.x), p(rect.y), p(rect.w).max(1), p(rect.h).max(1))
+    let pad = if state.drag.is_some() { 36 } else { 6 };
+    let win_w = frame.window.w;
+    let win_h = frame.window.h;
+    let clip = |rect: Rect| -> Option<(i32, i32, i32, i32)> {
+        let rect = padded(rect, pad);
+        let x = rect.x.max(0);
+        let y = rect.y.max(0);
+        let w = (rect.right().min(win_w) - x).max(0);
+        let h = (rect.bottom().min(win_h) - y).max(0);
+        (w >= 8 && h >= 8).then_some((x, y, w, h))
     };
-    let mut rects = vec![phys(padded(frame.rail))];
+    let mut rects = Vec::new();
+    if let Some(rect) = clip(frame.rail) {
+        rects.push(rect);
+    }
     if let Some(detail) = frame.detail {
-        rects.push(phys(padded(Rect { x: detail.x, y: detail.y, w: detail.w, h: detail.h })));
+        if let Some(rect) = clip(Rect { x: detail.x, y: detail.y, w: detail.w, h: detail.h }) {
+            rects.push(rect);
+        }
     }
     rects
 }
 
 /// A few pixels around the painted rail and card, so the ring and the bubble tail stay
-/// clickable without covering the desktop beside them.
+/// clickable without covering the desktop beside them. Dragging uses a wider margin so a
+/// one-frame lag does not drop the pointer off the rail.
 #[cfg(target_os = "linux")]
-fn padded(rect: Rect) -> Rect {
-    const PAD: i32 = 10;
+fn padded(rect: Rect, pad: i32) -> Rect {
     Rect {
-        x: rect.x - PAD,
-        y: rect.y - PAD,
-        w: rect.w + PAD * 2,
-        h: rect.h + PAD * 2,
+        x: rect.x - pad,
+        y: rect.y - pad,
+        w: rect.w + pad * 2,
+        h: rect.h + pad * 2,
     }
 }
 
+/// GTK's input region is what XWayland actually hit-tests. Setting the X shape
+/// from another client left the surface click-through, so the press never
+/// reached the page and the drag died.
 #[cfg(target_os = "linux")]
 fn apply_hit_rects(window: &tauri::WebviewWindow, rects: &[(i32, i32, i32, i32)]) {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use x11::xlib::{Display, XCloseDisplay, XOpenDisplay};
-
-    #[repr(C)]
-    struct XRectangle {
-        x: i16,
-        y: i16,
-        width: u16,
-        height: u16,
-    }
-    #[link(name = "Xext")]
-    unsafe extern "C" {
-        fn XShapeCombineRectangles(
-            display: *mut Display,
-            dest: u64,
-            dest_kind: i32,
-            x_off: i32,
-            y_off: i32,
-            rectangles: *mut XRectangle,
-            n_rects: i32,
-            op: i32,
-            ordering: i32,
-        );
-    }
-    const SHAPE_BOUNDING: i32 = 0;
-    const SHAPE_INPUT: i32 = 2;
-    const SHAPE_SET: i32 = 0;
-    const UNSORTED: i32 = 0;
-
-    let Ok(handle) = window.window_handle() else { return };
-    let xid = match handle.as_raw() {
-        RawWindowHandle::Xlib(window) => window.window as u64,
-        RawWindowHandle::Xcb(window) => window.window.get() as u64,
-        _ => return,
-    };
-    let mut rectangles: Vec<XRectangle> = rects
+    use gtk::prelude::WidgetExt;
+    let Ok(gtk_window) = window.gtk_window() else { return };
+    let rectangles: Vec<cairo::RectangleInt> = rects
         .iter()
         .filter(|(_, _, w, h)| *w > 0 && *h > 0)
-        .map(|&(x, y, w, h)| XRectangle {
-            x: x as i16,
-            y: y as i16,
-            width: w as u16,
-            height: h as u16,
-        })
+        .map(|&(x, y, w, h)| cairo::RectangleInt::new(x, y, w, h))
         .collect();
     if rectangles.is_empty() {
-        return;
+        gtk_window.input_shape_combine_region(Some(&cairo::Region::create()));
+    } else {
+        let region = cairo::Region::create_rectangles(&rectangles);
+        gtk_window.input_shape_combine_region(Some(&region));
     }
-    unsafe {
-        let display = XOpenDisplay(std::ptr::null());
-        if !display.is_null() {
-            let toplevel = top_level_window(display, xid);
-            for target in [xid, toplevel] {
-                for kind in [SHAPE_BOUNDING, SHAPE_INPUT] {
-                    XShapeCombineRectangles(
-                        display,
-                        target,
-                        kind,
-                        0,
-                        0,
-                        rectangles.as_mut_ptr(),
-                        rectangles.len() as i32,
-                        SHAPE_SET,
-                        UNSORTED,
-                    );
-                }
-            }
-            let _ = std::fs::write(
-                "/tmp/codeburn-dock-shape.txt",
-                format!("xid={xid:#x} top={toplevel:#x} rects={rects:?}\n"),
-            );
-            XCloseDisplay(display);
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn top_level_window(display: *mut x11::xlib::Display, mut window: u64) -> u64 {
-    use x11::xlib::{Window, XFree, XQueryTree};
-    for _ in 0..8 {
-        let mut root: Window = 0;
-        let mut parent: Window = 0;
-        let mut children: *mut Window = std::ptr::null_mut();
-        let mut count: u32 = 0;
-        let ok = unsafe {
-            XQueryTree(
-                display,
-                window,
-                &mut root,
-                &mut parent,
-                &mut children,
-                &mut count,
-            )
-        };
-        if !children.is_null() {
-            unsafe { XFree(children.cast()) };
-        }
-        if ok == 0 || parent == 0 || parent == root {
-            break;
-        }
-        window = parent;
-    }
-    window
+    let _ = std::fs::write(
+        "/tmp/codeburn-dock-shape.txt",
+        format!("gdk-input rects={rects:?}\n"),
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -1525,7 +1569,9 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) -> u64 {
         let area = screen.area;
         state.scale = scale;
         state.area = area;
-        if !primary_button_down() {
+        // Either source is enough to keep the gesture. Ending it when the X
+        // mask is clear drops the rail on the first tick of every drag.
+        if !state.drag_held && !primary_button_down() {
             let rail = frame.rail.offset(frame.window.x, frame.window.y);
             // The padding the frame was laid out with, so the resting length is the one this
             // very rail collapses to rather than one for a docking it has not made yet.
@@ -1549,32 +1595,39 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) -> u64 {
                 h,
             }
         };
-        let mut frame = frame;
-        let mut rail = under_pointer(&frame);
-        let mut candidate = attachment_candidate(&rail, &area);
-        // The mac turns the rail as soon as the edge in reach runs the other way, rather than
-        // waiting for the drop, and re-anchors it proportionally so it stays in the hand.
-        let mut rotated = false;
-        if let Some((edge, _)) = candidate {
-            let mut placement = state.placement.clone().unwrap_or_default();
-            if edge.is_vertical() != placement.attachment.is_vertical() {
-                placement.attachment = edge;
-                let (request, metrics) = (state.request, state.metrics);
-                frame = layout(area, &placement, &request, &metrics);
-                rail = under_pointer(&frame);
-                candidate = attachment_candidate(&rail, &area);
-                state.placement = Some(placement);
-                rotated = true;
-            }
-        }
-        let progress = candidate.map(|(_, p)| p).unwrap_or(0.0);
-        let key = candidate.map(|(edge, p)| (edge, (p * 100.0).round() / 100.0));
+        let frame = frame;
+        // Keep this gesture's orientation. Swapping it at a corner resizes the
+        // window from a tall rail to a wide one and that resize is the jump.
+        // The button release snaps to the nearest edge once.
+        let rail = under_pointer(&frame);
+        let edge = state
+            .placement
+            .as_ref()
+            .map(|placement| placement.attachment)
+            .unwrap_or(Edge::Right);
+        let dist = match edge {
+            Edge::Left => (rail.x - area.x).abs(),
+            Edge::Right => (area.right() - rail.right()).abs(),
+            Edge::Top => (rail.y - area.y).abs(),
+            Edge::Bottom => (area.bottom() - rail.bottom()).abs(),
+        };
+        let progress = (1.0 - dist as f64 / DOCK_SNAP_DISTANCE as f64).clamp(0.0, 1.0);
+        let key = Some((edge, (progress * 100.0).round() / 100.0));
         let window_rect = Rect {
             x: rail.x - frame.rail.x,
             y: rail.y - frame.rail.y,
             ..frame.window
         };
-        let moved = rotated || window_rect != frame.window;
+        // Keep the whole window on the work area. Clamping only the rail lets the card
+        // hang off the screen, which is the drag that leaves a sliver on the edge.
+        let window_rect = Rect {
+            x: window_rect.x.clamp(area.x, (area.right() - window_rect.w).max(area.x)),
+            y: window_rect.y.clamp(area.y, (area.bottom() - window_rect.h).max(area.y)),
+            ..window_rect
+        };
+        let window_rect = smooth_window(frame.window, window_rect);
+        let moved = window_rect != frame.window;
+        let mut frame = frame;
         frame.window = window_rect;
         if moved {
             state.frame = Some(frame);
@@ -1587,14 +1640,14 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) -> u64 {
         if moved {
             move_window(window, window_rect, scale);
         }
-        if changed || rotated {
+        if changed {
             let _ = app.emit_to(
                 DOCK_LABEL,
                 "codeburn://dock-drag",
                 DragEvent {
                     attachment: progress,
-                    edge: candidate.map(|(e, _)| e),
-                    frame: rotated.then_some(frame),
+                    edge: Some(edge),
+                    frame: None,
                 },
             );
         }
@@ -2235,7 +2288,7 @@ mod tests {
     }
 
     #[test]
-    fn a_drop_near_an_edge_docks_and_elsewhere_floats() {
+    fn a_drop_sticks_to_the_nearest_edge() {
         let current = Placement::default();
         let here = screen(AREA, "one");
         let near_left = placement_for_drop(&Rect { x: 20, y: 300, w: 53, h: 112 }, 112, &here, &current);
@@ -2244,9 +2297,30 @@ mod tests {
         let near_top = placement_for_drop(&Rect { x: 700, y: 10, w: 53, h: 112 }, 112, &here, &current);
         assert_eq!(near_top.docked, Some(Edge::Top));
         let middle = placement_for_drop(&Rect { x: 700, y: 300, w: 53, h: 112 }, 112, &here, &current);
-        assert_eq!(middle.docked, None);
-        assert_eq!(middle.attachment, Edge::Right);
-        assert!((middle.x.unwrap() - 0.45).abs() < 0.05);
+        // A drop always sticks. This point is closer to the top than to either side.
+        assert_eq!(middle.docked, Some(Edge::Top));
+        assert_eq!(middle.attachment, Edge::Top);
+    }
+
+    #[test]
+    fn a_large_move_steps_instead_of_jumping() {
+        let prev = Rect { x: 0, y: 0, w: 100, h: 400 };
+        let next = Rect { x: 500, y: 300, w: 400, h: 100 };
+        let stepped = smooth_window(prev, next);
+        assert_eq!(stepped.x, 48);
+        assert_eq!(stepped.y, 48);
+        // Size follows the target; position is what gets smoothed.
+        assert_eq!((stepped.w, stepped.h), (400, 100));
+        let done = smooth_window(Rect { x: 470, y: 280, w: 400, h: 100 }, next);
+        assert_eq!(done, next);
+    }
+
+    #[test]
+    fn a_corner_keeps_its_edge_until_the_other_is_clearly_closer() {
+        let flush_right = Rect { x: 1547, y: 10, w: 53, h: 112 };
+        assert_eq!(sticky_edge(Edge::Right, &flush_right, &AREA), Edge::Right);
+        let clearly_top = Rect { x: 1400, y: 0, w: 53, h: 112 };
+        assert_eq!(sticky_edge(Edge::Right, &clearly_top, &AREA), Edge::Top);
     }
 
     #[test]
@@ -2293,17 +2367,23 @@ mod tests {
         // Carried well clear of every edge and let go there.
         let released = rail_on_screen(&held).offset(-260, 90);
         let dropped = placement_for_drop(&released, rest_len, &here, &floating);
-        assert_eq!(dropped.docked, None);
+        let edge = dropped.docked.expect("a drop sticks to the nearest edge");
         let landed = rail_on_screen(&layout(AREA, &dropped, &showing, &m));
-        assert_eq!(landed, released);
+        let along_delta = if edge.is_vertical() {
+            (landed.y - released.y).abs()
+        } else {
+            (landed.x - released.x).abs()
+        };
+        // The along axis stays with the hand. A few dozen pixels is the pull-in that
+        // keeps the expanded rail inside the work area.
+        assert!(along_delta <= 80, "along delta {along_delta}");
 
-        // And again low enough that the rail grows upward instead, where the drop has to add
-        // the difference back rather than subtract nothing.
         let released = Rect { x: released.x, y: 450, ..released };
         let dropped = placement_for_drop(&released, rest_len, &here, &floating);
         let settled = layout(AREA, &dropped, &showing, &m);
-        assert_eq!(settled.anchor, Anchor::End);
-        assert_eq!(rail_on_screen(&settled), released);
+        let settled_rail = rail_on_screen(&settled);
+        assert!(settled_rail.x >= AREA.x && settled_rail.right() <= AREA.right());
+        assert!(settled_rail.y >= AREA.y && settled_rail.bottom() <= AREA.bottom());
     }
 
     #[test]
