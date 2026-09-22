@@ -887,18 +887,16 @@ fn place_linux(window: &tauri::WebviewWindow, target: Rect) {
             ),
         );
         let _ = window.set_position(tauri::LogicalPosition::new(target.x as f64, target.y as f64));
+        sync_hit_shape(window);
         return;
     }
     let Ok(gtk_window) = window.gtk_window() else {
         let _ = window.set_position(tauri::LogicalPosition::new(target.x as f64, target.y as f64));
+        sync_hit_shape(window);
         return;
     };
     use gtk::prelude::WidgetExt;
     use gtk_layer_shell::{Edge as ShellEdge, Layer, LayerShell};
-    let Ok(gtk_window) = window.gtk_window() else {
-        let _ = window.set_position(tauri::LogicalPosition::new(target.x as f64, target.y as f64));
-        return;
-    };
     // Tauri realizes the GDK window while building it, and layer shell refuses to
     // initialize after that. Unrealize once so the compositor actually anchors it.
     if !gtk_window.is_layer_window() {
@@ -1292,16 +1290,24 @@ fn hit_rects(state: &DockState) -> Vec<(i32, i32, i32, i32)> {
         let p = |v: i32| (v as f64 * scale).round() as i32;
         (p(rect.x), p(rect.y), p(rect.w).max(1), p(rect.h).max(1))
     };
-    let mut rects = vec![phys(frame.rail)];
+    let mut rects = vec![phys(padded(frame.rail))];
     if let Some(detail) = frame.detail {
-        rects.push(phys(Rect { x: detail.x, y: detail.y, w: detail.w, h: detail.h }));
-    }
-    // While dragging, the window follows the rail. Cover the whole window so a fast move
-    // still lands on an X11 surface and the pointer poll keeps updating.
-    if state.drag.is_some() {
-        rects.push(phys(Rect { x: 0, y: 0, w: frame.window.w, h: frame.window.h }));
+        rects.push(phys(padded(Rect { x: detail.x, y: detail.y, w: detail.w, h: detail.h })));
     }
     rects
+}
+
+/// A few pixels around the painted rail and card, so the ring and the bubble tail stay
+/// clickable without covering the desktop beside them.
+#[cfg(target_os = "linux")]
+fn padded(rect: Rect) -> Rect {
+    const PAD: i32 = 10;
+    Rect {
+        x: rect.x - PAD,
+        y: rect.y - PAD,
+        w: rect.w + PAD * 2,
+        h: rect.h + PAD * 2,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1330,6 +1336,7 @@ fn apply_hit_rects(window: &tauri::WebviewWindow, rects: &[(i32, i32, i32, i32)]
             ordering: i32,
         );
     }
+    const SHAPE_BOUNDING: i32 = 0;
     const SHAPE_INPUT: i32 = 2;
     const SHAPE_SET: i32 = 0;
     const UNSORTED: i32 = 0;
@@ -1355,22 +1362,59 @@ fn apply_hit_rects(window: &tauri::WebviewWindow, rects: &[(i32, i32, i32, i32)]
     }
     unsafe {
         let display = XOpenDisplay(std::ptr::null());
-        if display.is_null() {
-            return;
+        if !display.is_null() {
+            let toplevel = top_level_window(display, xid);
+            for target in [xid, toplevel] {
+                for kind in [SHAPE_BOUNDING, SHAPE_INPUT] {
+                    XShapeCombineRectangles(
+                        display,
+                        target,
+                        kind,
+                        0,
+                        0,
+                        rectangles.as_mut_ptr(),
+                        rectangles.len() as i32,
+                        SHAPE_SET,
+                        UNSORTED,
+                    );
+                }
+            }
+            let _ = std::fs::write(
+                "/tmp/codeburn-dock-shape.txt",
+                format!("xid={xid:#x} top={toplevel:#x} rects={rects:?}\n"),
+            );
+            XCloseDisplay(display);
         }
-        XShapeCombineRectangles(
-            display,
-            xid,
-            SHAPE_INPUT,
-            0,
-            0,
-            rectangles.as_mut_ptr(),
-            rectangles.len() as i32,
-            SHAPE_SET,
-            UNSORTED,
-        );
-        XCloseDisplay(display);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn top_level_window(display: *mut x11::xlib::Display, mut window: u64) -> u64 {
+    use x11::xlib::{Window, XFree, XQueryTree};
+    for _ in 0..8 {
+        let mut root: Window = 0;
+        let mut parent: Window = 0;
+        let mut children: *mut Window = std::ptr::null_mut();
+        let mut count: u32 = 0;
+        let ok = unsafe {
+            XQueryTree(
+                display,
+                window,
+                &mut root,
+                &mut parent,
+                &mut children,
+                &mut count,
+            )
+        };
+        if !children.is_null() {
+            unsafe { XFree(children.cast()) };
+        }
+        if ok == 0 || parent == 0 || parent == root {
+            break;
+        }
+        window = parent;
+    }
+    window
 }
 
 #[cfg(target_os = "linux")]
@@ -1443,8 +1487,25 @@ fn poll_interval_ms(distance: i32, engaged: bool) -> u64 {
 
 /// One tick of pointer tracking: drives a drag in progress, else hit-tests the painted
 /// shapes for hover and click-through. Returns how long to wait before the next one.
+fn clear_hover(app: &AppHandle) {
+    let mut state = lock();
+    let pointer = Pointer::default();
+    if state.pointer == pointer {
+        return;
+    }
+    state.pointer = pointer;
+    state.press = None;
+    drop(state);
+    let _ = app.emit_to(DOCK_LABEL, "codeburn://dock-pointer", pointer);
+}
+
 fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) -> u64 {
-    let Some((cx, cy)) = cursor_position() else { return POLL_FAR_MS };
+    let Some((cx, cy)) = cursor_position() else {
+        // The pointer left the shaped rail. Leaving the last sample in place keeps the
+        // provider card open over empty desktop.
+        clear_hover(app);
+        return POLL_FAR_MS;
+    };
     let mut state = lock();
     let Some(frame) = state.frame else { return POLL_FAR_MS };
 
@@ -1772,6 +1833,15 @@ pub fn show(app: &AppHandle) -> tauri::Result<()> {
             last.clear();
         }
         sync_hit_shape(&window);
+        let later = window.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if let Ok(mut last) = HIT_SHAPE.lock() {
+                last.clear();
+            }
+            let again = later.clone();
+            let _ = later.run_on_main_thread(move || sync_hit_shape(&again));
+        });
     }
     // Whether or not this call built the window: a window kept from a dock that was switched
     // off and straight back on can have outlived the thread that was tracking it, and the
