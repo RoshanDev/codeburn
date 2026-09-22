@@ -879,6 +879,13 @@ fn move_window(window: &tauri::WebviewWindow, target: Rect, scale: f64) {
 fn place_linux(window: &tauri::WebviewWindow, target: Rect) {
     let _ = window.set_size(tauri::LogicalSize::new(target.w.max(1) as f64, target.h.max(1) as f64));
     if !gtk_layer_shell::is_supported() {
+        let _ = std::fs::write(
+            "/tmp/codeburn-dock-place.txt",
+            format!(
+                "layer-shell unsupported; logical move {},{} {}x{}\n",
+                target.x, target.y, target.w, target.h
+            ),
+        );
         let _ = window.set_position(tauri::LogicalPosition::new(target.x as f64, target.y as f64));
         return;
     }
@@ -886,12 +893,19 @@ fn place_linux(window: &tauri::WebviewWindow, target: Rect) {
         let _ = window.set_position(tauri::LogicalPosition::new(target.x as f64, target.y as f64));
         return;
     };
+    use gtk::prelude::WidgetExt;
     use gtk_layer_shell::{Edge as ShellEdge, Layer, LayerShell};
-    static READY: AtomicBool = AtomicBool::new(false);
-    if READY
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
+    let Ok(gtk_window) = window.gtk_window() else {
+        let _ = window.set_position(tauri::LogicalPosition::new(target.x as f64, target.y as f64));
+        return;
+    };
+    // Tauri realizes the GDK window while building it, and layer shell refuses to
+    // initialize after that. Unrealize once so the compositor actually anchors it.
+    if !gtk_window.is_layer_window() {
+        if gtk_window.is_realized() {
+            gtk_window.hide();
+            gtk_window.unrealize();
+        }
         gtk_window.init_layer_shell();
         gtk_window.set_layer(Layer::Overlay);
         gtk_window.set_namespace("codeburn-dock");
@@ -943,6 +957,18 @@ fn place_linux(window: &tauri::WebviewWindow, target: Rect) {
             gtk_window.set_layer_shell_margin(ShellEdge::Top, target.y.max(0));
         }
     }
+    let _ = std::fs::write(
+        "/tmp/codeburn-dock-place.txt",
+        format!(
+            "layer={} target={},{} {}x{} docked={:?}\n",
+            gtk_window.is_layer_window(),
+            target.x,
+            target.y,
+            target.w,
+            target.h,
+            placement.docked
+        ),
+    );
 }
 
 /// Recomputes the layout from the stored placement and request, moving the window only when
@@ -1847,8 +1873,17 @@ fn next_generation() -> u64 {
 
 /// Destroying the window while the rail is still on screen makes it vanish rather than leave,
 /// so the page is asked to retract first and calls `dock_close` when it has. This only arms
-/// the timer that keeps a stuck page from holding the window open.
+/// the timer that keeps a stuck page from holding the window open. On Linux the layer-shell
+/// surface ignores that handshake and stays mapped, so hide removes the window immediately.
 pub fn hide(app: &AppHandle) {
+    #[cfg(target_os = "linux")]
+    {
+        next_generation();
+        destroy_window(app);
+        return;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
     let Some(window) = app.get_webview_window(DOCK_LABEL) else {
         return;
     };
@@ -1881,6 +1916,7 @@ pub fn hide(app: &AppHandle) {
             }
         });
     });
+    }
 }
 
 /// Whether a close still belongs to the window that is up. The page carries back the number its
