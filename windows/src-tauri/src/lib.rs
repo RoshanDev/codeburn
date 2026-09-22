@@ -260,6 +260,7 @@ pub fn run() {
             commands::dock_context_menu,
             commands::dock_close,
             commands::dock_begin_drag,
+            commands::dock_pointer_sample,
             commands::dock_prefs,
             commands::set_dock_prefs,
             commands::open_settings_window,
@@ -867,7 +868,24 @@ fn position_popover(window: &tauri::WebviewWindow, anchor: Option<(i32, i32)>) {
         (area_y + area_h - pop_h - margin).max(area_y + margin)
     };
 
-    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+    // Work-area numbers are physical. On Linux the window scale and the monitor scale
+    // disagree under fractional/200% scaling, and a physical position then lands off
+    // screen, which is the flame icon appearing to do nothing.
+    #[cfg(target_os = "linux")]
+    {
+        let _ = window.set_size(tauri::LogicalSize::new(
+            POPOVER_WIDTH_LOGICAL,
+            POPOVER_HEIGHT_LOGICAL,
+        ));
+        let _ = window.set_position(tauri::LogicalPosition::new(
+            x as f64 / scale,
+            y as f64 / scale,
+        ));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+    }
 }
 
 mod commands {
@@ -1213,6 +1231,17 @@ mod commands {
     #[tauri::command]
     pub fn dock_begin_drag(app: AppHandle, x: i32, y: i32) {
         crate::dock::begin_drag(&app, (x, y));
+    }
+
+    /// Linux only: the dock page forwarding the real pointer, because the X11 cursor is not it.
+    #[tauri::command]
+    pub fn dock_pointer_sample(app: AppHandle, x: f64, y: f64, down: bool, present: bool) {
+        #[cfg(target_os = "linux")]
+        if let Some(window) = app.get_webview_window(crate::dock::DOCK_LABEL) {
+            crate::dock::note_page_pointer(&window, x, y, down, present);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (app, x, y, down, present);
     }
 
     #[tauri::command]

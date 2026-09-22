@@ -845,6 +845,31 @@ export function Dock() {
     return () => cancelAnimationFrame(raf)
   }, [frame, presence])
 
+  // The Linux cursor poll cannot see the Wayland mouse, so the page forwards the pointer it
+  // actually receives. Coordinates stay CSS pixels; Rust scales them onto the screen.
+  useEffect(() => {
+    const send = (event: PointerEvent, present: boolean) => {
+      void invoke('dock_pointer_sample', {
+        x: event.clientX,
+        y: event.clientY,
+        down: (event.buttons & 1) !== 0,
+        present,
+      })
+    }
+    const move = (event: PointerEvent) => send(event, true)
+    const leave = (event: PointerEvent) => send(event, false)
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerdown', move)
+    window.addEventListener('pointerup', move)
+    window.addEventListener('pointerleave', leave)
+    return () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerdown', move)
+      window.removeEventListener('pointerup', move)
+      window.removeEventListener('pointerleave', leave)
+    }
+  }, [])
+
   // Rust asks before it destroys the window, so the rail can go back into the edge rather than
   // vanish. The bubble goes first, then the rail retracts, then the window is released. Rust
   // keeps its own timer, so a page that never gets here costs a moment, not a stuck window.

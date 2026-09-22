@@ -22,12 +22,11 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 pub const DOCK_LABEL: &str = "dock";
 
-/// The dock is a Windows surface. Its window is a transparent, always-on-top rectangle far
-/// larger than the rail it paints, and what keeps it from swallowing every click that lands in
-/// the empty part is the user32 cursor tracking below. No other platform has that counterpart
-/// here: the Linux tray runs its own SNI menu and never had a dock. So off Windows the dock is
-/// simply not there, rather than a window nobody can see and nobody can click through.
-pub const AVAILABLE: bool = cfg!(target_os = "windows");
+/// The dock window is a transparent, always-on-top rectangle far larger than the rail it
+/// paints. Click-through depends on a cursor poll that hit-tests the painted shapes: user32
+/// on Windows, XQueryPointer on Linux (including XWayland). macOS keeps the Swift dock, so
+/// this Tauri window stays off there.
+pub const AVAILABLE: bool = cfg!(any(target_os = "windows", target_os = "linux"));
 
 /// The size scale the settings window writes, from CapacityDockPreferences.scaleRange.
 pub const MIN_SCALE: f64 = 0.6;
@@ -435,7 +434,7 @@ pub fn layout(area: Rect, placement: &Placement, request: &LayoutRequest, m: &Me
             let local = rect.offset(-window.x, -window.y);
             DetailFrame { x: local.x, y: local.y, w: local.w, h: local.h, tail }
         }),
-        native_pointer: cfg!(target_os = "windows"),
+        native_pointer: cfg!(any(target_os = "windows", target_os = "linux")),
     }
 }
 
@@ -853,9 +852,97 @@ fn move_window(window: &tauri::WebviewWindow, target: Rect, scale: f64) {
 
 #[cfg(not(target_os = "windows"))]
 fn move_window(window: &tauri::WebviewWindow, target: Rect, scale: f64) {
-    let physical = |v: i32| (v as f64 * scale).round() as i32;
-    let _ = window.set_size(tauri::PhysicalSize::new(physical(target.w).max(1) as u32, physical(target.h).max(1) as u32));
-    let _ = window.set_position(tauri::PhysicalPosition::new(physical(target.x), physical(target.y)));
+    // The layout rect is in logical pixels. Multiplying by the monitor scale and then
+    // handing Tauri a physical position divides by the window scale again, and on a 200%
+    // display those two scales disagree, so the rail lands in the middle of the screen.
+    #[cfg(target_os = "linux")]
+    {
+        let _ = scale;
+        place_linux(window, target);
+        return;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let physical = |v: i32| (v as f64 * scale).round() as i32;
+        let _ = window.set_size(tauri::PhysicalSize::new(
+            physical(target.w).max(1) as u32,
+            physical(target.h).max(1) as u32,
+        ));
+        let _ = window.set_position(tauri::PhysicalPosition::new(physical(target.x), physical(target.y)));
+    }
+}
+
+/// Anchors the rail to a screen edge in compositor coordinates, so a 200% display keeps it
+/// flush instead of treating our physical pixels as logical ones. Wayland ignores a normal
+/// window's `move`, which is why the rail was opening in the middle.
+#[cfg(target_os = "linux")]
+fn place_linux(window: &tauri::WebviewWindow, target: Rect) {
+    let _ = window.set_size(tauri::LogicalSize::new(target.w.max(1) as f64, target.h.max(1) as f64));
+    if !gtk_layer_shell::is_supported() {
+        let _ = window.set_position(tauri::LogicalPosition::new(target.x as f64, target.y as f64));
+        return;
+    }
+    let Ok(gtk_window) = window.gtk_window() else {
+        let _ = window.set_position(tauri::LogicalPosition::new(target.x as f64, target.y as f64));
+        return;
+    };
+    use gtk_layer_shell::{Edge as ShellEdge, Layer, LayerShell};
+    static READY: AtomicBool = AtomicBool::new(false);
+    if READY
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        gtk_window.init_layer_shell();
+        gtk_window.set_layer(Layer::Overlay);
+        gtk_window.set_namespace("codeburn-dock");
+        gtk_window.set_exclusive_zone(0);
+        gtk_window.set_keyboard_mode(gtk_layer_shell::KeyboardMode::None);
+    }
+    let (placement, area) = {
+        let state = lock();
+        (
+            state.placement.clone().unwrap_or_default(),
+            state.area,
+        )
+    };
+    for edge in [ShellEdge::Left, ShellEdge::Right, ShellEdge::Top, ShellEdge::Bottom] {
+        gtk_window.set_anchor(edge, false);
+        gtk_window.set_layer_shell_margin(edge, 0);
+    }
+    let top = (target.y - area.y).max(0);
+    let left = (target.x - area.x).max(0);
+    let right = (area.right() - target.right()).max(0);
+    let bottom = (area.bottom() - target.bottom()).max(0);
+    match placement.docked {
+        Some(Edge::Right) | Some(Edge::Left) => {
+            let edge = if placement.docked == Some(Edge::Left) {
+                ShellEdge::Left
+            } else {
+                ShellEdge::Right
+            };
+            gtk_window.set_anchor(edge, true);
+            gtk_window.set_anchor(ShellEdge::Top, true);
+            gtk_window.set_layer_shell_margin(edge, if edge == ShellEdge::Left { left } else { right });
+            gtk_window.set_layer_shell_margin(ShellEdge::Top, top);
+        }
+        Some(Edge::Top) | Some(Edge::Bottom) => {
+            let edge = if placement.docked == Some(Edge::Top) {
+                ShellEdge::Top
+            } else {
+                ShellEdge::Bottom
+            };
+            gtk_window.set_anchor(edge, true);
+            gtk_window.set_anchor(ShellEdge::Left, true);
+            gtk_window.set_layer_shell_margin(edge, if edge == ShellEdge::Top { top } else { bottom });
+            gtk_window.set_layer_shell_margin(ShellEdge::Left, left);
+        }
+        None => {
+            gtk_window.set_anchor(ShellEdge::Left, true);
+            gtk_window.set_anchor(ShellEdge::Top, true);
+            gtk_window.set_layer_shell_margin(ShellEdge::Left, target.x.max(0));
+            gtk_window.set_layer_shell_margin(ShellEdge::Top, target.y.max(0));
+        }
+    }
 }
 
 /// Recomputes the layout from the stored placement and request, moving the window only when
@@ -1002,8 +1089,15 @@ pub fn begin_drag(app: &AppHandle, anchor: (i32, i32)) {
     drop(state);
     // Recorded the same way the tick does it, so a call that fails here leaves the state unknown
     // and the next tick asks again rather than trusting a window that never took the change.
-    let ok = window.set_ignore_cursor_events(false).is_ok();
-    lock().ignoring = ignore_after_call(false, ok);
+    // Linux keeps an input shape around the rail instead of this on/off switch: a fully
+    // click-through XWayland window never sees the Wayland pointer, so hover and drag die.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let ok = window.set_ignore_cursor_events(false).is_ok();
+        lock().ignoring = ignore_after_call(false, ok);
+    }
+    #[cfg(target_os = "linux")]
+    sync_hit_shape(&window);
     let _ = app.emit_to(
         DOCK_LABEL,
         "codeburn://dock-drag",
@@ -1019,7 +1113,60 @@ fn cursor_position() -> Option<(i32, i32)> {
     (unsafe { GetCursorPos(&mut point) } != 0).then_some((point.x, point.y))
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+struct PagePointer {
+    x: i32,
+    y: i32,
+    down: bool,
+}
+
+/// The Wayland pointer, as the dock page last saw it. XQueryPointer only follows the X11
+/// cursor, which on this session is not the mouse the user is holding, so hover and drag
+/// read this sample instead.
+#[cfg(target_os = "linux")]
+static PAGE_POINTER: Mutex<Option<PagePointer>> = Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+pub fn note_page_pointer(
+    window: &tauri::WebviewWindow,
+    local_x: f64,
+    local_y: f64,
+    down: bool,
+    present: bool,
+) {
+    let mut slot = PAGE_POINTER.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !present {
+        *slot = None;
+        return;
+    }
+    let scale = window.scale_factor().unwrap_or(1.0);
+    // Wayland does not tell a client where the compositor put it, so the layout origin
+    // is the position we asked for. outer_position() stays at the origin and the drag
+    // never leaves the corner.
+    let origin = {
+        let state = lock();
+        state
+            .frame
+            .map(|frame| (frame.window.x, frame.window.y))
+            .unwrap_or((0, 0))
+    };
+    *slot = Some(PagePointer {
+        x: ((origin.0 as f64 + local_x) * scale).round() as i32,
+        y: ((origin.1 as f64 + local_y) * scale).round() as i32,
+        down,
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn cursor_position() -> Option<(i32, i32)> {
+    PAGE_POINTER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|sample| (sample.x, sample.y))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn cursor_position() -> Option<(i32, i32)> {
     None
 }
@@ -1030,9 +1177,194 @@ fn primary_button_down() -> bool {
     (unsafe { GetAsyncKeyState(VK_LBUTTON as i32) } as u16) & 0x8000 != 0
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+fn primary_button_down() -> bool {
+    PAGE_POINTER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_some_and(|sample| sample.down)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn primary_button_down() -> bool {
     false
+}
+
+/// One X11 pointer sample. The display stays open on the cursor thread; a failed query
+/// drops it so the next tick can reconnect. Coordinates are root-window pixels, which
+/// match an X11 or XWayland window (`GDK_BACKEND=x11`).
+#[cfg(target_os = "linux")]
+struct LinuxPointer {
+    x: i32,
+    y: i32,
+    button1: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pointer() -> Option<LinuxPointer> {
+    use std::cell::Cell;
+    use x11::xlib::{
+        Button1Mask, Display, XCloseDisplay, XDefaultRootWindow, XOpenDisplay, XQueryPointer,
+    };
+
+    thread_local! {
+        static DISPLAY: Cell<*mut Display> = const { Cell::new(std::ptr::null_mut()) };
+    }
+
+    DISPLAY.with(|slot| {
+        let mut display = slot.get();
+        if display.is_null() {
+            display = unsafe { XOpenDisplay(std::ptr::null()) };
+            if display.is_null() {
+                return None;
+            }
+            slot.set(display);
+        }
+        let mut root_ret: x11::xlib::Window = 0;
+        let mut child: x11::xlib::Window = 0;
+        let mut root_x = 0;
+        let mut root_y = 0;
+        let mut win_x = 0;
+        let mut win_y = 0;
+        let mut mask: std::os::raw::c_uint = 0;
+        let ok = unsafe {
+            XQueryPointer(
+                display,
+                XDefaultRootWindow(display),
+                &mut root_ret,
+                &mut child,
+                &mut root_x,
+                &mut root_y,
+                &mut win_x,
+                &mut win_y,
+                &mut mask,
+            )
+        };
+        if ok == 0 {
+            unsafe { XCloseDisplay(display) };
+            slot.set(std::ptr::null_mut());
+            return None;
+        }
+        Some(LinuxPointer {
+            x: root_x,
+            y: root_y,
+            button1: mask & Button1Mask != 0,
+        })
+    })
+}
+
+/// The painted rail and bubble, in the window's own physical pixels. Everything else in the
+/// window stays click-through. A 1×1 input shape (what `set_ignore_cursor_events(true)` does)
+/// also hides the rail from the Wayland pointer, so XWayland never hears the mouse and the
+/// hover poll has nothing to hit.
+#[cfg(target_os = "linux")]
+fn hit_rects(state: &DockState) -> Vec<(i32, i32, i32, i32)> {
+    let Some(frame) = state.frame else { return Vec::new() };
+    let scale = if state.scale > 0.0 { state.scale } else { 1.0 };
+    let phys = |rect: Rect| {
+        let p = |v: i32| (v as f64 * scale).round() as i32;
+        (p(rect.x), p(rect.y), p(rect.w).max(1), p(rect.h).max(1))
+    };
+    let mut rects = vec![phys(frame.rail)];
+    if let Some(detail) = frame.detail {
+        rects.push(phys(Rect { x: detail.x, y: detail.y, w: detail.w, h: detail.h }));
+    }
+    // While dragging, the window follows the rail. Cover the whole window so a fast move
+    // still lands on an X11 surface and the pointer poll keeps updating.
+    if state.drag.is_some() {
+        rects.push(phys(Rect { x: 0, y: 0, w: frame.window.w, h: frame.window.h }));
+    }
+    rects
+}
+
+#[cfg(target_os = "linux")]
+fn apply_hit_rects(window: &tauri::WebviewWindow, rects: &[(i32, i32, i32, i32)]) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use x11::xlib::{Display, XCloseDisplay, XOpenDisplay};
+
+    #[repr(C)]
+    struct XRectangle {
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    }
+    #[link(name = "Xext")]
+    unsafe extern "C" {
+        fn XShapeCombineRectangles(
+            display: *mut Display,
+            dest: u64,
+            dest_kind: i32,
+            x_off: i32,
+            y_off: i32,
+            rectangles: *mut XRectangle,
+            n_rects: i32,
+            op: i32,
+            ordering: i32,
+        );
+    }
+    const SHAPE_INPUT: i32 = 2;
+    const SHAPE_SET: i32 = 0;
+    const UNSORTED: i32 = 0;
+
+    let Ok(handle) = window.window_handle() else { return };
+    let xid = match handle.as_raw() {
+        RawWindowHandle::Xlib(window) => window.window as u64,
+        RawWindowHandle::Xcb(window) => window.window.get() as u64,
+        _ => return,
+    };
+    let mut rectangles: Vec<XRectangle> = rects
+        .iter()
+        .filter(|(_, _, w, h)| *w > 0 && *h > 0)
+        .map(|&(x, y, w, h)| XRectangle {
+            x: x as i16,
+            y: y as i16,
+            width: w as u16,
+            height: h as u16,
+        })
+        .collect();
+    if rectangles.is_empty() {
+        return;
+    }
+    unsafe {
+        let display = XOpenDisplay(std::ptr::null());
+        if display.is_null() {
+            return;
+        }
+        XShapeCombineRectangles(
+            display,
+            xid,
+            SHAPE_INPUT,
+            0,
+            0,
+            rectangles.as_mut_ptr(),
+            rectangles.len() as i32,
+            SHAPE_SET,
+            UNSORTED,
+        );
+        XCloseDisplay(display);
+    }
+}
+
+#[cfg(target_os = "linux")]
+static HIT_SHAPE: Mutex<Vec<(i32, i32, i32, i32)>> = Mutex::new(Vec::new());
+
+#[cfg(target_os = "linux")]
+fn sync_hit_shape(window: &tauri::WebviewWindow) {
+    let rects = hit_rects(&lock());
+    if rects.is_empty() {
+        return;
+    }
+    {
+        let mut last = HIT_SHAPE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *last == rects {
+            return;
+        }
+        *last = rects.clone();
+    }
+    let hosted = window.clone();
+    let _ = window.run_on_main_thread(move || apply_hit_rects(&hosted, &rects));
 }
 
 /// How far a point lies outside a rectangle, along whichever axis it is furthest out on, and
@@ -1211,7 +1543,9 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) -> u64 {
     let press = press_state(state.press, primary_button_down(), on_dock);
     state.press = press;
     let engaged = on_dock || press == Some(true);
+    #[cfg(not(target_os = "linux"))]
     let ignore = !engaged;
+    #[cfg(not(target_os = "linux"))]
     let needs_call = ignore_needs_call(state.ignoring, ignore);
     // Measured against the window rather than the rail: the window is the whole region the
     // dock can paint into, bubble included, so a pointer outside it cannot be hovering
@@ -1219,6 +1553,9 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) -> u64 {
     let distance = distance_to(&frame.window, cursor.0, cursor.1);
     drop(state);
 
+    #[cfg(target_os = "linux")]
+    sync_hit_shape(window);
+    #[cfg(not(target_os = "linux"))]
     if needs_call {
         let ok = window.set_ignore_cursor_events(ignore).is_ok();
         lock().ignoring = ignore_after_call(ignore, ok);
@@ -1234,6 +1571,11 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) -> u64 {
 /// and the taskbar moving or hiding all move at least one of them. Three user32 reads, with no
 /// trip through the event loop, which is what asking the window for its monitor list would
 /// cost a second.
+#[cfg(target_os = "linux")]
+fn display_signature() -> [i32; 9] {
+    [0; 9]
+}
+
 #[cfg(target_os = "windows")]
 fn display_signature() -> [i32; 9] {
     use windows_sys::Win32::Foundation::RECT;
@@ -1268,16 +1610,21 @@ static TRACKER_RUNNING: AtomicBool = AtomicBool::new(false);
 /// click-through on the way out. If the window is still there, tracking it is still wanted, so
 /// a fresh thread takes over: without this, a tracker that ended in the moment between one
 /// window being destroyed and the next being built would never be replaced.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 struct TrackerGuard(AppHandle);
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 impl Drop for TrackerGuard {
     fn drop(&mut self) {
         TRACKER_RUNNING.store(false, Ordering::SeqCst);
         lock().ignoring = None;
-        let Some(window) = self.0.get_webview_window(DOCK_LABEL) else { return };
-        let _ = window.set_ignore_cursor_events(true);
+        if self.0.get_webview_window(DOCK_LABEL).is_none() {
+            return;
+        }
+        #[cfg(not(target_os = "linux"))]
+        if let Some(window) = self.0.get_webview_window(DOCK_LABEL) {
+            let _ = window.set_ignore_cursor_events(true);
+        }
         spawn_pointer_tracking(self.0.clone());
     }
 }
@@ -1286,7 +1633,7 @@ impl Drop for TrackerGuard {
 /// would starve, at a rate that follows the pointer: fast on and around the dock, slow while it
 /// is elsewhere. Once a second the same thread checks whether the desktop itself has changed
 /// shape, which is the Windows counterpart of the mac's didChangeScreenParameters observer.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn spawn_pointer_tracking(app: AppHandle) {
     // One tracker at a time, and a new one whenever the last has gone.
     if TRACKER_RUNNING
@@ -1327,6 +1674,7 @@ fn spawn_pointer_tracking(app: AppHandle) {
         });
     if spawned.is_err() {
         TRACKER_RUNNING.store(false, Ordering::SeqCst);
+        #[cfg(not(target_os = "linux"))]
         if let Some(window) = app.get_webview_window(DOCK_LABEL) {
             let _ = window.set_ignore_cursor_events(true);
         }
@@ -1371,7 +1719,10 @@ pub fn show(app: &AppHandle) -> tauri::Result<()> {
             let window = builder.build()?;
             // Click-through from its very first frame: the painted shapes are a sliver of this
             // window, and until the first cursor read says otherwise everything in it would
-            // swallow clicks meant for whatever is behind.
+            // swallow clicks meant for whatever is behind. On Linux the request is applied on
+            // the GTK loop and panics if it runs before the window is realized, so it is sent
+            // after `show` instead.
+            #[cfg(not(target_os = "linux"))]
             let _ = window.set_ignore_cursor_events(true);
             window
         }
@@ -1389,10 +1740,17 @@ pub fn show(app: &AppHandle) -> tauri::Result<()> {
     }
     relayout(&window);
     window.show()?;
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(mut last) = HIT_SHAPE.lock() {
+            last.clear();
+        }
+        sync_hit_shape(&window);
+    }
     // Whether or not this call built the window: a window kept from a dock that was switched
     // off and straight back on can have outlived the thread that was tracking it, and the
     // spawn is a no-op while one is already running.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     spawn_pointer_tracking(app.clone());
     // A reused window is one that was told to retract and is playing that now. It has to be
     // told the retract is off, or the rail would sit tucked behind its edge until the next
@@ -1579,7 +1937,15 @@ pub fn popup_context_menu(app: &AppHandle) -> tauri::Result<()> {
     let edges = Submenu::with_items(app, "Dock to Edge", true, &[&left, &right, &top, &bottom])?;
     let hide = MenuItem::with_id(app, "dock_hide", "Hide Capacity Dock", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&refresh, &edges, &hide])?;
-    menu.popup(window.as_ref().window())
+    // Popup at the rail, in the window's own logical pixels. The cursor position GTK
+    // reports on a scaled Wayland display is not where the pointer is, so a bare popup
+    // opens in the middle of the screen.
+    let at = lock().frame.map(|frame| (frame.rail.x, frame.rail.y));
+    if let Some((x, y)) = at {
+        window.popup_menu_at(&menu, tauri::LogicalPosition::new(x as f64, y as f64))
+    } else {
+        menu.popup(window.as_ref().window())
+    }
 }
 
 #[cfg(test)]

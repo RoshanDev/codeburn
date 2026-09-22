@@ -33,6 +33,10 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Globali
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = "0.3"
 png = "0.17"
+gtk = "0.18"
+gtk-layer-shell = { version = "0.8", features = ["v0_6"] }
+x11 = { version = "2.21.0", features = ["xlib"] }
+raw-window-handle = "0.6"
 
 [features]
 default = ["custom-protocol"]
