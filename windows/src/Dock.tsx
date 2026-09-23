@@ -797,7 +797,10 @@ export function Dock() {
         cancel('detailDismiss')
         setDetailPhase('shown')
       } else if (!hovering) {
-        if (!interactionRef.current.railHovered) hideDetail()
+        // `pointerRef` already holds this sample. `interactionRef` still has the
+        // previous rail hover, so a leave that clears the card and the rail in
+        // one event would skip the dismiss and wait on the collapse timer.
+        if (!pointerRef.current.railHovered) hideDetail()
         scheduleCollapse()
       }
     },
@@ -863,15 +866,23 @@ export function Dock() {
       if (event.buttons & 1) return
       send(event, false)
     }
+    // `pointerout` with nowhere to go is the same leave. WebKit sometimes
+    // skips `pointerleave` when the cursor crosses from the input shape onto
+    // a Wayland window, and that is the sample the card was waiting on.
+    const out = (event: PointerEvent) => {
+      if (event.relatedTarget == null) leave(event)
+    }
     window.addEventListener('pointermove', move)
     window.addEventListener('pointerdown', move)
     window.addEventListener('pointerup', move)
     window.addEventListener('pointerleave', leave)
+    window.addEventListener('pointerout', out)
     return () => {
       window.removeEventListener('pointermove', move)
       window.removeEventListener('pointerdown', move)
       window.removeEventListener('pointerup', move)
       window.removeEventListener('pointerleave', leave)
+      window.removeEventListener('pointerout', out)
     }
   }, [])
 

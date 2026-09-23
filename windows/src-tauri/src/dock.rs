@@ -816,6 +816,11 @@ struct DockState {
     /// XWayland's `XQueryPointer` button mask stays clear while the button is held,
     /// and trusting that alone settled the drag on the next tick: the rail vanished.
     drag_held: bool,
+    /// Where the page last saw the pointer, in window logical pixels.
+    /// `None` means it left the shaped window. XWayland keeps reporting the last
+    /// point inside the card after the real pointer has moved onto a Wayland
+    /// window, so hover must not be derived from that sample while this is absent.
+    page_local: Option<(i32, i32)>,
 }
 
 static STATE: Mutex<DockState> = Mutex::new(DockState {
@@ -844,6 +849,7 @@ static STATE: Mutex<DockState> = Mutex::new(DockState {
     press: None,
     drag: None,
     drag_held: false,
+    page_local: None,
 });
 
 fn lock() -> std::sync::MutexGuard<'static, DockState> {
@@ -1033,14 +1039,38 @@ fn place_linux(window: &tauri::WebviewWindow, target: Rect) {
     if size_changed {
         // A resize configure puts the old origin back. Move again once that has landed,
         // or the ball stays where the wide window's left edge was.
+        // The resize itself can be dropped too: after a drag the window stayed at the
+        // rail's 200x570 while the page painted the top-docked ball 700 px to the
+        // right, outside it. Check what GTK actually has and ask again if it is short.
         let again = window.clone();
+        let placed = (x, y, target.w, target.h);
+        let (w, h) = (target.w.max(1), target.h.max(1));
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            let hosted = again.clone();
-            let _ = again.run_on_main_thread(move || {
-                let _ = hosted.set_position(tauri::LogicalPosition::new(x as f64, y as f64));
-                sync_hit_shape(&hosted);
-            });
+            for delay in [50, 150, 300] {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+                // A newer placement owns the window now.
+                if *LAST_PLACE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) != Some(placed) {
+                    return;
+                }
+                let hosted = again.clone();
+                let _ = again.run_on_main_thread(move || {
+                    use gtk::prelude::GtkWindowExt;
+                    if let Ok(gtk_window) = hosted.gtk_window() {
+                        let (aw, ah) = gtk_window.size();
+                        if aw < w || ah < h {
+                            crate::log_line!(
+                                "codeburn dock: window is {aw}x{ah}, wanted {w}x{h}; resizing again"
+                            );
+                            gtk_window.resize(w, h);
+                        }
+                    }
+                    let _ = hosted.set_position(tauri::LogicalPosition::new(x as f64, y as f64));
+                    if let Ok(mut last) = HIT_SHAPE.lock() {
+                        last.clear();
+                    }
+                    sync_hit_shape(&hosted);
+                });
+            }
         });
     }
     // Drag runs on the pointer thread. GTK, including the layer-shell support
@@ -1352,12 +1382,20 @@ pub fn note_page_pointer(
         lock().drag_held = false;
     }
     let mut start_drag = None;
+    if !present {
+        {
+            let mut slot = PAGE_POINTER.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot = None;
+        }
+        // The shaped window stops delivering moves once the pointer leaves it.
+        // XQueryPointer stays on the last point inside the card, and the next
+        // poll would cancel this dismiss by reporting the bubble still hovered.
+        lock().page_local = None;
+        clear_hover(app);
+        return;
+    }
     {
         let mut slot = PAGE_POINTER.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !present {
-            *slot = None;
-            return;
-        }
         let (origin, scale, on_rail, dragging) = {
             let state = lock();
             let scale = if state.scale > 0.0 { state.scale } else { 1.0 };
@@ -1399,17 +1437,36 @@ pub fn note_page_pointer(
             press,
         });
     }
+    lock().page_local = Some((local_x.round() as i32, local_y.round() as i32));
     if let Some(anchor) = start_drag {
         begin_drag(app, anchor);
     }
+    // Publish from the page sample now. Waiting for the poll lets a stuck X11
+    // point put the bubble back before this position is ever read.
+    publish_hover(app);
 }
 
 #[cfg(target_os = "linux")]
 fn cursor_position() -> Option<(i32, i32)> {
-    // Read the pointer from X11 every tick. The page only sends an event while the
-    // cursor is inside the shaped window, so the last event still says "on the card"
-    // after the mouse has left it, and the card waits for a leave that may not come.
+    // Dragging still follows X11: the button is held, so the page suppresses
+    // pointerleave and the rail has to keep moving outside its own window.
+    // Hover reads `pointer_sample` instead.
     linux_pointer().map(|sample| (sample.x, sample.y))
+}
+
+/// The X11 point and whether it is still on an X11 window. When the real pointer
+/// crosses onto a Wayland window, XWayland freezes the coordinates at the last
+/// point it saw, which is inside the card, but moves the sprite to the root, so
+/// the query's child comes back None. That flag is the only leave this desktop
+/// reports reliably: the page's pointerleave often never arrives.
+#[cfg(target_os = "linux")]
+fn pointer_sample() -> Option<(i32, i32, bool)> {
+    linux_pointer().map(|sample| (sample.x, sample.y, sample.over_window))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pointer_sample() -> Option<(i32, i32, bool)> {
+    cursor_position().map(|(x, y)| (x, y, true))
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -1441,6 +1498,9 @@ struct LinuxPointer {
     x: i32,
     y: i32,
     button1: bool,
+    /// The query named a child of the root. False once XWayland has handed the
+    /// pointer to a Wayland window, while `x` and `y` stay on its last X11 point.
+    over_window: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -1492,6 +1552,7 @@ fn linux_pointer() -> Option<LinuxPointer> {
             x: root_x,
             y: root_y,
             button1: mask & Button1Mask != 0,
+            over_window: child != 0,
         })
     })
 }
@@ -1690,6 +1751,105 @@ fn poll_interval_ms(distance: i32, engaged: bool) -> u64 {
 
 /// One tick of pointer tracking: drives a drag in progress, else hit-tests the painted
 /// shapes for hover and click-through. Returns how long to wait before the next one.
+/// Hit-test the painted rail and bubble. `None` is a pointer that has left the
+/// window: that is not hovering, even when an X11 query still returns a point
+/// inside the card.
+fn pointer_over_frame(frame: &DockFrame, metrics: &Metrics, cursor: Option<(i32, i32)>) -> Pointer {
+    let Some((x, y)) = cursor else {
+        return Pointer::default();
+    };
+    let rail = frame.rail.offset(frame.window.x, frame.window.y);
+    let rail_hovered = rail.contains(x, y);
+    let row = rail_hovered
+        .then(|| {
+            let along = if frame.vertical { y } else { x } - frame.rows_start;
+            if along < 0 {
+                return None;
+            }
+            let period = metrics.row_height + metrics.row_spacing;
+            let slot = along / period;
+            (slot < frame.rows as i32 && along - slot * period < metrics.row_height).then_some(slot as u32)
+        })
+        .flatten();
+    let detail_hovered = frame
+        .detail
+        .map(|d| {
+            Rect { x: d.x, y: d.y, w: d.w, h: d.h }
+                .offset(frame.window.x, frame.window.y)
+                .contains(x, y)
+        })
+        .unwrap_or(false);
+    Pointer { rail_hovered, row, detail_hovered }
+}
+
+/// Linux hover follows the page while that sample is still over a painted
+/// shape. `pointerleave` often never arrives once the cursor is on a Wayland
+/// window, and the last page sample then sits on the card forever. `x11_logical`
+/// is `None` when XWayland says the pointer is on no X11 window, or the query
+/// failed: that is a leave, whatever the frozen coordinates and the page sample
+/// still say. An X11 point that has left the rail and the bubble also wins, and
+/// the stale sample is dropped. Windows has one cursor, so the X11 argument is
+/// that cursor.
+fn resolve_hover(
+    frame: &DockFrame,
+    metrics: &Metrics,
+    page_local: Option<(i32, i32)>,
+    x11_logical: Option<(i32, i32)>,
+) -> (Pointer, Option<(i32, i32)>) {
+    let Some(x11_logical) = x11_logical else {
+        return (Pointer::default(), None);
+    };
+    let x11_hit = pointer_over_frame(frame, metrics, Some(x11_logical));
+    #[cfg(target_os = "linux")]
+    if !x11_hit.rail_hovered && !x11_hit.detail_hovered {
+        return (Pointer::default(), None);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let pointer = match page_local {
+            Some((x, y)) => {
+                let page_hit = pointer_over_frame(
+                    frame,
+                    metrics,
+                    Some((frame.window.x + x, frame.window.y + y)),
+                );
+                if page_hit.rail_hovered || page_hit.detail_hovered {
+                    page_hit
+                } else {
+                    x11_hit
+                }
+            }
+            None => x11_hit,
+        };
+        return (pointer, page_local);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = page_local;
+        (x11_hit, None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn publish_hover(app: &AppHandle) {
+    let mut state = lock();
+    let Some(frame) = state.frame else { return };
+    // A failed query is not a hover. Pretending the cursor sat on the rail
+    // kept the card open until the next tick happened to succeed.
+    let x11 = pointer_sample().filter(|&(_, _, over)| over).map(|(x, y, _)| {
+        let scale = if state.scale > 0.0 { state.scale } else { 1.0 };
+        ((x as f64 / scale).round() as i32, (y as f64 / scale).round() as i32)
+    });
+    let (pointer, page_local) = resolve_hover(&frame, &state.metrics, state.page_local, x11);
+    state.page_local = page_local;
+    if state.pointer == pointer {
+        return;
+    }
+    state.pointer = pointer;
+    drop(state);
+    let _ = app.emit_to(DOCK_LABEL, "codeburn://dock-pointer", pointer);
+}
+
 fn clear_hover(app: &AppHandle) {
     let mut state = lock();
     let pointer = Pointer::default();
@@ -1703,7 +1863,7 @@ fn clear_hover(app: &AppHandle) {
 }
 
 fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) -> u64 {
-    let Some((cx, cy)) = cursor_position() else {
+    let Some((cx, cy, over_window)) = pointer_sample() else {
         // The pointer left the shaped rail. Leaving the last sample in place keeps the
         // provider card open over empty desktop.
         clear_hover(app);
@@ -1807,24 +1967,14 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) -> u64 {
     }
 
     let scale = state.scale;
-    let cursor = ((cx as f64 / scale).round() as i32, (cy as f64 / scale).round() as i32);
-    let rail = frame.rail.offset(frame.window.x, frame.window.y);
-    let rail_hovered = rail.contains(cursor.0, cursor.1);
+    let x11_logical = ((cx as f64 / scale).round() as i32, (cy as f64 / scale).round() as i32);
     let metrics = state.metrics;
-    let row = rail_hovered.then(|| {
-        let along = if frame.vertical { cursor.1 } else { cursor.0 } - frame.rows_start;
-        if along < 0 {
-            return None;
-        }
-        let period = metrics.row_height + metrics.row_spacing;
-        let slot = along / period;
-        (slot < frame.rows as i32 && along - slot * period < metrics.row_height).then_some(slot as u32)
-    }).flatten();
-    let detail_hovered = frame
-        .detail
-        .map(|d| Rect { x: d.x, y: d.y, w: d.w, h: d.h }.offset(frame.window.x, frame.window.y).contains(cursor.0, cursor.1))
-        .unwrap_or(false);
-    let pointer = Pointer { rail_hovered, row, detail_hovered };
+    let (pointer, page_local) =
+        resolve_hover(&frame, &metrics, state.page_local, over_window.then_some(x11_logical));
+    state.page_local = page_local;
+    let page_left = cfg!(target_os = "linux") && page_local.is_none();
+    let rail_hovered = pointer.rail_hovered;
+    let detail_hovered = pointer.detail_hovered;
     let pointer_changed = pointer != state.pointer;
     state.pointer = pointer;
     // A press that began on the rail keeps the window's input while the button is held, so
@@ -1841,7 +1991,7 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) -> u64 {
     // Measured against the window rather than the rail: the window is the whole region the
     // dock can paint into, bubble included, so a pointer outside it cannot be hovering
     // anything and one just inside it is about to be.
-    let distance = distance_to(&frame.window, cursor.0, cursor.1);
+    let distance = distance_to(&frame.window, x11_logical.0, x11_logical.1);
     drop(state);
 
     #[cfg(target_os = "linux")]
@@ -1853,6 +2003,12 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) -> u64 {
     }
     if pointer_changed {
         let _ = app.emit_to(DOCK_LABEL, "codeburn://dock-pointer", pointer);
+    }
+    // A stuck X11 point inside the card would otherwise keep the 16 ms poll
+    // running for the whole session after the pointer has left. On Windows
+    // `page_left` is always false and the cursor query is the real pointer.
+    if page_left && !engaged {
+        return POLL_FAR_MS;
     }
     poll_interval_ms(distance, engaged)
 }
@@ -2306,6 +2462,44 @@ mod tests {
         // Out-of-range and nonsense scales land back inside the range rather than collapsing.
         assert_eq!(Metrics::for_scale(4.0), big);
         assert_eq!(Metrics::for_scale(f64::NAN), small());
+    }
+
+    #[test]
+    fn leaving_the_window_is_not_hovering_even_if_the_x11_point_stays_on_the_card() {
+        let frame = layout(
+            AREA,
+            &Placement { docked: Some(Edge::Right), attachment: Edge::Right, ..Placement::default() },
+            &request(1, true, Some(DetailRequest { row: 0, height: 200 })),
+            &small(),
+        );
+        let detail = frame.detail.expect("detail");
+        let on_card = (
+            frame.window.x + detail.x + detail.w / 2,
+            frame.window.y + detail.y + detail.h / 2,
+        );
+        let hovering = pointer_over_frame(&frame, &small(), Some(on_card));
+        assert!(hovering.detail_hovered, "a pointer on the card is hovering it");
+        let left = pointer_over_frame(&frame, &small(), None);
+        assert!(!left.detail_hovered);
+        assert!(!left.rail_hovered);
+        assert!(left.row.is_none());
+
+        // The page never receives pointerleave, so its last sample stays on the
+        // card. The X11 cursor has already moved off. That has to close the bubble.
+        let stale_page = Some((on_card.0 - frame.window.x, on_card.1 - frame.window.y));
+        let (resolved, kept) = resolve_hover(&frame, &small(), stale_page, Some((0, 0)));
+        assert!(!resolved.detail_hovered);
+        assert!(kept.is_none());
+        let (still, _) = resolve_hover(&frame, &small(), stale_page, Some(on_card));
+        assert!(still.detail_hovered);
+
+        // The real pointer on a Wayland window: XWayland freezes the X11 point on
+        // the card and the page sample never updates. Only the query's child says
+        // it left, and that has to win over both.
+        let (gone, kept) = resolve_hover(&frame, &small(), stale_page, None);
+        assert!(!gone.detail_hovered);
+        assert!(!gone.rail_hovered);
+        assert!(kept.is_none());
     }
 
     #[test]
