@@ -1062,7 +1062,7 @@ fn place_linux(window: &tauri::WebviewWindow, target: Rect) {
                     }
                     let _ = hosted.set_position(tauri::LogicalPosition::new(x as f64, y as f64));
                     if let Ok(mut last) = HIT_SHAPE.lock() {
-                        last.clear();
+                        *last = None;
                     }
                     sync_hit_shape(&hosted);
                 });
@@ -1554,38 +1554,22 @@ fn linux_pointer() -> Option<LinuxPointer> {
     })
 }
 
-/// The painted rail and bubble, in the window's logical pixels. GTK scales the input
-/// region itself; passing physical pixels doubled them and the hit target missed the rail.
-/// Everything else in the window stays click-through.
+/// The painted rail and bubble as strips, in the window's logical pixels. GTK scales the
+/// input region itself; passing physical pixels doubled them and the hit target missed the
+/// rail. Everything else in the window, the bubble's transparent corners included, stays
+/// click-through.
 #[cfg(target_os = "linux")]
-fn hit_rects(state: &DockState) -> Vec<(i32, i32, i32, i32)> {
-    let Some(frame) = state.frame else { return Vec::new() };
-    let pad = if state.drag.is_some() { 36 } else { 6 };
-    let win_w = frame.window.w;
-    let win_h = frame.window.h;
-    let clip = |rect: Rect| -> Option<(i32, i32, i32, i32)> {
-        let rect = padded(rect, pad);
-        let x = rect.x.max(0);
-        let y = rect.y.max(0);
-        let w = (rect.right().min(win_w) - x).max(0);
-        let h = (rect.bottom().min(win_h) - y).max(0);
-        (w >= 8 && h >= 8).then_some((x, y, w, h))
-    };
-    let mut rects = Vec::new();
-    if let Some(rect) = clip(frame.rail) {
-        rects.push(rect);
+fn hit_region(state: &DockState) -> Option<HitShape> {
+    let frame = state.frame?;
+    let mut shape = hit_shape(&frame, &state.metrics);
+    if state.drag.is_some() {
+        // Dragging uses a wide box so a one-frame lag does not drop the pointer off the rail.
+        shape.rail = vec![padded(frame.rail, 36)];
     }
-    if let Some(detail) = frame.detail {
-        if let Some(rect) = clip(Rect { x: detail.x, y: detail.y, w: detail.w, h: detail.h }) {
-            rects.push(rect);
-        }
-    }
-    rects
+    Some(shape)
 }
 
-/// A few pixels around the painted rail and card, so the ring and the bubble tail stay
-/// clickable without covering the desktop beside them. Dragging uses a wider margin so a
-/// one-frame lag does not drop the pointer off the rail.
+/// A few pixels around the painted rail, for the drag box and the press test.
 #[cfg(target_os = "linux")]
 fn padded(rect: Rect, pad: i32) -> Rect {
     Rect {
@@ -1613,73 +1597,58 @@ fn apply_input_region(widget: &gtk::Widget, region: &cairo::Region) {
 /// from another client left the surface click-through, so the press never
 /// reached the page and the drag died.
 #[cfg(target_os = "linux")]
-fn apply_hit_rects(window: &tauri::WebviewWindow, rects: &[(i32, i32, i32, i32)]) {
+fn apply_hit_shape(window: &tauri::WebviewWindow, shape: &HitShape) {
     use gtk::prelude::{Cast, WidgetExt};
     let Ok(gtk_window) = window.gtk_window() else { return };
     let allocation = gtk_window.allocation();
     let aw = allocation.width().max(1);
     let ah = allocation.height().max(1);
     let frame = lock().frame;
-    let rects: Vec<(i32, i32, i32, i32)> = rects
+    // The page pins a docked rail to the window's outer edge (`right` / `bottom`), so after a
+    // resize the rail is drawn against the real allocation rather than where the layout put
+    // it. Only the rail moves with that edge: the bubble is placed from the left and top.
+    let (dx, dy) = match frame {
+        Some(frame) if frame.docked && frame.edge == Edge::Right => (aw - frame.rail.right(), 0),
+        Some(frame) if frame.docked && frame.edge == Edge::Bottom => (0, ah - frame.rail.bottom()),
+        _ => (0, 0),
+    };
+    let clip = |rect: Rect| -> Option<cairo::RectangleInt> {
+        let x = rect.x.max(0);
+        let y = rect.y.max(0);
+        let w = rect.right().min(aw) - x;
+        let h = rect.bottom().min(ah) - y;
+        (w > 0 && h > 0).then(|| cairo::RectangleInt::new(x, y, w, h))
+    };
+    let rectangles: Vec<cairo::RectangleInt> = shape
+        .rail
         .iter()
-        .map(|&(mut x, mut y, mut w, mut h)| {
-            // The page pins a docked ball to the window's outer edge (`right` / `bottom`).
-            // A logical rect from the layout can sit outside the real allocation after a
-            // resize, which is the ball the pointer goes straight through.
-            if let Some(frame) = frame {
-                if frame.docked && frame.edge == Edge::Right {
-                    x = aw - w;
-                }
-                if frame.docked && frame.edge == Edge::Bottom {
-                    y = ah - h;
-                }
-            }
-            w = w.min(aw).max(1);
-            h = h.min(ah).max(1);
-            x = x.clamp(0, (aw - w).max(0));
-            y = y.clamp(0, (ah - h).max(0));
-            (x, y, w, h)
-        })
+        .map(|rect| rect.offset(dx, dy))
+        .chain(shape.detail.iter().copied())
+        .filter_map(clip)
         .collect();
-    let rectangles: Vec<cairo::RectangleInt> = rects
-        .iter()
-        .filter(|(_, _, w, h)| *w > 0 && *h > 0)
-        .map(|&(x, y, w, h)| cairo::RectangleInt::new(x, y, w, h))
-        .collect();
-    if rectangles.is_empty() {
-        apply_input_region(gtk_window.upcast_ref::<gtk::Widget>(), &cairo::Region::create());
+    let region = if rectangles.is_empty() {
+        cairo::Region::create()
     } else {
-        let region = cairo::Region::create_rectangles(&rectangles);
-        apply_input_region(gtk_window.upcast_ref::<gtk::Widget>(), &region);
-    }
-    let _ = std::fs::write(
-        "/tmp/codeburn-dock-shape.txt",
-        format!(
-            "gdk-input rects={rects:?} window={:?} rail={:?}\n",
-            frame.map(|f| f.window),
-            frame.map(|f| f.rail)
-        ),
-    );
+        cairo::Region::create_rectangles(&rectangles)
+    };
+    apply_input_region(gtk_window.upcast_ref::<gtk::Widget>(), &region);
 }
 
 #[cfg(target_os = "linux")]
-static HIT_SHAPE: Mutex<Vec<(i32, i32, i32, i32)>> = Mutex::new(Vec::new());
+static HIT_SHAPE: Mutex<Option<HitShape>> = Mutex::new(None);
 
 #[cfg(target_os = "linux")]
 fn sync_hit_shape(window: &tauri::WebviewWindow) {
-    let rects = hit_rects(&lock());
-    if rects.is_empty() {
-        return;
-    }
+    let Some(shape) = hit_region(&lock()) else { return };
     {
         let mut last = HIT_SHAPE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if *last == rects {
+        if last.as_ref() == Some(&shape) {
             return;
         }
-        *last = rects.clone();
+        *last = Some(shape.clone());
     }
     let hosted = window.clone();
-    let _ = window.run_on_main_thread(move || apply_hit_rects(&hosted, &rects));
+    let _ = window.run_on_main_thread(move || apply_hit_shape(&hosted, &shape));
 }
 
 /// A resize clears the input region after the shape was applied, and the ball
@@ -1694,12 +1663,187 @@ fn refresh_hit_shape_after_resize(window: &tauri::WebviewWindow) {
             let hosted = window.clone();
             let _ = window.run_on_main_thread(move || {
                 if let Ok(mut last) = HIT_SHAPE.lock() {
-                    last.clear();
+                    *last = None;
                 }
                 sync_hit_shape(&hosted);
             });
         }
     });
+}
+
+/// How far past the painted outline the hit shape reaches: enough to cover the stroke and
+/// its antialiasing, not enough to steal a click from the window beside it.
+const HIT_PAD: i32 = 2;
+
+/// The painted rail and bubble as strips in window logical pixels. Both the GTK input region
+/// and the hover test are cut from it, so the pointer is on the dock exactly where the dock
+/// is drawn: the transparent corners of the window and of the bubble fall through to
+/// whatever is underneath.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct HitShape {
+    rail: Vec<Rect>,
+    /// The bubble plus the bridge across the gap between its tail and the rail, so crossing
+    /// from a row into its bubble never leaves the dock.
+    detail: Vec<Rect>,
+}
+
+/// One strip of a shape drawn for a right-edge rail: rows `along..along + len` cover
+/// `lo..hi` across. The same canonical box `src/dockGeometry.ts` draws its paths in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Strip {
+    along: i32,
+    len: i32,
+    lo: i32,
+    hi: i32,
+}
+
+/// Rasterizes a canonical outline one pixel row at a time and merges equal rows into strips.
+/// `span` answers the painted interval across the row centred at an along coordinate.
+fn strips(along_len: i32, pad: i32, span: impl Fn(f64) -> Option<(f64, f64)>) -> Vec<Strip> {
+    let mut out: Vec<Strip> = Vec::new();
+    if along_len <= 0 {
+        return out;
+    }
+    let last = along_len as f64 - 0.5;
+    for t in -pad..along_len + pad {
+        let at = (t as f64 + 0.5).clamp(0.5, last);
+        let Some((lo, hi)) = span(at) else { continue };
+        if hi - lo <= 0.0 {
+            continue;
+        }
+        let lo = lo.floor() as i32 - pad;
+        let hi = hi.ceil() as i32 + pad;
+        match out.last_mut() {
+            Some(prev) if prev.along + prev.len == t && prev.lo == lo && prev.hi == hi => prev.len += 1,
+            _ => out.push(Strip { along: t, len: 1, lo, hi }),
+        }
+    }
+    out
+}
+
+/// Maps canonical strips onto `edge` inside a box at `origin`, with the same flips the page's
+/// `mapper` applies to its paths.
+fn place(strips: &[Strip], edge: Edge, cross: i32, origin: (i32, i32)) -> Vec<Rect> {
+    let (ox, oy) = origin;
+    strips
+        .iter()
+        .map(|s| match edge {
+            Edge::Right => Rect { x: ox + s.lo, y: oy + s.along, w: s.hi - s.lo, h: s.len },
+            Edge::Left => Rect { x: ox + cross - s.hi, y: oy + s.along, w: s.hi - s.lo, h: s.len },
+            Edge::Bottom => Rect { x: ox + s.along, y: oy + s.lo, w: s.len, h: s.hi - s.lo },
+            Edge::Top => Rect { x: ox + s.along, y: oy + cross - s.hi, w: s.len, h: s.hi - s.lo },
+        })
+        .collect()
+}
+
+/// How far a corner drawn as the page's quadratic (`Q corner end`) of radius `r` sits in from
+/// the straight edge, `u` along from where the corner starts.
+fn corner_inset(r: f64, u: f64) -> f64 {
+    if r <= 0.0 || u >= r {
+        return 0.0;
+    }
+    let s = (u.max(0.0) / r).sqrt();
+    r * (1.0 - s) * (1.0 - s)
+}
+
+/// `railPath`: a rounded pill while loose; once docked, convex corners on the free side and
+/// concave shoulders flaring into the contact edge at `cross`.
+fn rail_strips(m: &Metrics, cross: i32, len: i32, docked: bool, pad: i32) -> Vec<Strip> {
+    let (c, l) = (cross as f64, len as f64);
+    let free = 22.0_f64.min(l / 2.0).min(c * 0.45);
+    if !docked {
+        return strips(len, pad, |t| {
+            let inset = corner_inset(free, t).max(corner_inset(free, l - t));
+            Some((inset, c - inset))
+        });
+    }
+    let contact = (m.flare_compensation as f64).min(l * 0.22).min((l / 2.0 - free).max(0.0));
+    strips(len, pad, move |t| {
+        let end = t.min(l - t);
+        if end < contact {
+            // The shoulder: `Q (cross, contact) (cross - contact, contact)` from the contact edge.
+            let s = 1.0 - (1.0 - end / contact).max(0.0).sqrt();
+            return Some((c - s * s * contact, c));
+        }
+        let inset = corner_inset(free, t - contact).max(corner_inset(free, l - contact - t));
+        Some((inset, c))
+    })
+}
+
+/// `bubblePath` with its tail at `cross`, pointing at `tail` along, plus `bridge` pixels past
+/// the tip for the gap to the rail.
+fn bubble_strips(cross: i32, along: i32, tail: i32, bridge: (i32, f64), pad: i32) -> Vec<Strip> {
+    let (c, a) = (cross as f64, along as f64);
+    let tail_width = 22.0_f64.min(14.0_f64.max(c * 0.055));
+    let body = c - tail_width;
+    let radius = 20.0_f64.min(a * 0.18);
+    let mid = a * (tail as f64 / a.max(1.0)).clamp(0.18, 0.82);
+    let neck = 32.0_f64.min(a * 0.19);
+    // The upper tail curve, `C (body, mid - 0.55 neck) (cross, mid - 0.42 tw) (cross, mid)`
+    // from (body, mid - neck), sampled once; the lower half mirrors it.
+    let curve: Vec<(f64, f64)> = (0..=32)
+        .map(|i| {
+            let s = i as f64 / 32.0;
+            let k = 1.0 - s;
+            let x = k * k * k * body + 3.0 * k * k * s * body + 3.0 * k * s * s * c + s * s * s * c;
+            let y = k * k * k * (mid - neck)
+                + 3.0 * k * k * s * (mid - neck * 0.55)
+                + 3.0 * k * s * s * (mid - tail_width * 0.42)
+                + s * s * s * mid;
+            (mid - y, x)
+        })
+        .collect();
+    let tail_at = |d: f64| -> f64 {
+        curve
+            .windows(2)
+            .find(|pair| d <= pair[0].0 && d >= pair[1].0)
+            .map(|pair| {
+                let (d0, x0) = pair[0];
+                let (d1, x1) = pair[1];
+                if d0 == d1 { x0.max(x1) } else { x0 + (x1 - x0) * (d0 - d) / (d0 - d1) }
+            })
+            .unwrap_or(body)
+    };
+    let (reach, half_band) = bridge;
+    strips(along, pad, move |t| {
+        let inset = corner_inset(radius, t).max(corner_inset(radius, a - t));
+        let mut hi = body - inset;
+        let d = (t - mid).abs();
+        if d <= neck {
+            hi = hi.max(tail_at(d));
+        }
+        if reach > 0 && d <= half_band {
+            hi = c + reach as f64;
+        }
+        Some((inset, hi))
+    })
+}
+
+fn hit_shape(frame: &DockFrame, m: &Metrics) -> HitShape {
+    let rail = frame.rail;
+    let (cross, len) = if frame.vertical { (rail.w, rail.h) } else { (rail.h, rail.w) };
+    let rail_edge = if frame.vertical {
+        if frame.edge.is_vertical() { frame.edge } else { Edge::Right }
+    } else if frame.edge.is_vertical() {
+        Edge::Bottom
+    } else {
+        frame.edge
+    };
+    let rail_rects = place(&rail_strips(m, cross, len, frame.docked, HIT_PAD), rail_edge, cross, (rail.x, rail.y));
+    let detail = frame.detail.map(|d| {
+        let tail_edge = frame.bubble_side.opposite();
+        let (cross, along) = if tail_edge.is_vertical() { (d.w, d.h) } else { (d.h, d.w) };
+        let gap = match tail_edge {
+            Edge::Right => rail.x - (d.x + d.w),
+            Edge::Left => d.x - rail.right(),
+            Edge::Bottom => rail.y - (d.y + d.h),
+            Edge::Top => d.y - rail.bottom(),
+        }
+        .max(0);
+        let band = m.row_height as f64 / 2.0;
+        place(&bubble_strips(cross, along, d.tail, (gap, band), HIT_PAD), tail_edge, cross, (d.x, d.y))
+    });
+    HitShape { rail: rail_rects, detail: detail.unwrap_or_default() }
 }
 
 /// How far a point lies outside a rectangle, along whichever axis it is furthest out on, and
@@ -1759,8 +1903,11 @@ fn pointer_over_frame(frame: &DockFrame, metrics: &Metrics, cursor: Option<(i32,
     let Some((x, y)) = cursor else {
         return Pointer::default();
     };
-    let rail = frame.rail.offset(frame.window.x, frame.window.y);
-    let rail_hovered = rail.contains(x, y);
+    // The same outline the input region is cut from, so hover and click-through agree about
+    // the bubble's transparent corners and the gap beside its tail.
+    let shape = hit_shape(frame, metrics);
+    let (lx, ly) = (x - frame.window.x, y - frame.window.y);
+    let rail_hovered = shape.rail.iter().any(|rect| rect.contains(lx, ly));
     let row = rail_hovered
         .then(|| {
             let along = if frame.vertical { y } else { x } - frame.rows_start;
@@ -1772,14 +1919,7 @@ fn pointer_over_frame(frame: &DockFrame, metrics: &Metrics, cursor: Option<(i32,
             (slot < frame.rows as i32 && along - slot * period < metrics.row_height).then_some(slot as u32)
         })
         .flatten();
-    let detail_hovered = frame
-        .detail
-        .map(|d| {
-            Rect { x: d.x, y: d.y, w: d.w, h: d.h }
-                .offset(frame.window.x, frame.window.y)
-                .contains(x, y)
-        })
-        .unwrap_or(false);
+    let detail_hovered = shape.detail.iter().any(|rect| rect.contains(lx, ly));
     Pointer { rail_hovered, row, detail_hovered }
 }
 
@@ -2220,14 +2360,14 @@ pub fn show(app: &AppHandle) -> tauri::Result<()> {
     #[cfg(target_os = "linux")]
     {
         if let Ok(mut last) = HIT_SHAPE.lock() {
-            last.clear();
+            *last = None;
         }
         sync_hit_shape(&window);
         let later = window.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(500));
             if let Ok(mut last) = HIT_SHAPE.lock() {
-                last.clear();
+                *last = None;
             }
             let again = later.clone();
             let _ = later.run_on_main_thread(move || sync_hit_shape(&again));
@@ -2489,6 +2629,65 @@ mod tests {
         // Out-of-range and nonsense scales land back inside the range rather than collapsing.
         assert_eq!(Metrics::for_scale(4.0), big);
         assert_eq!(Metrics::for_scale(f64::NAN), small());
+    }
+
+    #[test]
+    fn the_hit_shape_follows_the_painted_card_and_rail() {
+        let frame = layout(
+            AREA,
+            &Placement { docked: Some(Edge::Right), attachment: Edge::Right, ..Placement::default() },
+            &request(4, true, Some(DetailRequest { row: 2, height: 330 })),
+            &small(),
+        );
+        let d = frame.detail.expect("detail");
+        let at = |x: i32, y: i32| pointer_over_frame(&frame, &small(), Some((frame.window.x + x, frame.window.y + y)));
+
+        // The card's far left, where its button sits, belongs to the card: the old region
+        // was pinned to the window's right edge and dropped it.
+        assert!(at(d.x + 30, d.y + d.h - 30).detail_hovered);
+        assert!(at(d.x + 4, d.y + d.h / 2).detail_hovered);
+        // Its rounded corners do not.
+        assert!(!at(d.x + 1, d.y + 1).detail_hovered);
+        assert!(!at(d.x + 1, d.y + d.h - 2).detail_hovered);
+        // The gap between tail and rail is bridged at the tail, and open elsewhere.
+        let gap_x = d.x + d.w + DETAIL_GAP / 2;
+        assert!(at(gap_x, d.y + d.tail).detail_hovered);
+        assert!(!at(gap_x, d.y + 4).detail_hovered);
+        assert!(!at(gap_x, d.y + d.h - 4).detail_hovered);
+        // Beside the tail, inside the card's box but outside the body, is open desktop.
+        assert!(!at(d.x + d.w - 3, d.y + 30).detail_hovered);
+
+        // The rail: its middle is solid, the free-side corners are not.
+        let r = frame.rail;
+        assert!(at(r.x + r.w / 2, r.y + r.h / 2).rail_hovered);
+        assert!(!at(r.x - 3, r.y + frame.along_pad).rail_hovered);
+        let corner_y = r.y + small().flare_compensation;
+        assert!(!at(r.x, corner_y).rail_hovered);
+        assert!(at(r.x + 1, r.y + r.h / 2).rail_hovered);
+    }
+
+    #[test]
+    fn hit_strips_cover_every_edge_orientation() {
+        for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+            let frame = layout(
+                AREA,
+                &Placement { docked: Some(edge), attachment: edge, ..Placement::default() },
+                &request(3, true, Some(DetailRequest { row: 1, height: 240 })),
+                &small(),
+            );
+            let d = frame.detail.expect("detail");
+            let shape = hit_shape(&frame, &small());
+            let centre = (d.x + d.w / 2, d.y + d.h / 2);
+            assert!(shape.detail.iter().any(|rect| rect.contains(centre.0, centre.1)), "{edge:?} card centre");
+            let r = frame.rail;
+            assert!(shape.rail.iter().any(|rect| rect.contains(r.x + r.w / 2, r.y + r.h / 2)), "{edge:?} rail centre");
+            // Nothing reaches outside the window by more than the pad.
+            for rect in shape.rail.iter().chain(shape.detail.iter()) {
+                assert!(rect.x >= -HIT_PAD - 1 && rect.y >= -HIT_PAD - 1, "{edge:?} {rect:?}");
+                assert!(rect.right() <= frame.window.w + HIT_PAD + 1, "{edge:?} {rect:?}");
+                assert!(rect.bottom() <= frame.window.h + HIT_PAD + 1, "{edge:?} {rect:?}");
+            }
+        }
     }
 
     #[test]
