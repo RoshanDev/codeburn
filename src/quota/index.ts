@@ -30,6 +30,9 @@ export type QuotaCommandProvider = {
   plan?: string
   windows: QuotaCommandWindow[]
   error?: string
+  /** How the read went when it did not connect, so a reader can tell a retry
+   *  (`transientFailure`) from a login that needs the user (`terminalFailure`). */
+  connection?: QuotaProvider['connection']
   /** Provider facts that are not a window, such as Codex's limit-reset credits.
    *  Printed under the provider's rows and carried in `--format json`. */
   notes?: string[]
@@ -111,7 +114,7 @@ export function toCommandProvider(id: ProviderName, name: string, quota: QuotaPr
     available: quota.connection === 'connected',
     ...(quota.planLabel ? { plan: quota.planLabel } : {}),
     windows: toWindows(quota),
-    ...(error ? { error } : {}),
+    ...(error ? { error, connection: quota.connection } : {}),
     ...(notes.length ? { notes } : {}),
   }
 }
@@ -129,7 +132,7 @@ export async function collectQuota(options: {
     try {
       const quota = await Promise.race([entry.read(controller.signal), timedOut])
       if (quota === 'timeout') {
-        return { id: entry.id, name: entry.name, available: false, windows: [], error: 'Timed out.' }
+        return { id: entry.id, name: entry.name, available: false, windows: [], error: 'Timed out.', connection: 'transientFailure' as const }
       }
       return toCommandProvider(entry.id, entry.name, quota)
     } finally {

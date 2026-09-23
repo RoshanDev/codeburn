@@ -7,8 +7,14 @@
 //
 // Credential: $GROK_HOME/auth.json (default ~/.grok/auth.json), read-only. The
 // file maps a login scope to its token; the current OIDC login wins over the
-// older sign-in one. CodeBurn never refreshes and never writes, so an expired
-// login is terminal until the user runs `grok login` again.
+// older sign-in one. The access token lives six hours and only the Grok CLI
+// refreshes it, so a login nobody has used for an afternoon reads as expired
+// while its refresh token is still good. CodeBurn never writes the file and
+// never spends the refresh token itself (a rotation the CLI did not see would
+// sign it out); it asks the CLI to refresh by running a command that needs the
+// login, reads the file again, and calls it terminal only if that fails.
+import { execFile } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -30,7 +36,14 @@ export type GrokDeps = {
   credentialPath: string
   readFile: typeof readSecureFile
   now: () => number
+  /** Has the Grok CLI refresh its own login. Resolves true when the CLI ran cleanly. */
+  refreshLogin: () => Promise<boolean>
 }
+
+/** Refresh this far ahead of the stamp, so a token does not lapse mid-request. */
+const EXPIRY_MARGIN_MS = 60_000
+/** Long enough for a cold CLI start plus the token grant behind a slow proxy. */
+const REFRESH_TIMEOUT_MS = 30_000
 
 export function grokAuthPath(env: NodeJS.ProcessEnv = process.env, home: string = os.homedir()): string {
   const configured = env['GROK_HOME']?.trim()
@@ -40,8 +53,44 @@ export function grokAuthPath(env: NodeJS.ProcessEnv = process.env, home: string 
   return path.join(grokHome, 'auth.json')
 }
 
+/** The CLI the installer puts under $GROK_HOME/bin, else whatever `grok` is on PATH. */
+export function grokBinary(env: NodeJS.ProcessEnv = process.env, home: string = os.homedir()): string {
+  const bundled = path.join(path.dirname(grokAuthPath(env, home)), 'bin', 'grok')
+  return existsSync(bundled) ? bundled : 'grok'
+}
+
+/** `grok models` needs a live login, so the CLI refreshes an expired access
+ *  token (under its own lock, with its own refresh-token rotation) before it
+ *  lists them. It opens no UI and makes no model call. */
+function runGrokRefresh(): Promise<boolean> {
+  return new Promise(resolve => {
+    execFile(grokBinary(), ['models'], { timeout: REFRESH_TIMEOUT_MS, windowsHide: true }, error => {
+      resolve(error === null)
+    })
+  })
+}
+
 function defaultDeps(): GrokDeps {
-  return { fetch: globalThis.fetch, credentialPath: grokAuthPath(), readFile: readSecureFile, now: Date.now }
+  return { fetch: globalThis.fetch, credentialPath: grokAuthPath(), readFile: readSecureFile, now: Date.now, refreshLogin: runGrokRefresh }
+}
+
+type CredentialRead = GrokCredential | 'malformed' | null
+
+async function readCredential(deps: GrokDeps): Promise<CredentialRead> {
+  const raw = await deps.readFile(deps.credentialPath, 128 * 1024)
+  return raw ? decodeGrokCredential(raw) : null
+}
+
+/** Asks the CLI to refresh, then reads the file again. Null when nothing newer came of it. */
+async function refreshedCredential(deps: GrokDeps, held: GrokCredential): Promise<GrokCredential | null> {
+  if (!(await deps.refreshLogin())) return null
+  const next = await readCredential(deps)
+  if (next === null || next === 'malformed' || next.accessToken === held.accessToken) return null
+  return next
+}
+
+function expired(credential: GrokCredential, now: number): boolean {
+  return credential.expiresAt !== null && credential.expiresAt - EXPIRY_MARGIN_MS <= now
 }
 
 function empty(connection: QuotaProvider['connection'], footerLines: string[] = []): QuotaProvider {
@@ -178,21 +227,30 @@ export type GrokResult = { quota: QuotaProvider; retryAfterSeconds?: number }
 export async function fetchGrokQuota(options: Partial<GrokDeps> & { signal?: AbortSignal } = {}): Promise<GrokResult> {
   const deps = { ...defaultDeps(), ...options }
   try {
-    const raw = await deps.readFile(deps.credentialPath, 128 * 1024)
-    if (!raw) return { quota: empty('disconnected') }
-    const credential = decodeGrokCredential(raw)
-    if (credential === 'malformed') return { quota: empty('terminalFailure', UNREADABLE_FOOTER) }
-    if (credential === null) return { quota: empty('disconnected') }
+    const read = await readCredential(deps)
+    if (read === 'malformed') return { quota: empty('terminalFailure', UNREADABLE_FOOTER) }
+    if (read === null) return { quota: empty('disconnected') }
+    let credential = read
 
     const now = deps.now()
-    if (credential.expiresAt !== null && credential.expiresAt <= now) {
-      return { quota: empty('terminalFailure', EXPIRED_FOOTER) }
+    if (expired(credential, now)) {
+      const next = await refreshedCredential(deps, credential)
+      if (next === null || expired(next, deps.now())) return { quota: empty('terminalFailure', EXPIRED_FOOTER) }
+      credential = next
     }
 
-    const response = await deps.fetch(BILLING_ENDPOINT, {
-      method: 'GET', signal: quotaRequestSignal(options.signal), headers: headers(credential.accessToken),
+    const requestBilling = (token: string) => deps.fetch(BILLING_ENDPOINT, {
+      method: 'GET', signal: quotaRequestSignal(options.signal), headers: headers(token),
     })
-    if (response.status === 401 || response.status === 403) return { quota: empty('terminalFailure', REJECTED_FOOTER) }
+    let response = await requestBilling(credential.accessToken)
+    if (response.status === 401 || response.status === 403) {
+      // A token revoked before its stamp says so gets the same one refresh.
+      const next = await refreshedCredential(deps, credential)
+      if (next === null) return { quota: empty('terminalFailure', REJECTED_FOOTER) }
+      credential = next
+      response = await requestBilling(credential.accessToken)
+      if (response.status === 401 || response.status === 403) return { quota: empty('terminalFailure', REJECTED_FOOTER) }
+    }
     if (response.status === 429) {
       const header = response.headers.get('Retry-After')
       const seconds = header === null ? NaN : Number(header)

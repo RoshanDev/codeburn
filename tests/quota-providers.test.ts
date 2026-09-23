@@ -285,6 +285,6 @@ describe('quota command envelope', () => {
       timeoutMs: 5,
       readers: [{ id: 'gemini', name: 'Gemini', read: () => new Promise<QuotaProvider>(() => {}) }],
     })
-    expect(report.providers).toEqual([{ id: 'gemini', name: 'Gemini', available: false, windows: [], error: 'Timed out.' }])
+    expect(report.providers).toEqual([{ id: 'gemini', name: 'Gemini', available: false, windows: [], error: 'Timed out.', connection: 'transientFailure' }])
   })
 })

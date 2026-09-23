@@ -140,9 +140,62 @@ describe('Grok Build quota fetch', () => {
       'https://auth.x.ai::p': { key: 'synthetic-oidc-token', expires_at: '2026-08-01T10:00:00Z' },
     }), { encoding: 'utf8', mode: 0o600 })
 
-    const result = await fetchGrokQuota({ credentialPath, now: () => NOW, fetch: neverFetch })
+    let asked = 0
+    const result = await fetchGrokQuota({
+      credentialPath, now: () => NOW, fetch: neverFetch,
+      refreshLogin: async () => { asked += 1; return false },
+    })
+    expect(asked).toBe(1)
     expect(result.quota.connection).toBe('terminalFailure')
     expect(result.quota.footerLines[0]).toContain('has expired')
+  })
+
+  it('has the Grok CLI refresh an expired login, then reads with the new token', async () => {
+    const credentialPath = path.join(root, 'auth.json')
+    await writeFile(credentialPath, JSON.stringify({
+      'https://auth.x.ai::p': { key: 'synthetic-stale-token', expires_at: '2026-09-01T09:00:00Z' },
+    }), { encoding: 'utf8', mode: 0o600 })
+
+    const seen: { url: string; headers: Record<string, string> }[] = []
+    const result = await fetchGrokQuota({
+      credentialPath,
+      now: () => NOW,
+      fetch: proxy(seen, { config: { creditUsagePercent: 10 } }),
+      refreshLogin: async () => {
+        await writeFile(credentialPath, JSON.stringify({
+          'https://auth.x.ai::p': { key: 'synthetic-fresh-token', expires_at: '2026-09-01T16:00:00Z' },
+        }), { encoding: 'utf8', mode: 0o600 })
+        return true
+      },
+    })
+
+    expect(result.quota.connection).toBe('connected')
+    expect(seen.every(row => row.headers['Authorization'] === 'Bearer synthetic-fresh-token')).toBe(true)
+  })
+
+  it('retries a rejected token once after the Grok CLI refreshes it', async () => {
+    const credentialPath = path.join(root, 'auth.json')
+    await writeFile(credentialPath, JSON.stringify(authFile), { encoding: 'utf8', mode: 0o600 })
+
+    const result = await fetchGrokQuota({
+      credentialPath,
+      now: () => NOW,
+      fetch: (async (url: string, init: RequestInit) => {
+        const auth = (init.headers as Record<string, string>)['Authorization']
+        if (auth !== 'Bearer synthetic-fresh-token') return jsonResponse({}, 401)
+        if (url.startsWith('https://cli-chat-proxy.grok.com/v1/settings')) return jsonResponse({})
+        return jsonResponse({ config: { creditUsagePercent: 5 } })
+      }) as unknown as typeof fetch,
+      refreshLogin: async () => {
+        await writeFile(credentialPath, JSON.stringify({
+          'https://auth.x.ai::p': { key: 'synthetic-fresh-token', expires_at: '2026-09-09T10:00:00Z' },
+        }), { encoding: 'utf8', mode: 0o600 })
+        return true
+      },
+    })
+
+    expect(result.quota.connection).toBe('connected')
+    expect(result.quota.primary?.percent).toBe(0.05)
   })
 
   it('reports an unreadable login file as terminal and never fetches', async () => {
@@ -161,6 +214,7 @@ describe('Grok Build quota fetch', () => {
       credentialPath,
       now: () => NOW,
       fetch: proxy([], {}, status, headers),
+      refreshLogin: async () => false,
     })
 
     expect((await respond(401)).quota.connection).toBe('terminalFailure')

@@ -509,6 +509,20 @@ async function usage(auth: AuthDoc, deps: CodexDeps, signal?: AbortSignal): Prom
   return deps.fetch(USAGE_ENDPOINT, { method: 'GET', headers, signal: quotaRequestSignal(signal) })
 }
 
+/** Only an answer from the API itself about this login means signing in
+ *  again. A 401 has already been through a refresh above. A 403 that is not the
+ *  API's JSON is an edge proxy's challenge page, and every other 4xx (a 404
+ *  while the endpoint moves, a 408 behind a slow proxy) says nothing about the
+ *  login, so they retry instead of asking for a reconnect. */
+function codexFailure(response: Response): QuotaProvider['connection'] {
+  if (response.status === 401) return 'terminalFailure'
+  if (response.status === 403) {
+    const type = response.headers.get('Content-Type') ?? ''
+    return type.includes('application/json') ? 'terminalFailure' : 'transientFailure'
+  }
+  return 'transientFailure'
+}
+
 export type CodexResult = { quota: QuotaProvider; retryAfterSeconds?: number }
 
 export async function fetchCodexQuota(options: Partial<CodexDeps> & { signal?: AbortSignal; allowKeychain?: boolean } = {}): Promise<CodexResult> {
@@ -554,7 +568,7 @@ export async function fetchCodexQuota(options: Partial<CodexDeps> & { signal?: A
       if (!Number.isFinite(seconds) && raw) seconds = (Date.parse(raw) - deps.now()) / 1000
       return { quota: empty('transientFailure'), retryAfterSeconds: Math.max(Number.isFinite(seconds) ? Math.ceil(seconds) : 300, 60) }
     }
-    if (!response.ok) return { quota: empty(response.status >= 400 && response.status < 500 ? 'terminalFailure' : 'transientFailure') }
+    if (!response.ok) return { quota: empty(codexFailure(response)) }
     return { quota: decodeCodexUsage(await response.json()) }
   } catch (error) {
     console.warn(`Codex quota unavailable: ${sanitizeError(error)}`)

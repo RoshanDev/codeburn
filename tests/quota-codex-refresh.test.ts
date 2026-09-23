@@ -480,3 +480,21 @@ describe('Codex quota credential rotation', () => {
     }
   })
 })
+
+describe('Codex quota failure classification', () => {
+  const respond = async (usage: Handler) => {
+    await writeAuth({ ...authDoc(), last_refresh: new Date(NOW).toISOString() })
+    return (await fetchCodexQuota({ authPath, now: () => NOW, fetch: routes({ token: rotatedGrant, usage }) })).quota.connection
+  }
+
+  it('asks for a reconnect only when the API itself refuses the login', async () => {
+    expect(await respond(() => json({ detail: 'forbidden' }, 403))).toBe('terminalFailure')
+    expect(await respond(() => json({ detail: 'unauthorized' }, 401))).toBe('terminalFailure')
+  })
+
+  it('retries a proxy challenge page and a 4xx that says nothing about the login', async () => {
+    expect(await respond(() => new Response('<html>challenge</html>', { status: 403, headers: { 'Content-Type': 'text/html' } }))).toBe('transientFailure')
+    expect(await respond(() => json({}, 404))).toBe('transientFailure')
+    expect(await respond(() => json({}, 408))).toBe('transientFailure')
+  })
+})

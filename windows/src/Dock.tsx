@@ -9,6 +9,7 @@ import {
   connectionFor,
   refreshQuota,
   subscribeQuota,
+  transientRead,
   visibleFooterLines,
   type Connection,
   type QuotaState,
@@ -89,6 +90,8 @@ type Provider = {
   plan?: string
   windows: QuotaWindow[]
   error?: string
+  connection?: string
+  lastKnown?: boolean
 }
 
 type Rect = { x: number; y: number; w: number; h: number }
@@ -254,7 +257,7 @@ function Row({ m, shape, provider, loading, style, onEnter, onLeave, onClick }: 
         <span className={`dock-glyph${loading ? ' is-loading' : ''}`}>
           <ProviderGlyph id={provider.id} size={m.providerIconSize} />
         </span>
-        {provider.error ? <span className="dock-row-alert" /> : null}
+        {provider.error && !provider.lastKnown && !transientRead(provider) ? <span className="dock-row-alert" /> : null}
       </span>
       <span className={`dock-pct${sev ? ` is-${sev}` : ' is-empty'}`}>{percent === null ? '--' : `${percent}%`}</span>
     </button>
@@ -264,7 +267,7 @@ function Row({ m, shape, provider, loading, style, onEnter, onLeave, onClick }: 
 /// CapacityDockConnectionAction.resolve: the one recovery the bubble offers. A provider the
 /// CLI could not read at all needs connecting; one it read and was refused needs reconnecting.
 function connectionAction(provider: Provider): 'Connect' | 'Reconnect' | null {
-  if (provider.available) return null
+  if (provider.available || transientRead(provider)) return null
   return provider.error ? 'Reconnect' : 'Connect'
 }
 

@@ -82,6 +82,30 @@ export type QuotaProvider = {
   plan?: string
   windows: QuotaWindow[]
   error?: string
+  /// The reader's own verdict on a failed read. Only `terminalFailure` asks the user to sign
+  /// in again; an older CLI leaves it out, and then only a timeout is known to be transient.
+  connection?: string
+  /// Set by the store, not the CLI: this read failed transiently and the windows are the
+  /// last good ones, kept so a blip reads as "retrying" rather than as an empty ring.
+  lastKnown?: boolean
+}
+
+/// A failed read that will fix itself on a later poll: a timeout, a rate limit, a network
+/// error. Anything else the CLI reports with an error is a login the user has to renew.
+export function transientRead(provider: QuotaProvider): boolean {
+  if (provider.available || !provider.error) return false
+  if (provider.connection) return provider.connection !== 'terminalFailure' && provider.connection !== 'accessDenied'
+  return provider.error === 'Timed out.'
+}
+
+/// Carries the last good windows across a transient failure, per provider.
+function mergeProviders(previous: QuotaProvider[], next: QuotaProvider[]): QuotaProvider[] {
+  return next.map(row => {
+    if (!transientRead(row)) return row
+    const last = previous.find(p => p.id === row.id)
+    if (!last || (!last.available && !last.lastKnown)) return row
+    return { ...last, available: true, error: row.error, connection: row.connection, lastKnown: true }
+  })
 }
 
 export type DockQuota =
@@ -231,7 +255,7 @@ async function run(): Promise<void> {
       if (answer.state === 'ready') {
         failures = 0
         publish({
-          providers: answer.providers,
+          providers: mergeProviders(state.providers, answer.providers),
           loading: false,
           retrying: false,
           cliOutdated: false,
@@ -295,8 +319,9 @@ export function subscribeQuota(listener: Listener): () => void {
 export function connectionFor(provider: QuotaProvider, quota: QuotaState): Connection {
   // The CLI reports a provider it could not read as unavailable with the reason attached;
   // unavailable and silent means there were no credentials to read in the first place.
+  if (transientRead(provider)) return 'transientFailure'
   if (!provider.available) return provider.error ? 'terminalFailure' : 'disconnected'
-  if (quota.retrying) return 'transientFailure'
+  if (provider.lastKnown || quota.retrying) return 'transientFailure'
   if (quota.fetchedAt !== null && Date.now() - quota.fetchedAt > STALE_MS) return 'stale'
   return 'connected'
 }
