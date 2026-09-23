@@ -505,39 +505,27 @@ fn hug_rail(frame: DockFrame) -> DockFrame {
     }
 }
 
-/// Where the window must sit so the painted ball, pinned the way the page pins it,
-/// occupies `rail`. A right-docked ball is the window's right edge; if GTK refuses
-/// to shrink the window to the ball, the extra pixels hang off the other side.
-fn window_for_rail(edge: Edge, docked: bool, rail: Rect, window_w: i32, window_h: i32) -> Rect {
-    let window_w = window_w.max(rail.w).max(1);
-    let window_h = window_h.max(rail.h).max(1);
-    let (x, y) = match (docked, edge) {
-        (true, Edge::Right) => (rail.right() - window_w, rail.y),
-        (true, Edge::Bottom) => (rail.x, rail.bottom() - window_h),
-        _ => (rail.x, rail.y),
-    };
-    Rect { x, y, w: window_w, h: window_h }
-}
+/// The smallest window GTK/WebKit will actually give us, in logical pixels.
+/// Windows sizes a window to the rail exactly.
+#[cfg(target_os = "linux")]
+const MIN_WINDOW_EXTENT: i32 = 200;
+#[cfg(not(target_os = "linux"))]
+const MIN_WINDOW_EXTENT: i32 = 1;
 
-/// Pull the window toward `next` by at most one step. A corner used to swap
-/// orientation and land hundreds of pixels away in a single tick; a normal
-/// drag moves less than this in one poll, so it still tracks the pointer.
-fn smooth_window(prev: Rect, next: Rect) -> Rect {
-    fn step(from: i32, to: i32) -> i32 {
-        let delta = to - from;
-        const MAX_STEP: i32 = 48;
-        if delta.abs() <= MAX_STEP {
-            to
-        } else {
-            from + delta.signum() * MAX_STEP
-        }
-    }
-    Rect {
-        x: step(prev.x, next.x),
-        y: step(prev.y, next.y),
-        w: next.w,
-        h: next.h,
-    }
+/// The window a dragged rail rides in, and where the rail sits inside it. GTK
+/// will not shrink the window to the ball, and a resize can be dropped
+/// outright, so the window is at least `min` (the real size, or GTK's floor)
+/// on each side and stays inside the work area. Near an edge it stops and the
+/// rail keeps moving inside it. Painting the rail at the window's origin
+/// instead stopped the ball short of the right and bottom edges, and a window
+/// still at its resting height stuck the ball halfway down the screen.
+fn drag_window(rail: Rect, area: &Rect, min: (i32, i32)) -> (Rect, Rect) {
+    let w = rail.w.max(min.0).min(area.w.max(rail.w)).max(1);
+    let h = rail.h.max(min.1).min(area.h.max(rail.h)).max(1);
+    let x = rail.x.min(area.right() - w).max(area.x).min(rail.x);
+    let y = rail.y.min(area.bottom() - h).max(area.y).min(rail.y);
+    let window = Rect { x, y, w, h };
+    (window, rail.offset(-x, -y))
 }
 
 /// The edge a dropped rail belongs on. A drop always sticks: the along-edge position
@@ -997,7 +985,7 @@ static LAST_PLACE: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
 /// computed for a shorter window then sticks out of the work area and is
 /// dropped, so the ball stays up at the old origin and the hit target collapses.
 fn fitted_origin(target: Rect, area: &Rect) -> (i32, i32) {
-    const MIN_EXTENT: i32 = 200;
+    const MIN_EXTENT: i32 = MIN_WINDOW_EXTENT;
     let w = target.w.max(MIN_EXTENT);
     let h = target.h.max(MIN_EXTENT);
     if area.w <= 0 || area.h <= 0 {
@@ -1005,15 +993,22 @@ fn fitted_origin(target: Rect, area: &Rect) -> (i32, i32) {
     }
     let mut x = target.x;
     let mut y = target.y;
-    if target.right() >= area.right() - 4 {
-        x = area.right() - w;
-    } else if target.x <= area.x + 4 {
-        x = area.x;
+    // Only an axis GTK would not honour needs the snap. A window already at its
+    // real size, like a drag window, is placed exactly, or the painted rail
+    // inside it would shift by those few pixels.
+    if target.w < MIN_EXTENT {
+        if target.right() >= area.right() - 4 {
+            x = area.right() - w;
+        } else if target.x <= area.x + 4 {
+            x = area.x;
+        }
     }
-    if target.bottom() >= area.bottom() - 4 {
-        y = area.bottom() - h;
-    } else if target.y <= area.y + 4 {
-        y = area.y;
+    if target.h < MIN_EXTENT {
+        if target.bottom() >= area.bottom() - 4 {
+            y = area.bottom() - h;
+        } else if target.y <= area.y + 4 {
+            y = area.y;
+        }
     }
     (
         x.clamp(area.x, (area.right() - w).max(area.x)),
@@ -1057,9 +1052,10 @@ fn place_linux(window: &tauri::WebviewWindow, target: Rect) {
                     use gtk::prelude::GtkWindowExt;
                     if let Ok(gtk_window) = hosted.gtk_window() {
                         let (aw, ah) = gtk_window.size();
-                        if aw < w || ah < h {
+                        let (ww, wh) = (w.max(MIN_WINDOW_EXTENT), h.max(MIN_WINDOW_EXTENT));
+                        if (aw, ah) != (ww, wh) {
                             crate::log_line!(
-                                "codeburn dock: window is {aw}x{ah}, wanted {w}x{h}; resizing again"
+                                "codeburn dock: window is {aw}x{ah}, wanted {ww}x{wh}; resizing again"
                             );
                             gtk_window.resize(w, h);
                         }
@@ -1313,7 +1309,8 @@ pub fn begin_drag(app: &AppHandle, anchor: (i32, i32)) {
     let scale = state.scale;
     // Shrink to the painted rail before the first move. The bubble-sized window
     // cannot cross the screen, so the ball was stopping short of both edges.
-    let frame = hug_rail(frame);
+    let mut frame = hug_rail(frame);
+    (frame.window, frame.rail) = drag_window(frame.window, &state.area, (MIN_WINDOW_EXTENT, MIN_WINDOW_EXTENT));
     state.frame = Some(frame);
     state.drag = Some(Drag { ax, ay, last: None });
     // The page only calls this with the button down. XWayland does not report
@@ -1657,7 +1654,11 @@ fn apply_hit_rects(window: &tauri::WebviewWindow, rects: &[(i32, i32, i32, i32)]
     }
     let _ = std::fs::write(
         "/tmp/codeburn-dock-shape.txt",
-        format!("gdk-input rects={rects:?}\n"),
+        format!(
+            "gdk-input rects={rects:?} window={:?} rail={:?}\n",
+            frame.map(|f| f.window),
+            frame.map(|f| f.rail)
+        ),
     );
 }
 
@@ -1863,6 +1864,14 @@ fn clear_hover(app: &AppHandle) {
 }
 
 fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) -> u64 {
+    // What the window really is, not what it was last asked to be. Read before
+    // taking the state lock: the query waits on the main thread, which may be
+    // waiting on that lock.
+    let dragging = lock().drag.is_some();
+    let real_size = dragging
+        .then(|| window.inner_size().ok())
+        .flatten()
+        .map(|size| (size.width as i32, size.height as i32));
     let Some((cx, cy, over_window)) = pointer_sample() else {
         // The pointer left the shaped rail. Leaving the last sample in place keeps the
         // provider card open over empty desktop.
@@ -1932,15 +1941,23 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) -> u64 {
         };
         let progress = (1.0 - dist as f64 / DOCK_SNAP_DISTANCE as f64).clamp(0.0, 1.0);
         let key = Some((edge, (progress * 100.0).round() / 100.0));
-        // The painted ball is pinned to the docked edge of the window. If the
-        // window is wider than the ball, its other side hangs away from that edge
-        // so the ball itself can still sit on the screen edge.
-        let window_rect = window_for_rail(edge, frame.docked, rail, frame.window.w, frame.window.h);
-        let window_rect = smooth_window(frame.window, window_rect);
+        let floor = real_size
+            .map(|(w, h)| {
+                (
+                    ((w as f64 / scale).round() as i32).max(MIN_WINDOW_EXTENT),
+                    ((h as f64 / scale).round() as i32).max(MIN_WINDOW_EXTENT),
+                )
+            })
+            .unwrap_or((MIN_WINDOW_EXTENT, MIN_WINDOW_EXTENT));
+        let (window_rect, rail_local) = drag_window(rail, &area, floor);
         let moved = window_rect != frame.window;
+        // The page paints the rail at this offset. It only changes once the
+        // window has stopped against an edge and the rail moves on inside it.
+        let repaint = rail_local != frame.rail;
         let mut frame = frame;
         frame.window = window_rect;
-        if moved {
+        frame.rail = rail_local;
+        if moved || repaint {
             state.frame = Some(frame);
         }
         let changed = key != drag.last;
@@ -1950,15 +1967,20 @@ fn pointer_tick(app: &AppHandle, window: &tauri::WebviewWindow) -> u64 {
         drop(state);
         if moved {
             move_window(window, window_rect, scale);
+        } else if repaint {
+            // The window is parked against the edge and only the rail moved inside
+            // it. The input region has to follow, or the ball slides off it.
+            #[cfg(target_os = "linux")]
+            sync_hit_shape(window);
         }
-        if changed {
+        if changed || repaint {
             let _ = app.emit_to(
                 DOCK_LABEL,
                 "codeburn://dock-drag",
                 DragEvent {
                     attachment: progress,
                     edge: Some(edge),
-                    frame: None,
+                    frame: repaint.then_some(frame),
                 },
             );
         }
@@ -2153,7 +2175,12 @@ pub fn show(app: &AppHandle) -> tauri::Result<()> {
                 // for the ball's width stays wide and the ball never reaches the edge.
                 .min_inner_size(1.0, 1.0)
                 .decorations(false)
-                .resizable(false)
+                // GTK pins a fixed window's WM hints to min = max = whatever size
+                // it last computed. Mutter then clamped every later resize back to
+                // it, so a drop that needed 926x586 stayed at the drag's 200x570 and
+                // the ball was painted outside the window. Undecorated, there is no
+                // handle to resize it by anyway.
+                .resizable(cfg!(target_os = "linux"))
                 .always_on_top(true)
                 .skip_taskbar(true)
                 .focused(false)
@@ -2660,13 +2687,36 @@ mod tests {
     }
 
     #[test]
-    fn a_right_pinned_ball_reaches_the_screen_edge_even_if_the_window_is_wider() {
-        let rail = Rect { x: 1512, y: 200, w: 88, h: 186 };
-        let window = window_for_rail(Edge::Right, true, rail, 200, 186);
-        assert_eq!(window.right(), rail.right());
-        assert_eq!(window.y, rail.y);
-        let at_left = window_for_rail(Edge::Right, true, Rect { x: 0, ..rail }, 88, 186);
-        assert_eq!(at_left.x, 0);
+    fn a_dragged_ball_reaches_every_edge_inside_a_window_gtk_will_not_shrink() {
+        let area = Rect { x: 0, y: 32, w: 1600, h: 915 };
+        let tall = Rect { x: 0, y: 0, w: 88, h: 570 };
+        let wide = Rect { x: 0, y: 0, w: 570, h: 88 };
+        // GTK's floor, and a resting window whose shrink for the drag was dropped.
+        for (rail, floor) in [tall, wide].into_iter().flat_map(|r| [(r, (200, 200)), (r, (926, 586))]) {
+            for (x, y) in [
+                (area.x, area.y),
+                (area.right() - rail.w, area.y),
+                (area.x, area.bottom() - rail.h),
+                (area.right() - rail.w, area.bottom() - rail.h),
+                (area.right() - rail.w - 150, 300),
+                (700, area.bottom() - rail.h - 150),
+                (700, 300),
+            ] {
+                let rail = Rect { x, y, ..rail };
+                let (window, local) = drag_window(rail, &area, floor);
+                assert!(window.w >= floor.0 && window.h >= floor.1, "{window:?}");
+                assert!(window.x >= area.x && window.right() <= area.right(), "{window:?}");
+                assert!(window.y >= area.y && window.bottom() <= area.bottom(), "{window:?}");
+                assert!(local.x >= 0 && local.right() <= window.w, "{local:?} in {window:?}");
+                assert!(local.y >= 0 && local.bottom() <= window.h, "{local:?} in {window:?}");
+                // Where the page paints the rail is where the pointer put it.
+                assert_eq!(local.offset(window.x, window.y), rail);
+                // And the placement does not move a window that is already its real size.
+                let mut placed = window;
+                (placed.x, placed.y) = fitted_origin(window, &area);
+                assert_eq!(placed, window);
+            }
+        }
     }
 
     #[test]
@@ -2687,19 +2737,6 @@ mod tests {
         // A docked pin would stick the ball to the far edge of a window GTK
         // refuses to shrink, which is past the screen.
         assert!(!hugged.docked);
-    }
-
-    #[test]
-    fn a_large_move_steps_instead_of_jumping() {
-        let prev = Rect { x: 0, y: 0, w: 100, h: 400 };
-        let next = Rect { x: 500, y: 300, w: 400, h: 100 };
-        let stepped = smooth_window(prev, next);
-        assert_eq!(stepped.x, 48);
-        assert_eq!(stepped.y, 48);
-        // Size follows the target; position is what gets smoothed.
-        assert_eq!((stepped.w, stepped.h), (400, 100));
-        let done = smooth_window(Rect { x: 470, y: 280, w: 400, h: 100 }, next);
-        assert_eq!(done, next);
     }
 
     #[test]
