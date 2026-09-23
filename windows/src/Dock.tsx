@@ -1075,11 +1075,18 @@ export function Dock() {
   const pad = alongPad(m, attachment)
   const restLength = railLength(m, 1, attachment)
   const targetLength = railLength(m, rows, attachment)
-  const bodyLength = Math.round(restLength + (targetLength - restLength) * progress)
   const railRect = frame?.rail ?? { x: 0, y: 0, w: cross, h: restLength }
+  // The layout rail is the box the window was sized for. Growing the painted
+  // ball past it (the expand animation finishing before the next layout) shifts
+  // an end-anchored ball upward, off the top of the screen.
+  const alongRoom = Math.max(vertical ? railRect.h : railRect.w, restLength)
+  const bodyLength = Math.min(
+    Math.round(restLength + (targetLength - restLength) * progress),
+    alongRoom,
+  )
   // The frame's rail is the target; the visual rail grows from the anchored end toward it.
   const railTarget = vertical ? railRect.h : railRect.w
-  const alongOffset = anchor === 'end' ? railTarget - bodyLength : 0
+  const alongOffset = anchor === 'end' ? Math.max(railTarget - bodyLength, 0) : 0
   const railLeft = (vertical ? railRect.x : railRect.x + alongOffset) + glideDx
   const railTop = (vertical ? railRect.y + alongOffset : railRect.y) + glideDy
   const railW = vertical ? cross : bodyLength
