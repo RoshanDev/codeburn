@@ -2,6 +2,9 @@ export type QuotaWindow = {
   label: string
   percent: number
   resetsAt: string | null
+  /** When the window began, for an adapter whose API says so. Absent means the
+   *  start is not known, and a reader works it out from the label if it must. */
+  startsAt?: string | null
 }
 
 export type QuotaProvider = {

@@ -26,7 +26,8 @@ export function severity(percent: number): Severity {
   return 'normal'
 }
 
-export type QuotaWindow = { label: string; usedPct: number; resetsAt?: string }
+/// `startsAt` is sent only by adapters whose API names the window's start (Grok, Cursor).
+export type QuotaWindow = { label: string; usedPct: number; resetsAt?: string; startsAt?: string }
 
 /// The glance value: every provider on the same billing horizon, weekly if there is one, else
 /// monthly, else the window nearest exhaustion. Empty stays null rather than posing as 0%.

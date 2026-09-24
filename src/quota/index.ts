@@ -21,7 +21,7 @@ import type { ProviderName, QuotaProvider } from './types.js'
 import { fetchZaiQuota } from './zai.js'
 import { fetchZcodeQuota } from './zcode.js'
 
-export type QuotaCommandWindow = { label: string; usedPct: number; resetsAt?: string }
+export type QuotaCommandWindow = { label: string; usedPct: number; resetsAt?: string; startsAt?: string }
 
 export type QuotaCommandProvider = {
   id: ProviderName
@@ -93,6 +93,7 @@ function toWindows(quota: QuotaProvider): QuotaCommandWindow[] {
     label: row.label,
     usedPct: Math.round(row.percent * 1000) / 10,
     ...(row.resetsAt ? { resetsAt: row.resetsAt } : {}),
+    ...(row.startsAt ? { startsAt: row.startsAt } : {}),
   }))
 }
 

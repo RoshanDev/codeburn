@@ -151,8 +151,29 @@ export function decodeGrokCredential(raw: string): GrokCredential | 'malformed' 
   }
 }
 
-/** Grok bills one credit pool, so the window is named after how long it runs
- *  rather than by a label the API sends. */
+/** The period type the billing API sends, when it is one with a name. */
+const PERIOD_TYPE_LABELS: Record<string, string> = {
+  USAGE_PERIOD_TYPE_DAILY: 'Daily',
+  USAGE_PERIOD_TYPE_WEEKLY: 'Weekly',
+  USAGE_PERIOD_TYPE_MONTHLY: 'Monthly',
+}
+
+/** Grok bills one credit pool. The window is named by the period type the API
+ *  sends, else by its length, and only failing both by how long is left: a
+ *  weekly window three days from its reset is still weekly. */
+export function grokPeriodLabel(type: unknown, startsAt: number | null, resetsAt: number | null, now: number): string {
+  const named = typeof type === 'string' ? PERIOD_TYPE_LABELS[type] : undefined
+  if (named) return named
+  if (startsAt !== null && resetsAt !== null && resetsAt > startsAt) {
+    const days = Math.round((resetsAt - startsAt) / 86_400_000)
+    if (days === 1) return 'Daily'
+    if (days === 7) return 'Weekly'
+    if (days >= 28 && days <= 31) return 'Monthly'
+  }
+  return grokWindowLabel(resetsAt, now)
+}
+
+/** The fallback for a payload with no period: named after how long is left. */
 export function grokWindowLabel(resetsAt: number | null, now: number): string {
   if (resetsAt === null) return 'Credits'
   const days = Math.round((resetsAt - now) / 86_400_000)
@@ -189,11 +210,13 @@ export function decodeGrokBilling(body: unknown, now: number): GrokBilling | nul
   if (percent === null) return null
 
   const resetsAt = parseDate(config.currentPeriod?.end ?? config.billingPeriodEnd)
+  const startsAt = parseDate(config.currentPeriod?.start ?? config.billingPeriodStart)
   return {
     window: {
-      label: grokWindowLabel(resetsAt, now),
+      label: grokPeriodLabel(config.currentPeriod?.type, startsAt, resetsAt, now),
       percent: Math.min(1, Math.max(0, percent / 100)),
       resetsAt: resetsAt === null ? null : new Date(resetsAt).toISOString(),
+      ...(startsAt === null ? {} : { startsAt: new Date(startsAt).toISOString() }),
     },
     tier: nonEmpty(config.subscriptionTier) ?? nonEmpty(root.subscriptionTier),
   }

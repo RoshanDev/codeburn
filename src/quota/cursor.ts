@@ -140,7 +140,8 @@ export function decodeCursorUsage(body: unknown): QuotaProvider | null {
   if (monthly === null) return null
 
   const reset = resetsAt(data.billingCycleEnd)
-  const primary: QuotaWindow = { label: 'Monthly', percent: monthly, resetsAt: reset }
+  const start = resetsAt(data.billingCycleStart)
+  const primary: QuotaWindow = { label: 'Monthly', percent: monthly, resetsAt: reset, ...(start ? { startsAt: start } : {}) }
   const details = [primary]
   if (auto !== null) details.push({ label: 'Auto', percent: auto, resetsAt: reset })
   if (api !== null) details.push({ label: 'API', percent: api, resetsAt: reset })

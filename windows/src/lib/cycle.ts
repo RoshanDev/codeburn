@@ -1,8 +1,8 @@
 /// The Capacity Dock's "this cycle" strip: what each provider has spent since the quota window
-/// behind its ball last reset. The window's length is not in the quota answer, so it is read
-/// from the label, which the CLI's adapters derive from the length in the first place
-/// (`labelForSeconds` in src/quota/codex.ts). A window whose label names no length (Credits,
-/// a model id) has no cycle to show.
+/// behind its ball last reset. An adapter whose API names the start (Grok, Cursor) sends it as
+/// `startsAt`. For the rest the window's length is read from the label, which the CLI's
+/// adapters derive from the length in the first place (`labelForSeconds` in
+/// src/quota/codex.ts), and a window whose label names no length has no cycle to show.
 
 import { invoke } from '@tauri-apps/api/core'
 
@@ -10,6 +10,22 @@ import type { ProviderToday } from './glance'
 import type { QuotaWindow } from './quota'
 
 export type WindowSpan = { hours: number } | { months: number }
+
+/// The window's own start when the adapter sent one, else its reset less its length.
+function startOf(window: QuotaWindow): Date | null {
+  if (window.startsAt) {
+    const sent = new Date(window.startsAt)
+    if (!Number.isNaN(sent.getTime())) return sent
+  }
+  if (!window.resetsAt) return null
+  const span = windowSpan(window.label)
+  const reset = new Date(window.resetsAt)
+  if (!span || Number.isNaN(reset.getTime())) return null
+  const start = new Date(reset)
+  if ('months' in span) start.setUTCMonth(start.getUTCMonth() - span.months)
+  else start.setTime(start.getTime() - span.hours * 3_600_000)
+  return start
+}
 
 export function windowSpan(label: string): WindowSpan | null {
   const text = label.toLowerCase()
@@ -30,13 +46,8 @@ export function windowSpan(label: string): WindowSpan | null {
 /// lie in the future. Rounding keeps the value, and so the Rust cache key, still while
 /// resetsAt jitters by milliseconds between fetches, and reads Claude's 02:59:59.982 as 03:00.
 export function cycleStart(window: QuotaWindow | null, now = Date.now()): string | null {
-  if (!window?.resetsAt) return null
-  const span = windowSpan(window.label)
-  const reset = new Date(window.resetsAt)
-  if (!span || Number.isNaN(reset.getTime())) return null
-  const start = new Date(reset)
-  if ('months' in span) start.setUTCMonth(start.getUTCMonth() - span.months)
-  else start.setTime(start.getTime() - span.hours * 3_600_000)
+  const start = window ? startOf(window) : null
+  if (!start) return null
   start.setTime(Math.round(start.getTime() / 60_000) * 60_000)
   if (start.getTime() > now) return null
   return start.toISOString().replace('.000Z', 'Z')

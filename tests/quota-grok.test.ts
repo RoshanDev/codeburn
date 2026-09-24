@@ -7,7 +7,7 @@ import path from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { decodeGrokBilling, decodeGrokCredential, fetchGrokQuota, grokAuthPath, grokPlanLabel, grokWindowLabel } from '../src/quota/grok.js'
+import { decodeGrokBilling, decodeGrokCredential, fetchGrokQuota, grokAuthPath, grokPeriodLabel, grokPlanLabel, grokWindowLabel } from '../src/quota/grok.js'
 
 const neverFetch = (() => { throw new Error('the test must not reach the network') }) as unknown as typeof fetch
 const NOW = Date.parse('2026-09-01T10:00:00Z')
@@ -95,6 +95,30 @@ describe('Grok Build billing decoding', () => {
     expect(billing?.window.percent).toBe(0.25)
     expect(billing?.window.label).toBe('Monthly')
     expect(billing?.tier).toBe('supergrok')
+  })
+
+  it('names the window by the period the API sends and keeps its start, however close the reset', () => {
+    // Three days from its reset, which the days-left fallback would call Credits.
+    const billing = decodeGrokBilling({
+      config: {
+        creditUsagePercent: 79,
+        currentPeriod: { type: 'USAGE_PERIOD_TYPE_WEEKLY', start: '2026-09-20T14:56:44.145628+00:00', end: '2026-09-27T14:56:44.145628+00:00' },
+      },
+    }, Date.parse('2026-09-24T07:00:00Z'))
+    expect(billing?.window).toEqual({
+      label: 'Weekly',
+      percent: 0.79,
+      resetsAt: '2026-09-27T14:56:44.145Z',
+      startsAt: '2026-09-20T14:56:44.145Z',
+    })
+  })
+
+  it('falls back from the period type to the period length, then to the time left', () => {
+    const start = Date.parse('2026-09-01T00:00:00Z')
+    expect(grokPeriodLabel('USAGE_PERIOD_TYPE_MONTHLY', null, null, NOW)).toBe('Monthly')
+    expect(grokPeriodLabel(undefined, start, start + 7 * 86_400_000, start + 6 * 86_400_000)).toBe('Weekly')
+    expect(grokPeriodLabel(undefined, start, start + 30 * 86_400_000, start + 29 * 86_400_000)).toBe('Monthly')
+    expect(grokPeriodLabel('SOMETHING_NEW', null, NOW + 2 * 86_400_000, NOW)).toBe('Credits')
   })
 
   it('rejects a payload with no usable percentage', () => {

@@ -95,7 +95,7 @@ describe('Cursor quota decoding', () => {
     const quota = decodeCursorUsage(successBody)
     expect(quota?.connection).toBe('connected')
     expect(quota?.planLabel).toBe('Pro')
-    expect(quota?.primary).toEqual({ label: 'Monthly', percent: 0.425, resetsAt: '2026-09-01T00:00:00.000Z' })
+    expect(quota?.primary).toEqual({ label: 'Monthly', percent: 0.425, resetsAt: '2026-09-01T00:00:00.000Z', startsAt: '2026-08-01T00:00:00.000Z' })
     expect(quota?.details.map(row => row.label)).toEqual(['Monthly', 'Auto', 'API'])
     expect(quota?.details.map(row => row.percent)).toEqual([0.425, 0.2, 0.65])
     expect(quota?.footerLines).toEqual(['Source: Cursor app'])
