@@ -199,6 +199,14 @@ export function subscribeDailyBudget(onChange: (budget: number | null) => void):
   }
 }
 
+/// Asks for today's totals again. The answer reaches the dock through the same broadcast as
+/// every other payload. The popover's background loop refreshes only the tray's own key while
+/// it is closed, and with the tray set to anything but today, Today on the dock would
+/// otherwise stay wherever the popover last left it.
+export function refreshGlanceToday(): void {
+  void invoke('fetch_payload', TODAY_ALL).catch(() => null)
+}
+
 /// Subscribes to the cached glance. The cold-start fetch runs at most once, and only when
 /// nothing has been cached: its own answer comes back through the same broadcast, so there is
 /// one path into the state either way.

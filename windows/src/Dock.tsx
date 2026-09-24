@@ -36,6 +36,7 @@ import {
   providerTotals,
   todayFor,
   type ProviderToday,
+  refreshGlanceToday,
   subscribeDailyBudget,
   subscribeGlance,
   thousands,
@@ -77,6 +78,9 @@ import {
 import { cycleStart, fetchCycle, sinceLabel } from './lib/cycle'
 import { track } from './lib/telemetry'
 import './dock.css'
+
+/// How often an open card may re-ask for today's totals.
+const TODAY_REFRESH_MS = 60_000
 
 const PROVIDER_NAMES: Record<string, string> = {
   claude: 'Claude',
@@ -636,6 +640,8 @@ export function Dock() {
   // totals. Rust caches the slice of every payload the popover's own fetch goes past.
   const [glance, setGlance] = useState<Glance>(EMPTY_GLANCE)
   const [budget, setBudget] = useState<number | null>(null)
+  // When the dock last asked for today's totals itself; see the hover effect below.
+  const todayAskedAt = useRef(0)
   // Per-provider totals since each ball's quota window last reset, keyed by that start. A
   // start is asked for when its card opens; the last answer stands in while a fresh one runs.
   const [cycles, setCycles] = useState<Record<string, ProviderToday[]>>({})
@@ -1171,6 +1177,14 @@ export function Dock() {
     }
     // A quota refresh re-asks, which Rust answers from its cache until the answer is stale.
   }, [hoveredSince, quota.fetchedAt])
+  // An open card asks for today again, at most once a minute: with the popover closed nothing
+  // else refreshes it unless the tray itself shows today, and a stale Today beside a fresh
+  // This cycle would read as the cycle outspending the day.
+  useEffect(() => {
+    if (!hovered || Date.now() - todayAskedAt.current < TODAY_REFRESH_MS) return
+    todayAskedAt.current = Date.now()
+    refreshGlanceToday()
+  }, [hovered, quota.fetchedAt])
   const detailFrame = frame?.detail ?? null
   const tailEdge = opposite(frame?.bubbleSide ?? 'left')
   const detailW = m.detailWidth
