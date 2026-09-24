@@ -36,6 +36,19 @@ export type GlanceToday = {
   outputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
+  /// Per-provider rows for the same day; null on a CLI that sends no breakdown.
+  providerDetails: ProviderToday[] | null
+}
+
+/// One provider's share of today. Token counts are null when the CLI did not report them,
+/// which the card draws as a missing figure rather than as zero.
+export type ProviderToday = {
+  id: string
+  cost: number
+  calls: number
+  hasUsage: boolean
+  inputTokens: number | null
+  outputTokens: number | null
 }
 
 /// Both halves are absent for different reasons: no live-session block means the CLI never
@@ -92,6 +105,40 @@ export function sessionSubtitle(session: LiveSession, now = Date.now()): string 
 export function sessionsFor(glance: Glance, providerId: string): LiveSession[] | null {
   if (!glance.liveSessions) return null
   return glance.liveSessions.sessions.filter((session) => session.provider === providerId)
+}
+
+/// The payload rows one dock tile stands for. The mac's CapacityDockProvider.payloadProviderIDs:
+/// one subscription can be recorded under several names.
+function payloadProviderIds(providerId: string): string[] {
+  switch (providerId) {
+    case 'cursor': return ['cursor', 'cursor-agent']
+    case 'factory': return ['droid']
+    case 'clinepass': return ['cline', 'cline-cli']
+    default: return [providerId]
+  }
+}
+
+/// Today's totals for one provider's card, the mac's AppStore.capacityDockToday(for:). The
+/// machine-wide block would put the same figure on every card, so a payload without a
+/// breakdown hides the section; a provider missing from a breakdown that is present simply
+/// used nothing today.
+export function todayFor(glance: Glance, providerId: string): ProviderToday | null {
+  const details = glance.today?.providerDetails
+  if (!details || details.length === 0) return null
+  const ids = payloadProviderIds(providerId)
+  const rows = details.filter((row) => ids.includes(row.id))
+  const sum = (pick: (row: ProviderToday) => number | null): number | null => {
+    const present = rows.map(pick).filter((n): n is number => n !== null)
+    return present.length === 0 ? null : present.reduce((a, b) => a + b, 0)
+  }
+  return {
+    id: providerId,
+    cost: rows.reduce((total, row) => total + row.cost, 0),
+    calls: rows.reduce((total, row) => total + row.calls, 0),
+    hasUsage: rows.some((row) => row.hasUsage),
+    inputTokens: rows.length === 0 ? 0 : sum((row) => row.inputTokens),
+    outputTokens: rows.length === 0 ? 0 : sum((row) => row.outputTokens),
+  }
 }
 
 export function runningLabel(count: number): string {

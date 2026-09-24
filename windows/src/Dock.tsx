@@ -33,6 +33,7 @@ import {
   sessionSubtitle,
   sessionTitle,
   sessionsFor,
+  todayFor,
   subscribeDailyBudget,
   subscribeGlance,
   thousands,
@@ -397,7 +398,7 @@ function Detail({
   const now = Date.now()
   const connection: Connection = loading ? 'loading' : connectionFor(provider, quota)
   const sessions = sessionsFor(glance, provider.id)
-  const today = glance.today
+  const today = todayFor(glance, provider.id)
   const windows = provider.windows.slice(0, MAX_WINDOW_COLUMNS)
   const footer = footerLines(provider, fetchedAt, now)
   const action = loading ? null : connectionAction(provider)
@@ -460,14 +461,18 @@ function Detail({
               <span className="dock-today-burned">burned</span>
             </span>
             <span className="dock-today-stack">
-              <span className="dock-today-token">
-                <span className="dock-today-arrow">&darr;</span>
-                {compactTokens(today.inputTokens)}
-              </span>
-              <span className="dock-today-token">
-                <span className="dock-today-arrow">&uarr;</span>
-                {compactTokens(today.outputTokens)}
-              </span>
+              {today.inputTokens !== null ? (
+                <span className="dock-today-token">
+                  <span className="dock-today-arrow">&darr;</span>
+                  {compactTokens(today.inputTokens)}
+                </span>
+              ) : null}
+              {today.outputTokens !== null ? (
+                <span className="dock-today-token">
+                  <span className="dock-today-arrow">&uarr;</span>
+                  {compactTokens(today.outputTokens)}
+                </span>
+              ) : null}
               <span className="dock-today-calls">{thousands(today.calls)} calls</span>
             </span>
           </div>
@@ -478,7 +483,7 @@ function Detail({
         <section className={`dock-glance-windows${footer.length > 0 ? ' has-rule' : ''}`}>
           {windows.length === 0 ? (
             <p className="dock-budget-line">
-              {budget && budget > 0 ? `today ${usd(today?.cost ?? 0)} of ${usd(budget)}` : 'no budget set'}
+              {budget && budget > 0 ? `today ${usd(glance.today?.cost ?? 0)} of ${usd(budget)}` : 'no budget set'}
             </p>
           ) : (
             <div className="dock-window-row" style={{ textAlign: windowAlign }}>

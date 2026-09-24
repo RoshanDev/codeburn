@@ -25,6 +25,23 @@ pub struct Today {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// The payload's per-provider rows for the same day. Each glance card is one provider's,
+    /// so it draws its own row rather than the machine-wide figures above, which belong to
+    /// every card at once. None on a CLI old enough to send no breakdown.
+    pub provider_details: Option<Vec<ProviderDetail>>,
+}
+
+/// One provider's share of today. Token counts stay optional because a CLI up to 0.9.23 sent
+/// the row without them, and an absent count must not read as zero.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderDetail {
+    pub id: String,
+    pub cost: f64,
+    pub calls: u64,
+    pub has_usage: bool,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
 }
 
 /// What the dock is handed. Both halves are optional and mean different things when absent:
@@ -60,6 +77,32 @@ pub fn live_sessions_of(payload: &Value) -> Option<Value> {
     Some(block.clone())
 }
 
+fn optional_count(block: &Value, key: &str) -> Option<u64> {
+    block.get(key)?.as_f64()?;
+    Some(count(block, key))
+}
+
+fn provider_details_of(current: &Value) -> Option<Vec<ProviderDetail>> {
+    let rows = current.get("providerDetails")?.as_array()?;
+    Some(
+        rows.iter()
+            .filter_map(|row| {
+                Some(ProviderDetail {
+                    id: row.get("id")?.as_str()?.to_string(),
+                    cost: number(row, "cost"),
+                    calls: count(row, "calls"),
+                    has_usage: row
+                        .get("hasUsage")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    input_tokens: optional_count(row, "inputTokens"),
+                    output_tokens: optional_count(row, "outputTokens"),
+                })
+            })
+            .collect(),
+    )
+}
+
 pub fn today_of(payload: &Value) -> Option<Today> {
     let current = payload.get("current")?;
     Some(Today {
@@ -70,6 +113,7 @@ pub fn today_of(payload: &Value) -> Option<Today> {
         output_tokens: count(current, "outputTokens"),
         cache_read_tokens: count(current, "cacheReadTokens"),
         cache_write_tokens: count(current, "cacheWriteTokens"),
+        provider_details: provider_details_of(current),
     })
 }
 
@@ -156,6 +200,27 @@ mod tests {
         assert_eq!(today.output_tokens, 238_270);
         assert_eq!(today.cache_read_tokens, 696_179_871);
         assert_eq!(today.cache_write_tokens, 4_866_152);
+    }
+
+    #[test]
+    fn today_carries_each_providers_own_row() {
+        let mut value = payload(None, 12.0);
+        value["current"]["providerDetails"] = json!([
+            { "id": "claude", "cost": 9.5, "calls": 40, "hasUsage": true,
+              "inputTokens": 1000, "outputTokens": 2000 },
+            { "id": "codex", "cost": 2.5, "calls": 7, "hasUsage": true },
+        ]);
+        let details = today_of(&value).unwrap().provider_details.unwrap();
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[0].id, "claude");
+        assert_eq!(details[0].cost, 9.5);
+        assert_eq!(details[0].input_tokens, Some(1000));
+        assert_eq!(details[1].calls, 7);
+        assert_eq!(details[1].output_tokens, None);
+        assert!(today_of(&payload(None, 1.0))
+            .unwrap()
+            .provider_details
+            .is_none());
     }
 
     #[test]
