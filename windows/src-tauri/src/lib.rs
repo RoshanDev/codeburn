@@ -7,6 +7,7 @@ mod cli;
 mod config;
 mod dock;
 mod fx;
+mod cycle;
 mod glance;
 mod plan;
 mod refresh;
@@ -71,6 +72,8 @@ pub struct AppState {
     /// window with no payload of its own, and a second CLI run to give it one would double
     /// the cost of every refresh.
     pub glance: glance::GlanceCache,
+    /// Per-provider totals since the ball's quota window last reset, per start.
+    pub cycle: cycle::CycleCache,
 }
 
 /// What a second launch is asking the running app to do. An app with no window of its own
@@ -144,6 +147,7 @@ pub fn run() {
                 fx: FxCache::new(),
                 plan: plan::PlanClient::new(),
                 glance: glance::GlanceCache::new(),
+                cycle: cycle::CycleCache::new(),
             });
 
             #[cfg(target_os = "windows")]
@@ -238,6 +242,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::fetch_payload,
             commands::dock_glance,
+            commands::dock_cycle,
             commands::cli_status,
             commands::currency,
             commands::set_currency,
@@ -951,6 +956,21 @@ mod commands {
     #[tauri::command]
     pub fn dock_glance(state: State<'_, AppState>) -> Option<crate::glance::Glance> {
         state.glance.snapshot()
+    }
+
+    /// Per-provider totals since `since` (a whole UTC minute), for the dock's "this cycle"
+    /// strip. Cached per start; see `cycle.rs`.
+    #[tauri::command]
+    pub async fn dock_cycle(since: String, state: State<'_, AppState>) -> Result<Value, String> {
+        let cli = state.cli.lock().map_err(|e| e.to_string())?.clone();
+        state
+            .cycle
+            .get_or_run(&since, || async {
+                cli.fetch_provider_totals_since(&since)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await
     }
 
     /// Re-resolves the CLI each call so a freshly installed `codeburn` is picked up

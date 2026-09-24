@@ -117,6 +117,25 @@ export function parseDayFlag(day: string | undefined): { day: string; range: Dat
   return { day: resolvedDay, range: dayRangeForDate(date), label: formatDayRangeLabel(resolvedDay) }
 }
 
+/// The oldest start `--since` accepts. Every quota window a dock tile draws is a month or
+/// shorter; a bound keeps a stray timestamp from turning one poll into a years-long parse.
+const MAX_SINCE_MS = 45 * 24 * 60 * 60 * 1000
+
+/// `--since`: an exact instant (ISO 8601 date-time with an offset or Z) to now.
+export function parseSinceFlag(since: string | undefined, now = new Date()): DateRange | null {
+  if (since === undefined) return null
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/.test(since)) {
+    throw new UsageQueryError(`Invalid --since "${since}": expected an ISO 8601 date-time with an offset, e.g. 2026-09-18T14:00:00Z`)
+  }
+  const start = new Date(since)
+  if (Number.isNaN(start.getTime())) throw new UsageQueryError(`Invalid --since "${since}"`)
+  if (start > now) throw new UsageQueryError(`--since must not be in the future (got ${since})`)
+  if (now.getTime() - start.getTime() > MAX_SINCE_MS) {
+    throw new UsageQueryError(`--since must be within the last 45 days (got ${since})`)
+  }
+  return { start, end: now }
+}
+
 export function parseDateRangeFlags(from: string | undefined, to: string | undefined): DateRange | null {
   if (from === undefined && to === undefined) return null
 

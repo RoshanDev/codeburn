@@ -126,6 +126,21 @@ fn is_safe_arg(value: &str) -> bool {
         })
 }
 
+/// `YYYY-MM-DDTHH:MM:00Z`, the only instant the dock asks for: UTC and whole minutes, so the
+/// argument needs neither `+` nor anything else `is_safe_arg` rejects.
+pub fn is_utc_minute(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 20
+        && bytes.iter().enumerate().all(|(i, b)| match i {
+            4 | 7 => *b == b'-',
+            10 => *b == b'T',
+            13 | 16 => *b == b':',
+            17 | 18 => *b == b'0',
+            19 => *b == b'Z',
+            _ => b.is_ascii_digit(),
+        })
+}
+
 #[derive(Clone, Debug)]
 pub struct CodeburnCli {
     program: String,
@@ -291,6 +306,18 @@ impl CodeburnCli {
             serde_json::from_str(&stdout).with_context(|| "CLI returned invalid JSON")?;
         PAYLOAD_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(payload)
+    }
+
+    /// Spawns `codeburn status --format providers-json --since X`: per-provider totals from
+    /// the moment a quota window last reset, for the Capacity Dock's "this cycle" strip.
+    pub async fn fetch_provider_totals_since(&self, since: &str) -> Result<Value> {
+        if !is_utc_minute(since) {
+            bail!("invalid since argument");
+        }
+        let args = ["status", "--format", "providers-json", "--since", since];
+        let warm = PAYLOAD_SEEN.load(std::sync::atomic::Ordering::Relaxed);
+        let stdout = self.run_capture(&args, silence_window(warm)).await?;
+        serde_json::from_str(&stdout).with_context(|| "CLI returned invalid JSON")
     }
 
     /// Spawns `codeburn quota --format json` for the Capacity Dock. A CLI without the

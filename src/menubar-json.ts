@@ -651,7 +651,7 @@ function buildProviders(providers: ProviderCost[]): Record<string, number> {
   return map
 }
 
-function buildProviderDetails(providers: ProviderCost[]): MenubarPayload['current']['providerDetails'] {
+export function buildProviderDetails(providers: ProviderCost[]): MenubarPayload['current']['providerDetails'] {
   return providers
     .filter(p => p.cost >= 0)
     .map(p => ({

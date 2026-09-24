@@ -1,7 +1,7 @@
 import { homedir } from 'node:os'
 import { CATEGORY_LABELS, type ProjectSummary, type SessionSummary, type TaskCategory, type DateRange } from './types.js'
 import { behavioralCallWeight } from './behavioral-weight.js'
-import { type PeriodData, type ProviderCost, type BreakdownArrays, type MenubarPayload, type ClaudeConfigSelector, type HydrationState, buildMenubarPayload } from './menubar-json.js'
+import { type PeriodData, type ProviderCost, type BreakdownArrays, type MenubarPayload, type ClaudeConfigSelector, type HydrationState, buildMenubarPayload, buildProviderDetails } from './menubar-json.js'
 import { type SessionCountBasis } from './session-count-label.js'
 import { parseAllSessions, filterProjectsByName, filterProjectsByDays, filterProjectsByClaudeConfigSource, filterProjectsByDateRange, isSessionHydrationComplete, makeProjectFilter, type ProjectFilterTarget, sessionHydrationSnapshot } from './parser.js'
 type ProjectFilter = (entry: ProjectFilterTarget) => boolean
@@ -2035,4 +2035,38 @@ export async function buildMenubarPayloadForRange(periodInfo: PeriodInfo, opts: 
   const liveSessions = await collectLiveSessions().catch(() => null)
   if (liveSessions) payload.liveSessions = liveSessions
   return payload
+}
+
+export type ProviderTotalsSince = {
+  start: string
+  end: string
+  providerDetails: MenubarPayload['current']['providerDetails']
+}
+
+/// Per-provider totals from an exact instant to now: the Capacity Dock's "this cycle" strip,
+/// whose cycle starts wherever a quota window last reset. The durable path is keyed by whole
+/// days, so a window that reset at 14:00 would also count the morning before it; this parses
+/// the range itself, and the parser slices every call by its own timestamp. Daily-aggregate
+/// providers are left out because a day-granular row cannot be cut at an hour.
+export async function buildProviderTotalsSince(
+  start: Date,
+  opts: { project?: string[]; exclude?: string[] } = {},
+): Promise<ProviderTotalsSince> {
+  const end = new Date()
+  const projects = filterProjectsByName(
+    await parseAllSessions({ start, end }, 'all'),
+    opts.project ?? [],
+    opts.exclude ?? [],
+  )
+  const totals: Record<string, ProviderSliceTotal> = {}
+  for (const day of aggregateProjectsIntoDays(projects)) {
+    for (const [name, slice] of Object.entries(day.providers)) addProviderSlice(totals, name, slice)
+  }
+  const displayNameByName = new Map((await getAllProviders()).map(p => [p.name, p.displayName]))
+  const providers: ProviderCost[] = Object.entries(totals).map(([name, total]) => ({
+    name,
+    displayName: displayNameByName.get(name) ?? name,
+    ...total,
+  }))
+  return { start: start.toISOString(), end: end.toISOString(), providerDetails: buildProviderDetails(providers) }
 }

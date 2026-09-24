@@ -120,10 +120,15 @@ function payloadProviderIds(providerId: string): string[] {
 
 /// Today's totals for one provider's card, the mac's AppStore.capacityDockToday(for:). The
 /// machine-wide block would put the same figure on every card, so a payload without a
-/// breakdown hides the section; a provider missing from a breakdown that is present simply
-/// used nothing today.
+/// breakdown hides the section.
 export function todayFor(glance: Glance, providerId: string): ProviderToday | null {
-  const details = glance.today?.providerDetails
+  return providerTotals(glance.today?.providerDetails ?? null, providerId)
+}
+
+/// One card's share of a per-provider breakdown, folding the rows its subscription is
+/// recorded under. A provider missing from a breakdown that is present used nothing, which is
+/// a real zero; no breakdown at all is null.
+export function providerTotals(details: ProviderToday[] | null, providerId: string): ProviderToday | null {
   if (!details || details.length === 0) return null
   const ids = payloadProviderIds(providerId)
   const rows = details.filter((row) => ids.includes(row.id))

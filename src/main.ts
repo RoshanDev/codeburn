@@ -21,7 +21,7 @@ import { behavioralCallWeight } from './behavioral-weight.js'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
 import type { AppliedFix } from './act/types.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
-import { buildPeriodData, buildMenubarPayloadForRange, buildDurablePeriod, getDailyCacheConfigHash, SERVE_HYDRATION_ENV, type DurablePeriod } from './usage-aggregator.js'
+import { buildPeriodData, buildMenubarPayloadForRange, buildDurablePeriod, buildProviderTotalsSince, getDailyCacheConfigHash, SERVE_HYDRATION_ENV, type DurablePeriod } from './usage-aggregator.js'
 import { aggregateProjectsIntoDays } from './day-aggregator.js'
 import { buildPeriodDiffReport, defaultSevenDayRanges, diffSessions, dayKeyToRange, historyBasis, localRangeInfo } from './period-diff.js'
 import { loadStatusSnapshot, saveStatusSnapshot } from './session-cache.js'
@@ -38,7 +38,7 @@ import { pairingCode } from './sharing/pairing.js'
 import { ShareController } from './sharing/share-controller.js'
 import { getSharingDir, loadRemotes, saveRemotes } from './sharing/store.js'
 import type { UsageQuery } from './sharing/share-server.js'
-import { formatDateRangeLabel, parseDateRangeFlags, parseDayFlag, parseDaysFlag, getDateRange, periodInfoFromQuery, toPeriod, type Period } from './cli-date.js'
+import { formatDateRangeLabel, parseDateRangeFlags, parseSinceFlag, parseDayFlag, parseDaysFlag, getDateRange, periodInfoFromQuery, toPeriod, type Period } from './cli-date.js'
 import { runOptimize } from './optimize.js'
 import { registerActCommands } from './act/cli.js'
 import { registerGuardCommands } from './guard/cli.js'
@@ -1156,9 +1156,10 @@ program
 program
   .command('status')
   .description('Compact status output (today + month)')
-  .option('--format <format>', 'Output format: terminal, menubar-json, json', 'terminal')
+  .option('--format <format>', 'Output format: terminal, menubar-json, json, providers-json', 'terminal')
   .option('--scope <scope>', 'Usage scope for menubar-json: local, combined', 'local')
   .option('--provider <provider>', 'Filter by provider (e.g. claude, gemini, cursor, copilot)', 'all')
+  .option('--since <datetime>', 'Exact start (ISO 8601 date-time) for providers-json; the range runs to now')
   .option('--project <name>', 'Show only projects matching name (repeatable)', collect, [])
   .option('--exclude <name>', 'Exclude projects matching name (repeatable)', collect, [])
   .option('--period <period>', 'Primary period for menubar-json: today, week, 30days, month, all, lifetime', 'today')
@@ -1170,7 +1171,15 @@ program
   .option('--no-timeline', 'Skip the granular timeline (menubar-json only, faster)')
   .addOption(new Option('--claude-config-source <id>').hideHelp())
   .action(async (opts) => {
-    assertFormat(opts.format, ['terminal', 'menubar-json', 'json'], 'status')
+    assertFormat(opts.format, ['terminal', 'menubar-json', 'json', 'providers-json'], 'status')
+    if ((opts.format === 'providers-json') !== (opts.since !== undefined)) {
+      process.stderr.write('error: --format providers-json and --since go together\n')
+      process.exit(1)
+    }
+    if (opts.since && (opts.day || opts.from || opts.to || opts.days || opts.scope !== 'local' || opts.provider !== 'all')) {
+      process.stderr.write('error: --since cannot be combined with --day, --from, --to, --days, --scope combined, or --provider\n')
+      process.exit(1)
+    }
     assertScope(opts.scope, ['local', 'combined'], 'status')
     assertProvider(opts.provider, 'status')
     if (opts.day && (opts.from || opts.to)) {
@@ -1203,6 +1212,12 @@ program
     await loadPricing()
     const pf = opts.provider
     const fp = (p: ProjectSummary[]) => filterProjectsByName(p, opts.project, opts.exclude)
+    if (opts.format === 'providers-json') {
+      // Per-provider totals from an exact instant, for a quota window that resets mid-day.
+      const range = parseSinceFlag(opts.since)!
+      console.log(JSON.stringify(await buildProviderTotalsSince(range.start, { project: opts.project, exclude: opts.exclude })))
+      return
+    }
     if (opts.format === 'menubar-json') {
       const daysSelection = parseDaysFlag(opts.days)
       const customRange = daysSelection ? null : parseDateRangeFlags(opts.from, opts.to)

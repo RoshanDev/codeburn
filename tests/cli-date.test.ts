@@ -4,6 +4,7 @@ import {
   PERIODS,
   PERIOD_LABELS,
   parsePeriodOrThrow,
+  parseSinceFlag,
   periodInfoFromQuery,
   toPeriod,
   type Period,
@@ -180,5 +181,26 @@ describe('toPeriod', () => {
       exitSpy.mockRestore()
       stderrSpy.mockRestore()
     }
+  })
+})
+
+describe('parseSinceFlag', () => {
+  const now = new Date('2026-09-24T06:00:00Z')
+
+  it('keeps the exact instant, not the start of its day', () => {
+    const range = parseSinceFlag('2026-09-18T14:30:00+08:00', now)!
+    expect(range.start.toISOString()).toBe('2026-09-18T06:30:00.000Z')
+    expect(range.end).toBe(now)
+  })
+
+  it('is absent when the flag is', () => {
+    expect(parseSinceFlag(undefined, now)).toBeNull()
+  })
+
+  it('refuses a bare date, a missing offset, the future and anything older than 45 days', () => {
+    expect(() => parseSinceFlag('2026-09-18', now)).toThrow(/ISO 8601/)
+    expect(() => parseSinceFlag('2026-09-18T14:00:00', now)).toThrow(/ISO 8601/)
+    expect(() => parseSinceFlag('2026-09-25T00:00:00Z', now)).toThrow(/future/)
+    expect(() => parseSinceFlag('2026-08-01T00:00:00Z', now)).toThrow(/45 days/)
   })
 })

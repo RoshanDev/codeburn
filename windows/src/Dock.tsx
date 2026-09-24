@@ -33,7 +33,9 @@ import {
   sessionSubtitle,
   sessionTitle,
   sessionsFor,
+  providerTotals,
   todayFor,
+  type ProviderToday,
   subscribeDailyBudget,
   subscribeGlance,
   thousands,
@@ -72,6 +74,7 @@ import {
   type QuotaWindow,
   type Severity,
 } from './dockGeometry'
+import { cycleStart, fetchCycle, sinceLabel } from './lib/cycle'
 import { track } from './lib/telemetry'
 import './dock.css'
 
@@ -374,6 +377,33 @@ function drawsWindows(connection: Connection): boolean {
   return connection !== 'disconnected' && connection !== 'terminalFailure'
 }
 
+/// Cost burned beside the token and call counts: the Today strip and the This cycle strip.
+function UsageFigures({ totals }: { totals: ProviderToday }) {
+  return (
+    <div className="dock-today">
+      <span className="dock-today-figure">
+        <span className="dock-today-cost">{usd(totals.cost)}</span>
+        <span className="dock-today-burned">burned</span>
+      </span>
+      <span className="dock-today-stack">
+        {totals.inputTokens !== null ? (
+          <span className="dock-today-token">
+            <span className="dock-today-arrow">&darr;</span>
+            {compactTokens(totals.inputTokens)}
+          </span>
+        ) : null}
+        {totals.outputTokens !== null ? (
+          <span className="dock-today-token">
+            <span className="dock-today-arrow">&uarr;</span>
+            {compactTokens(totals.outputTokens)}
+          </span>
+        ) : null}
+        <span className="dock-today-calls">{thousands(totals.calls)} calls</span>
+      </span>
+    </div>
+  )
+}
+
 /// The glance popover. Sections stack at fixed heights, every one a whole pixel, separated by
 /// hairlines drawn as overlays so a rule never adds a pixel the height did not reserve. The
 /// page measures the result and Rust lays the window out around it.
@@ -382,6 +412,7 @@ function Detail({
   provider,
   quota,
   glance,
+  cycle,
   budget,
   loading,
   fetchedAt,
@@ -390,6 +421,7 @@ function Detail({
   provider: Provider
   quota: QuotaState
   glance: Glance
+  cycle: { since: string; rows: ProviderToday[] | null } | null
   budget: number | null
   loading: boolean
   fetchedAt: number | null
@@ -399,6 +431,7 @@ function Detail({
   const connection: Connection = loading ? 'loading' : connectionFor(provider, quota)
   const sessions = sessionsFor(glance, provider.id)
   const today = todayFor(glance, provider.id)
+  const cycleTotals = cycle ? providerTotals(cycle.rows, provider.id) : null
   const windows = provider.windows.slice(0, MAX_WINDOW_COLUMNS)
   const footer = footerLines(provider, fetchedAt, now)
   const action = loading ? null : connectionAction(provider)
@@ -455,27 +488,19 @@ function Detail({
           <div className="dock-glance-caption">
             <span>Today</span>
           </div>
-          <div className="dock-today">
-            <span className="dock-today-figure">
-              <span className="dock-today-cost">{usd(today.cost)}</span>
-              <span className="dock-today-burned">burned</span>
-            </span>
-            <span className="dock-today-stack">
-              {today.inputTokens !== null ? (
-                <span className="dock-today-token">
-                  <span className="dock-today-arrow">&darr;</span>
-                  {compactTokens(today.inputTokens)}
-                </span>
-              ) : null}
-              {today.outputTokens !== null ? (
-                <span className="dock-today-token">
-                  <span className="dock-today-arrow">&uarr;</span>
-                  {compactTokens(today.outputTokens)}
-                </span>
-              ) : null}
-              <span className="dock-today-calls">{thousands(today.calls)} calls</span>
+          <UsageFigures totals={today} />
+        </section>
+      ) : null}
+
+      {cycle ? (
+        <section className="dock-glance-block has-rule">
+          <div className="dock-glance-caption">
+            <span>This cycle</span>
+            <span className="dock-glance-caption-end">
+              {cycle.rows ? sinceLabel(cycle.since, now) : 'loading…'}
             </span>
           </div>
+          {cycleTotals ? <UsageFigures totals={cycleTotals} /> : null}
         </section>
       ) : null}
 
@@ -611,6 +636,9 @@ export function Dock() {
   // totals. Rust caches the slice of every payload the popover's own fetch goes past.
   const [glance, setGlance] = useState<Glance>(EMPTY_GLANCE)
   const [budget, setBudget] = useState<number | null>(null)
+  // Per-provider totals since each ball's quota window last reset, keyed by that start. A
+  // start is asked for when its card opens; the last answer stands in while a fresh one runs.
+  const [cycles, setCycles] = useState<Record<string, ProviderToday[]>>({})
   const [prefs, setPrefs] = useState<DockPrefs>(DEFAULT_DOCK_PREFS)
   // Nothing may be written back before the stored preferences have arrived: the defaults say
   // nobody has chosen a provider set yet, and acting on that would overwrite one.
@@ -1037,7 +1065,7 @@ export function Dock() {
     }
     const el = detailRef.current
     if (el) setDetailHeight(Math.ceil(el.offsetHeight))
-  }, [hovered, quota, glance, budget, m])
+  }, [hovered, quota, glance, cycles, budget, m])
 
   const rows = ordered.length
   const totalRows = Math.max(selected.length, 1)
@@ -1127,6 +1155,22 @@ export function Dock() {
   const tucked = presence !== 'present'
 
   const hoveredProvider = hovered ? (ordered.find((p) => p.id === hovered) ?? null) : null
+  // The window the ball's percentage is read from, so the strip covers the same stretch.
+  const hoveredSince =
+    hoveredProvider?.available ? cycleStart(headlineWindow(hoveredProvider.windows)) : null
+  useEffect(() => {
+    if (!hoveredSince) return
+    let cancelled = false
+    fetchCycle(hoveredSince)
+      .then((rows) => {
+        if (!cancelled) setCycles((current) => ({ ...current, [hoveredSince]: rows }))
+      })
+      .catch(() => null)
+    return () => {
+      cancelled = true
+    }
+    // A quota refresh re-asks, which Rust answers from its cache until the answer is stale.
+  }, [hoveredSince, quota.fetchedAt])
   const detailFrame = frame?.detail ?? null
   const tailEdge = opposite(frame?.bubbleSide ?? 'left')
   const detailW = m.detailWidth
@@ -1264,6 +1308,7 @@ export function Dock() {
             provider={hoveredProvider}
             quota={quota}
             glance={glance}
+            cycle={hoveredSince ? { since: hoveredSince, rows: cycles[hoveredSince] ?? null } : null}
             budget={budget}
             loading={loading}
             fetchedAt={quota.fetchedAt}
