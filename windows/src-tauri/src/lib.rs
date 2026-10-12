@@ -469,10 +469,15 @@ fn init_tray_linux(app: AppHandle, handle: tray_linux::LinuxTrayHandle) {
         }
     });
 
-    // Left-click on the tray: show popover anchored to the click coordinates.
+    // A hidden dock must be recoverable from the tray. Enable rather than toggle it:
+    // SNI hosts can deliver two activations for a double-click.
+    // Keep opening the usage popover at the click coordinates as before.
     let activate_app = app.clone();
     app.listen_any("codeburn://tray-activate", move |event| {
         let anchor = parse_click(event.payload());
+        if !dock::is_enabled() {
+            set_dock_enabled(&activate_app, true);
+        }
         toggle_popover(&activate_app, anchor);
     });
 
