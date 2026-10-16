@@ -3,8 +3,9 @@ import { isAbsolute, join } from 'path'
 import { homedir } from 'os'
 
 import { createClineProvider, getClineDataPath } from '../src/providers/cline.js'
-import { createRooCodeProvider } from '../src/providers/roo-code.js'
 import { createKiloCodeProvider } from '../src/providers/kilo-code.js'
+import { createAmpProvider } from '../src/providers/amp.js'
+import { createCommandCodeProvider } from '../src/providers/command-code.js'
 import { createGrokProvider } from '../src/providers/grok.js'
 import { createPiProvider, createOmpProvider } from '../src/providers/pi.js'
 import { createKimiProvider } from '../src/providers/kimi.js'
@@ -28,7 +29,7 @@ import { createMistralVibeProvider, getMistralVibeSessionsDir } from '../src/pro
 // that one and is still open; fold the two together once it lands.
 
 const CLINE_EXTENSION = 'saoudrizwan.claude-dev'
-const ROO_EXTENSION = 'rooveterinaryinc.roo-cline'
+const KILO_EXTENSION = 'kilocode.kilo-code'
 
 describe('probeRoots mirrors discovery resolution (Tier 2, batch 1)', () => {
   it('cline reports exactly the roots discovery scans', async () => {
@@ -50,26 +51,18 @@ describe('probeRoots mirrors discovery resolution (Tier 2, batch 1)', () => {
     ])
   })
 
-  it('roo-code reports the override, or exactly the VS Code variant roots', async () => {
-    expect(await createRooCodeProvider('/tmp/roo-a').probeRoots!()).toEqual([
-      { path: '/tmp/roo-a', label: 'tasks' },
-    ])
-    expect(await createRooCodeProvider().probeRoots!()).toEqual(
-      getVSCodeGlobalStoragePaths(ROO_EXTENSION).map(path => ({ path, label: 'tasks' })),
-    )
-  })
-
   // Regression: an earlier draft mirrored the resolution in a local helper that
   // detected "no override" with `=== undefined`, while discoverClineTasks uses
   // truthiness. An empty-string override made doctor report [""] while
   // discovery scanned the three default roots. Both now call one resolver.
   it('an empty-string override resolves the same for probeRoots and discovery', async () => {
-    const probed = (await createRooCodeProvider('').probeRoots!()).map(r => r.path)
-    expect(probed).toEqual(clineTaskRoots(ROO_EXTENSION, ''))
-    expect(probed).toEqual(getVSCodeGlobalStoragePaths(ROO_EXTENSION))
+    const probed = (await createKiloCodeProvider('').probeRoots!()).filter(r => r.label === 'tasks').map(r => r.path)
+    expect(probed).toEqual(clineTaskRoots(KILO_EXTENSION, ''))
+    expect(probed).toEqual(getVSCodeGlobalStoragePaths(KILO_EXTENSION))
     // discoverClineTasks resolves through the same function, so an empty
     // override cannot send discovery somewhere probeRoots did not report.
-    expect(await discoverClineTasks(ROO_EXTENSION, 'roo-code', 'Roo Code', '')).toEqual([])
+    const discovered = await discoverClineTasks(KILO_EXTENSION, 'kilo-code', 'KiloCode', '')
+    for (const source of discovered) expect(probed.some(root => source.path.startsWith(root))).toBe(true)
   })
 
   it('kilo-code reports both halves of its discovery: tasks and the sqlite store', async () => {
@@ -86,9 +79,29 @@ describe('probeRoots mirrors discovery resolution (Tier 2, batch 1)', () => {
   it('grok reports exactly its resolved sessions dir', async () => {
     expect(await createGrokProvider('/tmp/grok-a').probeRoots!()).toEqual([
       { path: '/tmp/grok-a', label: 'sessions' },
+      { path: join('/tmp', 'logs', 'unified.jsonl'), label: 'unified log' },
     ])
     expect(await createGrokProvider().probeRoots!()).toEqual([
       { path: join(homedir(), '.grok', 'sessions'), label: 'sessions' },
+      { path: join(homedir(), '.grok', 'logs', 'unified.jsonl'), label: 'unified log' },
+    ])
+  })
+
+  it('amp reports exactly its resolved threads dir', async () => {
+    expect(await createAmpProvider(['/tmp/amp-a']).probeRoots!()).toEqual([
+      { path: join('/tmp/amp-a', 'threads'), label: 'threads' },
+    ])
+    expect(await createAmpProvider().probeRoots!()).toEqual([
+      { path: join(homedir(), '.local', 'share', 'amp', 'threads'), label: 'threads' },
+    ])
+  })
+
+  it('command-code reports exactly its projects dir', async () => {
+    expect(await createCommandCodeProvider('/tmp/cc-a').probeRoots!()).toEqual([
+      { path: '/tmp/cc-a', label: 'projects' },
+    ])
+    expect(await createCommandCodeProvider().probeRoots!()).toEqual([
+      { path: join(homedir(), '.commandcode', 'projects'), label: 'projects' },
     ])
   })
 

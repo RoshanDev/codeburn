@@ -1,12 +1,13 @@
 import { useState, type MouseEvent, type ReactNode } from 'react'
 
-import { version } from '../../package.json'
+import { displayVersion } from '../lib/platform'
 import { FlameMark } from './FlameMark'
 import { Icon } from './icons'
 import { BUILD_STAMP } from '../lib/build'
 import { useEscape } from '../hooks/useEscape'
 import { t } from '../i18n'
-import { updateDownloadUrl, useUpdateStatus } from '../hooks/useUpdateStatus'
+import { useUpdateStatus } from '../hooks/useUpdateStatus'
+import { UpdateAction } from './UpdateBanner'
 import { codeburn } from '../lib/ipc'
 import { DUR, useExitAnimation } from '../lib/motion'
 
@@ -53,7 +54,7 @@ export function AboutModal({ socials = SOCIALS, openKey, onClose }: { socials?: 
           <div className="about-modal-hero">
             <span className="about-modal-logo" aria-hidden="true"><FlameMark size={52} /></span>
             <div className="about-modal-name" id="about-modal-title">CodeBurn</div>
-            <div className="about-modal-version">v{version}</div>
+            <div className="about-modal-version">v{displayVersion()}</div>
             <div className="about-modal-build">{BUILD_STAMP}</div>
             <div className="about-modal-tagline">{t('shared.aboutModal.tagline')}</div>
           </div>
@@ -73,7 +74,7 @@ export function AboutModal({ socials = SOCIALS, openKey, onClose }: { socials?: 
                 </a>
               ))}
             </div>
-            <div className="about-modal-section about-modal-updates">
+            {!status?.storeManaged && <div className="about-modal-section about-modal-updates">
               <div className="about-modal-section-title">{t('shared.aboutModal.updatesTitle')}</div>
               <button
                 className="about-modal-update-button"
@@ -87,13 +88,7 @@ export function AboutModal({ socials = SOCIALS, openKey, onClose }: { socials?: 
                   {status?.updateAvailable && status.tag ? (
                     <>
                       {t('shared.aboutModal.updateAvailable', { version: status.latestVersion ?? '' })}{' '}
-                      <button
-                        type="button"
-                        className="set-text-button"
-                        onClick={() => { void codeburn.openExternal(updateDownloadUrl(status.tag!)) }}
-                      >
-                        {t('shared.aboutModal.download')}
-                      </button>
+                      <UpdateAction status={status} downloadLabel={t('shared.aboutModal.download')} />
                     </>
                   ) : status?.latestVersion ? (
                     t('shared.aboutModal.upToDate')
@@ -102,7 +97,7 @@ export function AboutModal({ socials = SOCIALS, openKey, onClose }: { socials?: 
                   )}
                 </p>
               )}
-            </div>
+            </div>}
           </div>
         </div>
         <div className="about-modal-credit">{t('shared.aboutModal.developedBy')}</div>

@@ -5,15 +5,17 @@ import { createHash } from 'crypto'
 import { performance } from 'node:perf_hooks'
 import { basename, dirname, join, resolve, sep } from 'path'
 import { FS_SCAN_CONCURRENCY, mapWithConcurrency, readSessionLines } from './fs-utils.js'
-import { billableOutputTokens, calculateCost, calculateLocalModelSavings, getShortModelName, modelRowKey, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash } from './models.js'
+import { billableOutputTokens, calculateCost, calculateLocalModelSavings, getShortModelName, modelRowKey, pricingModelAt, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash, recordedCostFallback, getModelRoute, isStandInPricedAt } from './models.js'
 import { resolveSubagentAttribution, sessionIdentity } from './sessions-report.js'
+import { applyCodexSessionNames } from './codex-session-index.js'
 import { normalizeContentBlocks, flatSlice, flatString } from './content-utils.js'
 import { discoverAllSessions, discoverAllSessionsWithFailures, getProvider } from './providers/index.js'
 import { evictCachedCodexResults, flushCodexCache, readCachedCodexResults, withCodexCacheDirectory, writeCachedCodexResults } from './codex-cache.js'
-import { antigravityCascadeIdFromPath, flushAntigravityCache, shouldReparseAntigravitySource } from './providers/antigravity.js'
+import { antigravityCascadeIdFromPath, flushAntigravityCache, preloadAntigravityCache, shouldReparseAntigravitySource } from './providers/antigravity.js'
 import { getClaudeConfigDirs, getDesktopSessionsDirs } from './providers/claude.js'
 import { kimicodeLineageForSource } from './providers/kimicode.js'
 import { isSqliteBusyError } from './sqlite.js'
+import { clearProviderIssue, recordProviderIssue } from './provider-issues.js'
 import { getCodeburnCacheDir } from './cache-dir.js'
 import {
   isHermesLedgerPublicationError,
@@ -28,18 +30,27 @@ import {
   type ProviderSection,
   type SessionCache,
   beginColdHydration,
+  cacheEntriesInLoadOrder,
+  cacheHiddenFingerprint,
+  cacheStubs,
   cleanupOrphanedTempFiles,
   computeEnvFingerprint,
   DURABLE_PROVIDER_NAMES,
+  evictCacheStub,
   fingerprintFile,
+  hasCachedEntries,
   hasDirtyDurableProvider,
   isCacheComplete,
   isCacheCurrent,
   isCacheDirty,
+  isCacheStub,
   loadCache,
+  loadCacheHiddenKeys,
+  loadCacheStubs,
   markCacheDirty,
   markProviderComplete,
   monthScopeForRange,
+  type CacheLoadScope,
   reconcileFile,
   saveCache,
   sourcePathStatCandidates,
@@ -49,8 +60,10 @@ import { classifyWslCachePath, isWslUncPath, refreshWslHomes, wslMode } from './
 import { decideParseWorkers, parseFilesInOrder, ParseWorkerPool, type ClaudeWorkerParse, type ParseJob } from './parse-workers.js'
 import type { CodexFullParse } from './providers/codex.js'
 import { dateKey } from './day-aggregator.js'
+import { folderNameOriginKey, isTemporaryProjectPath, linkedOriginKey, projectOriginKey, saveGitOrigins, TEMPORARY_PROJECTS } from './git-origin.js'
 import { behavioralCallWeight, isBehavioralTurn } from './behavioral-weight.js'
 import { gatewayIncludedInTotals } from './config.js'
+import { coverageFor, cursorImportPath, dropImportCoveredCalls, loadCursorImport, replacedProviders } from './cursor-import.js'
 import type { ParsedProviderCall, Provider, SessionSource } from './providers/types.js'
 import type {
   ApiUsageIteration,
@@ -118,6 +131,60 @@ export function normalizeProjectPathKey(projectPath: string): string {
 function projectNameFromPath(projectPath: string, fallback: string): string {
   const normalized = projectPath.trim().replace(/\\/g, '/').replace(/\/+$/, '')
   return normalized.split('/').filter(Boolean).pop() ?? fallback
+}
+
+type CallProject = { key: string; path: string; name: string }
+
+async function resolveClaudeCallProject(cwd: string, filePath: string): Promise<CallProject | null> {
+  if (isCoworkSession(cwd, filePath)) return null
+  const canonical = await resolveCanonicalProjectPath(cwd)
+  return {
+    key: normalizeProjectPathKey(canonical.path),
+    path: canonical.path,
+    // Claude Code names a project directory by replacing every non-alphanumeric
+    // character of its cwd with '-', so a slice lands under the same label.
+    name: canonical.isWorktree ? projectNameFromPath(canonical.path, cwd) : canonical.path.replace(/[^a-zA-Z0-9]/g, '-'),
+  }
+}
+
+// True when cwd lies below projectPath without crossing into another repository
+// (a .git entry between the two): `cd app` inside a repo stays in the repo,
+// while `cd Projects/x` out of a home folder reaches another project. A folder
+// that is gone cannot show a boundary (a deleted worktree), so it stays apart.
+async function insideProjectTree(projectPath: string, cwd: string): Promise<boolean> {
+  const root = normalizeProjectPathKey(projectPath)
+  if (!normalizeProjectPathKey(cwd).startsWith(root + '/') || !existsSync(cwd)) return false
+  for (let dir = cwd.trim(); normalizeProjectPathKey(dir) !== root; dir = dirname(dir)) {
+    if (await lstat(join(dir, '.git')).catch(() => null)) return false
+    if (dirname(dir) === dir) return false
+  }
+  return true
+}
+
+// Partition turns by each call's project. A turn whose calls span projects is
+// cut per call; only the piece holding its first call keeps the turn weight
+// (turn, edit and retry counts), so those stay whole. Every piece keeps the
+// turn's timestamp and category, so per-day and per-category cost do too.
+function splitTurnsByProject(turns: ClassifiedTurn[], projectOf: (call: ParsedApiCall) => CallProject): Array<CallProject & { turns: ClassifiedTurn[] }> {
+  const groups = new Map<string, CallProject & { turns: ClassifiedTurn[] }>()
+  for (const turn of turns) {
+    const byKey = new Map<string, ParsedApiCall[]>()
+    for (const call of turn.assistantCalls) {
+      const project = projectOf(call)
+      if (!groups.has(project.key)) groups.set(project.key, { ...project, turns: [] })
+      const calls = byKey.get(project.key)
+      if (calls) calls.push(call)
+      else byKey.set(project.key, [call])
+    }
+    let first = true
+    for (const [key, calls] of byKey) {
+      groups.get(key)!.turns.push(calls.length === turn.assistantCalls.length
+        ? turn
+        : { ...turn, assistantCalls: calls, ...(first ? {} : { projectContinuation: true, hasEdits: false, retries: 0 }) })
+      first = false
+    }
+  }
+  return [...groups.values()]
 }
 
 
@@ -988,6 +1055,27 @@ const USER_TEXT_CAP = 2000
 const BASH_COMMAND_CAP = 2000
 const MAX_TOOL_BLOCKS = 500
 const MAX_ADDED_NAMES = 1000
+const QUEUED_SLASH_COMMAND = /^\/[a-z][\w:.-]*(?:\s|$)/
+
+// Peer and agent-message queued commands (`isMeta: true`, `origin.kind: "peer"`)
+// are queue plumbing between agents, not a prompt the user typed.
+function isHumanQueuedPrompt(a: Record<string, unknown>): boolean {
+  const origin = a['origin'] as { kind?: unknown } | undefined
+  return a['type'] === 'queued_command' && a['commandMode'] === 'prompt'
+    && a['isMeta'] !== true && (origin?.kind ?? 'human') === 'human'
+}
+
+function firstPlainText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (!Array.isArray(value)) return ''
+  for (const block of value) {
+    if (typeof block === 'string') return block
+    if (!block || typeof block !== 'object') continue
+    const text = (block as Record<string, unknown>)['text']
+    if (typeof text === 'string') return text
+  }
+  return ''
+}
 
 export function compactEntry(raw: JournalEntry): JournalEntry {
   const entry: JournalEntry = { type: raw.type }
@@ -1014,6 +1102,12 @@ export function compactEntry(raw: JournalEntry): JournalEntry {
         if (typeof n === 'string') names.push(n)
       }
       ;(entry as Record<string, unknown>)['attachment'] = { type: 'deferred_tools_delta', addedNames: names }
+    } else if (isHumanQueuedPrompt(a)) {
+      entry.attachment = {
+        type: 'queued_command',
+        commandMode: 'prompt',
+        prompt: flatSlice(firstPlainText(a['prompt']), USER_TEXT_CAP),
+      }
     }
   }
 
@@ -1424,6 +1518,7 @@ export function parseApiCall(entry: JournalEntry, toolResultMeta?: Map<string, T
     tokens.webSearchRequests,
     usage.speed ?? 'standard',
     cacheCreation.oneHourTokens,
+    'claude',
   )
 
   const bashCmds = extractBashCommandsFromContent(contentBlocks)
@@ -1536,6 +1631,7 @@ export function parseAdvisorCalls(entry: JournalEntry): ParsedApiCall[] {
       tokens.webSearchRequests,
       speed,
       cacheCreation.oneHourTokens,
+      'claude',
     )
 
     calls.push(applyLocalModelSavings({
@@ -1601,48 +1697,10 @@ export function groupIntoTurns(entries: JournalEntry[], seenMsgIds: Set<string>,
   // carried from each call's `spawnToolUseIds`.
   let currentSpawnIds: string[] = []
 
-  for (const entry of entries) {
-    const entryBranch = typeof entry.gitBranch === 'string' && entry.gitBranch ? entry.gitBranch : undefined
-    if (entry.type === 'user') {
-      const text = getUserMessageText(entry)
-      if (text.trim()) {
-        if (currentCalls.length > 0) {
-          turns.push({
-            userMessage: currentUserMessage,
-            assistantCalls: currentCalls,
-            timestamp: currentTimestamp,
-            sessionId: currentSessionId,
-            ...(currentBranch ? { gitBranch: currentBranch } : {}),
-            ...(currentPrRefs.length > 0 ? { prRefs: [...currentPrRefs].sort() } : {}),
-            ...(currentSpawnIds.length > 0 ? { spawnToolUseIds: currentSpawnIds } : {}),
-          })
-        }
-        currentUserMessage = text
-        currentCalls = []
-        currentTimestamp = entry.timestamp ?? ''
-        currentSessionId = entry.sessionId ?? ''
-        currentBranch = entryBranch
-        currentPrRefs = extractPrUrlsFromText(text)
-        currentSpawnIds = []
-      }
-    } else if (entry.type === 'assistant') {
-      if (entryBranch && !currentBranch) currentBranch = entryBranch
-      const msgId = getMessageId(entry)
-      if (msgId && seenMsgIds.has(msgId)) continue
-      if (msgId) seenMsgIds.add(msgId)
-      const call = parseApiCall(entry, toolResultMeta)
-      if (call) {
-        currentCalls.push(call)
-        if (call.spawnToolUseIds) for (const id of call.spawnToolUseIds) if (!currentSpawnIds.includes(id)) currentSpawnIds.push(id)
-      }
-      for (const advisorCall of parseAdvisorCalls(entry)) currentCalls.push(advisorCall)
-    } else if (entry.type === 'pr-link') {
-      const url = (entry as Record<string, unknown>)['prUrl']
-      if (typeof url === 'string' && url && !currentPrRefs.includes(url)) currentPrRefs.push(url)
-    }
-  }
-
-  if (currentCalls.length > 0) {
+  const pushCurrentTurn = (): void => {
+    // Report turns only when they contain assistant API usage. An ordinary
+    // user-only entry and a queued prompt with no response are omitted alike.
+    if (currentCalls.length === 0) return
     turns.push({
       userMessage: currentUserMessage,
       assistantCalls: currentCalls,
@@ -1654,7 +1712,70 @@ export function groupIntoTurns(entries: JournalEntry[], seenMsgIds: Set<string>,
     })
   }
 
+  for (const entry of entries) {
+    const entryBranch = typeof entry.gitBranch === 'string' && entry.gitBranch ? entry.gitBranch : undefined
+    if (entry.type === 'user') {
+      const text = getUserMessageText(entry)
+      if (text.trim()) {
+        pushCurrentTurn()
+        currentUserMessage = text
+        currentCalls = []
+        currentTimestamp = entry.timestamp ?? ''
+        currentSessionId = entry.sessionId ?? ''
+        currentBranch = entryBranch
+        currentPrRefs = extractPrUrlsFromText(text)
+        currentSpawnIds = []
+      }
+    } else if (entry.type === 'attachment') {
+      const queuedPrompt = queuedHumanPromptText(entry)
+      if (queuedPrompt) {
+        pushCurrentTurn()
+        currentUserMessage = queuedPrompt
+        currentCalls = []
+        currentTimestamp = entry.timestamp ?? ''
+        currentSessionId = entry.sessionId ?? ''
+        currentBranch = entryBranch
+        currentPrRefs = extractPrUrlsFromText(queuedPrompt)
+        currentSpawnIds = []
+      }
+    } else if (entry.type === 'assistant') {
+      if (entryBranch && !currentBranch) currentBranch = entryBranch
+      const msgId = getMessageId(entry)
+      if (msgId && seenMsgIds.has(msgId)) continue
+      if (msgId) seenMsgIds.add(msgId)
+      const cwd = typeof entry.cwd === 'string' && entry.cwd.trim() ? entry.cwd.trim() : undefined
+      const call = parseApiCall(entry, toolResultMeta)
+      if (call) {
+        if (cwd) call.cwd = cwd
+        currentCalls.push(call)
+        if (call.spawnToolUseIds) for (const id of call.spawnToolUseIds) if (!currentSpawnIds.includes(id)) currentSpawnIds.push(id)
+      }
+      for (const advisorCall of parseAdvisorCalls(entry)) {
+        if (cwd) advisorCall.cwd = cwd
+        currentCalls.push(advisorCall)
+      }
+    } else if (entry.type === 'pr-link') {
+      const url = (entry as Record<string, unknown>)['prUrl']
+      if (typeof url === 'string' && url && !currentPrRefs.includes(url)) currentPrRefs.push(url)
+    }
+  }
+
+  pushCurrentTurn()
+
   return turns
+}
+
+function queuedHumanPromptText(entry: JournalEntry): string | undefined {
+  if (typeof entry.timestamp !== 'string' || !entry.timestamp) return undefined
+  const attachment = entry['attachment']
+  if (!attachment || typeof attachment !== 'object') return undefined
+  const data = attachment as Record<string, unknown>
+  if (!isHumanQueuedPrompt(data)) return undefined
+
+  const prompt = firstPlainText(data['prompt']).trim()
+  if (!prompt || prompt.startsWith('<ide_') || prompt.startsWith('<system-reminder')) return undefined
+  if (QUEUED_SLASH_COMMAND.test(prompt)) return undefined
+  return flatSlice(prompt, USER_TEXT_CAP)
 }
 
 // Map each subagent-spawn `tool_use` id to the PR set active at the turn that
@@ -2009,9 +2130,11 @@ async function scanProjectDirs(
   // mid-scan then resumes from a warm cache instead of re-parsing from zero.
   onFileParsed?: () => Promise<void>,
   readOnly = false,
+  preservedSourcePaths: string[] = [],
 ): Promise<ProjectSummary[]> {
   const section = getOrCreateProviderSection(diskCache, 'claude')
   const allDiscoveredFiles = new Set<string>()
+  for (const path of preservedSourcePaths) allDiscoveredFiles.add(path)
 
   type FileInfo = { dirName: string; fp: NonNullable<Awaited<ReturnType<typeof fingerprintFile>>>; source?: SessionSourceMetadata }
   const unchangedFiles: Array<{ filePath: string; dirName: string; source?: SessionSourceMetadata; cached: CachedFile }> = []
@@ -2045,15 +2168,37 @@ async function scanProjectDirs(
     rememberSweepFingerprint(e.filePath, fp, sweptAt)
     return fp
   })
+  // A stub stands in for its entry. One whose file changed loads its member
+  // first, so the append or re-parse below runs exactly as on a full load.
+  const stubs = cacheStubs(diskCache, 'claude')
+  if (stubs?.size && !readOnly) {
+    await loadCacheStubs(diskCache, 'claude', discovered.flatMap(({ filePath }, i) => {
+      const stub = stubs.get(filePath)
+      return stub && fingerprints[i] && reconcileFile(fingerprints[i]!, stub).action !== 'unchanged' ? [filePath] : []
+    }))
+  }
+  const servedStubs: string[][][] = []
+  const hiddenUnchanged: string[] = []
+
   for (const [i, { filePath, dirName, source }] of discovered.entries()) {
     allDiscoveredFiles.add(filePath)
     const fp = fingerprints[i]
     if (!fp) continue
 
     const cached = section.files[filePath]
-    const action = reconcileFile(fp, cached)
-    if (!readOnly && deferToBackgroundFill(filePath, fp, cached)) {
+    const stub = cached ? undefined : stubs?.get(filePath)
+    const action = reconcileFile(fp, cached ?? stub)
+    // Cached, but in no month this range reports on, and unchanged: nothing to
+    // parse or serve. A changed one re-parses as if uncached, as it always did.
+    const hidden = cached || stub || readOnly ? undefined : cacheHiddenFingerprint(diskCache, 'claude', filePath)
+    if (hidden && reconcileFile(fp, { fingerprint: hidden }).action === 'unchanged') {
+      hiddenUnchanged.push(filePath)
       continue
+    } else if (!readOnly && deferToBackgroundFill(filePath, fp, cached ?? stub)) {
+      continue
+    } else if (stub && (readOnly || action.action === 'unchanged')) {
+      if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
+      servedStubs.push(stub.keys)
     } else if (cached && (readOnly || action.action === 'unchanged')) {
       if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
       unchangedFiles.push({ filePath, dirName, source, cached: section.files[filePath]! })
@@ -2083,8 +2228,13 @@ async function scanProjectDirs(
   // is gone and can never re-parse, but they carry attributable PR spend the by-PR
   // report must keep (as a legacy even-split); the eviction below preserves the
   // same set so `section.files` still holds them when summaries are built.
-  for (const [filePath, cached] of Object.entries(section.files)) {
+  for (const [filePath, cached] of cacheEntriesInLoadOrder(diskCache, 'claude')) {
     if (allDiscoveredFiles.has(filePath)) continue
+    if (isCacheStub(cached)) {
+      // Never a WSL path (those always load in full).
+      if (readOnly || cached.hasPr) servedStubs.push(cached.keys)
+      continue
+    }
     const wslStatus = classifyWslCachePath(filePath, wslHomesForOrphans)
     // A WSL path missing from discovery is retained only when its root is
     // currently offline (or WSL discovery is explicitly disabled). If the
@@ -2105,6 +2255,12 @@ async function scanProjectDirs(
         seenMsgIds.add(call.deduplicationKey)
       }
     }
+  }
+  for (const keys of servedStubs) for (const turn of keys) for (const key of turn) seenMsgIds.add(key)
+  // Only a whole-file parse can replay an older transcript's message ids (a
+  // fork or resume); an append's new region never does, so it reads no keys.
+  if (hiddenUnchanged.length > 0 && changedFiles.some(f => !f.append)) {
+    for (const keys of await loadCacheHiddenKeys(diskCache, 'claude', hiddenUnchanged)) for (const turn of keys) for (const key of turn) seenMsgIds.add(key)
   }
 
   const parseProgress = createScanProgress('parsing changed claude sessions', changedFiles.length)
@@ -2377,6 +2533,10 @@ async function scanProjectDirs(
       delete section.files[cachedPath]
       markCacheDirty(diskCache, 'claude', cachedPath)
     }
+    for (const [cachedPath, stub] of stubs ?? []) {
+      if (allDiscoveredFiles.has(cachedPath) || stub.hasPr || dirs.length === 0) continue
+      evictCacheStub(diskCache, 'claude', cachedPath)
+    }
   }
 
   const projectMap = new Map<string, { project: string; projectPath: string; sessions: SessionSummary[]; anchors: SessionSummary[]; dirNames: Set<string> }>()
@@ -2408,8 +2568,13 @@ async function scanProjectDirs(
     // it is pure waste (on a week view that is nearly all of history). The
     // carries above still run over the FULL ordered turn list.
     const classifiedTurns: ClassifiedTurn[] = []
+    // Each call's own cwd, carried forward over the full turn list like the
+    // branch (the cache stores it only when it changes).
+    let carriedCwd = cachedFile.workingDirectory
+    const callCwds = new Map<ParsedApiCall, string>()
     for (const turn of cachedFile.turns) {
       if (turn.gitBranch) carriedBranch = turn.gitBranch
+      const turnCwds = turn.calls.map(call => (carriedCwd = call.cwd ?? carriedCwd))
       if (dateRange && !frozePrRefs) {
         const firstTs = turn.calls[0]?.timestamp
         if (firstTs && new Date(firstTs) >= dateRange.start) {
@@ -2420,6 +2585,12 @@ async function scanProjectDirs(
       if (turn.prRefs?.length) carriedPrRefs = turn.prRefs
       if (dateRange && !callsInRange(turn.calls, dateRange)) continue
       const classified = cachedTurnToClassified(turn, carriedBranch)
+      if (cachedFile.canonicalCwd) {
+        classified.assistantCalls.forEach((call, i) => {
+          const cwd = turnCwds[i]
+          if (cwd) callCwds.set(call, cwd)
+        })
+      }
       // Slice rather than drop: a turn spanning local midnight would otherwise
       // lose every call that lands in the requested day (issue #852). Only
       // `assistantCalls`/`timestamp` are touched — see classifiedTurnSlicedToRange.
@@ -2450,51 +2621,100 @@ async function scanProjectDirs(
     const sessionId = basename(filePath, '.jsonl')
     const projectPath = cachedFile.canonicalCwd ?? claudeSlugFallbackPath(dirName)
     const projectName = cachedFile.canonicalProjectName ?? dirName
+    const projectKey = cachedFile.canonicalCwd
+      ? normalizeProjectPathKey(cachedFile.canonicalCwd)
+      : `slug:${dirName}`
+    const fileProject: CallProject = { key: projectKey, path: projectPath, name: projectName }
     const mcpInv = cachedFile.mcpInventory.length > 0 ? cachedFile.mcpInventory : undefined
-    const session = buildSessionSummary(sessionId, projectName, classifiedTurns, mcpInv, source)
-    if (cachedFile.workingDirectory && !isCoworkSession(cachedFile.workingDirectory, filePath)) {
-      session.workingDirectory = cachedFile.workingDirectory
+    const decorate = (session: SessionSummary): SessionSummary => {
+      if (cachedFile.workingDirectory && !isCoworkSession(cachedFile.workingDirectory, filePath)) {
+        session.workingDirectory = cachedFile.workingDirectory
+      }
+      session.agentType = cachedFile.agentType
+      if (everHadBranch) session.everHadBranch = true
+      const observedPrLinks = new Set(classifiedTurns.flatMap(turn => turn.prRefs ?? []))
+      for (const link of cachedFile.prLinks ?? []) observedPrLinks.add(link)
+      if (observedPrLinks.size) {
+        session.prLinks = [...observedPrLinks].sort()
+        session.prAttributionSource = cachedFile.prLinks?.length ? 'transcript' : 'explicit-reference'
+      }
+      if (prRefsAtRangeStart?.length) session.prRefsAtRangeStart = prRefsAtRangeStart
+      if (cachedFile.title) session.title = cachedFile.title
+      // Sidechain linkage: carry the parent id (the transcript's internal
+      // `sessionId`, authoritative even when it disagrees with the owning directory
+      // on a resumed session) and derive the agent id from the `agent-<agentId>`
+      // filename. A sidechain whose parent id was never captured stays standalone.
+      if (cachedFile.isSidechain) {
+        session.isSidechain = true
+        if (cachedFile.parentSessionId) session.parentSessionId = cachedFile.parentSessionId
+        session.agentMetaPath = filePath.replace(/\.jsonl$/, '.meta.json')
+        session.agentId = sessionId.startsWith('agent-') ? sessionId.slice('agent-'.length) : sessionId
+      }
+      // Parent linkage maps (only present on sessions that spawned subagents).
+      if (cachedFile.agentSpawnLinks && Object.keys(cachedFile.agentSpawnLinks).length > 0) {
+        session.agentSpawnLinks = cachedFile.agentSpawnLinks
+      }
+      if (cachedFile.ambiguousSpawnAgentIds?.length) session.ambiguousSpawnAgentIds = cachedFile.ambiguousSpawnAgentIds
+      if (Object.keys(spawnPrSets).length > 0) session.spawnPrSets = spawnPrSets
+      // Provider-recorded parent/child lineage (CB-1, slice 1). Mirrors whatever
+      // the install path stored on the cached file; absent when no evidence.
+      if (cachedFile.lineage) session.lineage = cachedFile.lineage
+      return session
     }
-    session.agentType = cachedFile.agentType
-    if (everHadBranch) session.everHadBranch = true
-    const observedPrLinks = new Set(classifiedTurns.flatMap(turn => turn.prRefs ?? []))
-    for (const link of cachedFile.prLinks ?? []) observedPrLinks.add(link)
-    if (observedPrLinks.size) {
-      session.prLinks = [...observedPrLinks].sort()
-      session.prAttributionSource = cachedFile.prLinks?.length ? 'transcript' : 'explicit-reference'
-    }
-    if (prRefsAtRangeStart?.length) session.prRefsAtRangeStart = prRefsAtRangeStart
-    if (cachedFile.title) session.title = cachedFile.title
-    // Sidechain linkage: carry the parent id (the transcript's internal
-    // `sessionId`, authoritative even when it disagrees with the owning directory
-    // on a resumed session) and derive the agent id from the `agent-<agentId>`
-    // filename. A sidechain whose parent id was never captured stays standalone.
-    if (cachedFile.isSidechain) {
-      session.isSidechain = true
-      if (cachedFile.parentSessionId) session.parentSessionId = cachedFile.parentSessionId
-      session.agentId = sessionId.startsWith('agent-') ? sessionId.slice('agent-'.length) : sessionId
-    }
-    // Parent linkage maps (only present on sessions that spawned subagents).
-    if (cachedFile.agentSpawnLinks && Object.keys(cachedFile.agentSpawnLinks).length > 0) {
-      session.agentSpawnLinks = cachedFile.agentSpawnLinks
-    }
-    if (cachedFile.ambiguousSpawnAgentIds?.length) session.ambiguousSpawnAgentIds = cachedFile.ambiguousSpawnAgentIds
-    if (Object.keys(spawnPrSets).length > 0) session.spawnPrSets = spawnPrSets
-    // Provider-recorded parent/child lineage (CB-1, slice 1). Mirrors whatever
-    // the install path stored on the cached file; absent when no evidence.
-    if (cachedFile.lineage) session.lineage = cachedFile.lineage
-
-    if (session.apiCalls > 0 || anchorOnly) {
-      const projectKey = cachedFile.canonicalCwd
-        ? normalizeProjectPathKey(cachedFile.canonicalCwd)
-        : `slug:${dirName}`
-      const existing = projectMap.get(projectKey)
+    const addToProject = (project: CallProject, session: SessionSummary, anchor: boolean): void => {
+      const existing = projectMap.get(project.key)
       // An anchor (no in-range spend) goes into a separate bucket, never `sessions`.
-      const target = existing ?? { project: projectName, projectPath, sessions: [], anchors: [], dirNames: new Set([dirName]) }
-      if (anchorOnly) target.anchors.push(session)
+      const target = existing ?? { project: project.name, projectPath: project.path, sessions: [], anchors: [], dirNames: new Set<string>() }
+      if (anchor) target.anchors.push(session)
       else target.sessions.push(session)
-      target.dirNames.add(dirName)
-      if (!existing) projectMap.set(projectKey, target)
+      // Only the transcript's own directory may later absorb its slug-keyed rows.
+      if (project.key === projectKey) target.dirNames.add(dirName)
+      if (!existing) projectMap.set(project.key, target)
+    }
+
+    // A session that moved folders splits per call: each call goes to the
+    // project of its own cwd, and every slice keeps the session's metadata.
+    const callProjects = new Map<string, CallProject>()
+    for (const cwd of new Set(callCwds.values())) {
+      const resolved = await resolveClaudeCallProject(cwd, filePath)
+      callProjects.set(cwd, resolved && resolved.key !== projectKey ? resolved : fileProject)
+    }
+    // A subfolder of a folder this session worked in joins that folder's
+    // project (the outermost one), so `cd app` inside a repo is not a move.
+    const roots = [...new Map([fileProject, ...callProjects.values()].map(p => [p.key, p])).values()]
+      .sort((a, b) => a.path.length - b.path.length)
+    for (const [cwd, project] of callProjects) {
+      if (project === fileProject) continue
+      for (const root of roots) {
+        if (await insideProjectTree(root.path, cwd)) {
+          callProjects.set(cwd, root)
+          break
+        }
+      }
+    }
+    const groups = [...callProjects.values()].some(p => p !== fileProject)
+      ? splitTurnsByProject(classifiedTurns, call => {
+          const cwd = callCwds.get(call)
+          return (cwd && callProjects.get(cwd)) || fileProject
+        })
+      : [{ ...fileProject, turns: classifiedTurns }]
+    if (groups.length === 1) {
+      const only = groups[0]!
+      const name = only === fileProject || only.key === projectKey ? projectName : projectMap.get(only.key)?.project ?? only.name
+      const session = decorate(buildSessionSummary(sessionId, name, classifiedTurns, mcpInv, source))
+      if (session.apiCalls > 0 || anchorOnly) addToProject({ ...only, name }, session, anchorOnly)
+      continue
+    }
+    const slices = groups.map(group => {
+      const name = group.key === projectKey ? projectName : projectMap.get(group.key)?.project ?? group.name
+      return { project: { ...group, name }, session: decorate(buildSessionSummary(sessionId, name, group.turns, mcpInv, source)) }
+    })
+    // Primary = the slice holding the most cost, so the session row sits where
+    // the money went and a late `cd` cannot move it. Ties keep the earlier slice.
+    const primary = slices.reduce((best, slice) => slice.session.totalCostUSD > best.session.totalCostUSD ? slice : best)
+    for (const { project, session } of slices) {
+      session.projectSplit = { primaryProject: primary.project.name, primaryProjectPath: primary.project.path, primary: session === primary.session }
+      if (session.apiCalls > 0) addToProject(project, session, false)
     }
   }
 
@@ -2599,6 +2819,7 @@ function providerCallToCachedCall(call: ParsedProviderCall): CachedCall {
       cacheCreationOneHourTokens: 0,
     },
     costUSD: (REPORTED_COST_PROVIDERS.has(call.provider) || call.costFromBilling === true) ? call.costUSD : undefined,
+    ...(call.fallbackCostUSD ? { fallbackCostUSD: call.fallbackCostUSD } : {}),
     isEstimated: call.costIsEstimated || undefined,
     speed: call.speed,
     timestamp: call.timestamp,
@@ -2688,17 +2909,23 @@ function parsedTurnToCachedTurn(turn: ParsedTurn): CachedTurn {
 }
 
 // Convert a batch of parsed turns to cached turns, storing each turn's gitBranch
-// only when it differs from the previous turn's branch in this batch. A report
+// (and each call's cwd) only when it differs from the previous one in this batch. A report
 // reconstructs a turn's branch by carrying the last stored value forward. The
 // dedup is per-batch, so the first turn of an appended region always restates
 // its branch (harmless: a redundant restatement, never a wrong value).
 export function parsedTurnsToCachedTurns(turns: ParsedTurn[]): CachedTurn[] {
   const out: CachedTurn[] = []
   let prevBranch: string | undefined
+  let prevCwd: string | undefined
   for (const turn of turns) {
     const cached = parsedTurnToCachedTurn(turn)
     if (turn.gitBranch && turn.gitBranch !== prevBranch) cached.gitBranch = turn.gitBranch
     if (turn.gitBranch) prevBranch = turn.gitBranch
+    turn.assistantCalls.forEach((call, i) => {
+      if (!call.cwd || call.cwd === prevCwd) return
+      cached.calls[i]!.cwd = call.cwd
+      prevCwd = call.cwd
+    })
     out.push(cached)
   }
   return out
@@ -2755,9 +2982,9 @@ function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
   // disagree about whether reasoning is already inside output (#1075).
   const outputForCost = billableOutputTokens(call.provider, u.outputTokens, u.reasoningTokens)
   const costUSD = calculateCost(
-    call.model, u.inputTokens, outputForCost,
+    pricingModelAt(call.model, call.timestamp), u.inputTokens, outputForCost,
     u.cacheCreationInputTokens, u.cacheReadInputTokens,
-    u.webSearchRequests, call.speed, u.cacheCreationOneHourTokens,
+    u.webSearchRequests, call.speed, u.cacheCreationOneHourTokens, call.provider,
   )
   return applyLocalModelSavings({
     provider: call.provider,
@@ -2771,8 +2998,8 @@ function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
       reasoningTokens: u.reasoningTokens,
       webSearchRequests: u.webSearchRequests,
     },
-    costUSD: call.costUSD ?? costUSD,
-    isEstimated: call.isEstimated,
+    costUSD: call.costUSD ?? recordedCostFallback(call.model, costUSD, call.fallbackCostUSD) ?? costUSD,
+    isEstimated: call.isEstimated || (call.costUSD === undefined && isStandInPricedAt(call.model, call.timestamp)) || undefined,
     tools: call.tools,
     mcpTools: extractMcpTools(call.tools),
     skills: call.skills,
@@ -3109,6 +3336,13 @@ function getOrCreateProviderSection(cache: SessionCache, provider: string): Prov
       section.files[path] = { ...rest, fingerprint: { dev: 0, ino: 0, mtimeMs: 0, sizeBytes: -1 } }
     }
   }
+  // A Claude transcript that is gone can never re-parse, and its cached entry
+  // (kept only when PR-bearing) is the last record of it: a parse bump keeps it.
+  if (existing && provider === 'claude') {
+    for (const [path, file] of Object.entries(existing.files)) {
+      if (!existsSync(path)) section.files[path] = file
+    }
+  }
   cache.providers[provider] = section
   markCacheDirty(cache, provider)
   return section
@@ -3119,10 +3353,15 @@ function cachedFileNeedsProviderReparse(providerName: string, sourcePath: string
   // A 0-turn cache entry may just mean the server was unavailable last run.
   if (providerName === 'antigravity') return shouldReparseAntigravitySource(sourcePath, cached.turns.length)
 
-  // Devin transcript usage is enriched from sessions.db. The cache fingerprint
-  // only tracks the transcript JSON, so reparse to pick up DB-side project,
-  // title, model, and timestamp changes.
-  if (providerName === 'devin') return true
+  // A Devin transcript (read only when sessions.db is unusable) is enriched
+  // from sessions.db, which its fingerprint does not track, so it always
+  // reparses. A sessions.db source's fingerprint folds in the WAL already.
+  if (providerName === 'devin') return sourcePath.endsWith('.json')
+
+  // A Grok session dir parses to nothing while logs/unified.jsonl holds its
+  // session, which its fingerprint does not track. Once the log rotates or is
+  // truncated past it, the dir has to count again.
+  if (providerName === 'grok') return cached.turns.length === 0
 
   if (providerName !== 'gemini') return false
 
@@ -3168,6 +3407,7 @@ const parseFailureCounts = new Map<string, number>()
 const PARSE_FAILURE_WARN_CAP = 5
 
 function warnProviderParseFailure(providerName: string, sourcePath: string, err: unknown): void {
+  recordProviderIssue(providerName, 'parse', err)
   const n = (parseFailureCounts.get(providerName) ?? 0) + 1
   parseFailureCounts.set(providerName, n)
   if (n > PARSE_FAILURE_WARN_CAP) return
@@ -3388,6 +3628,7 @@ export async function parseProviderSources(
   // for this whole parse transaction so a host changing CODEBURN_CACHE_DIR
   // before the final flush cannot redirect A's dirty state into (or past) B.
   const antigravityCacheDir = providerName === 'antigravity' ? getCodeburnCacheDir() : undefined
+  if (antigravityCacheDir && !readOnly) await preloadAntigravityCache(antigravityCacheDir)
 
   const section = getOrCreateProviderSection(diskCache, providerName)
   if (providerName === 'hermes' && !readOnly) {
@@ -3425,6 +3666,20 @@ export async function parseProviderSources(
       rememberSweepFingerprint(s.path, fp, sweptAt)
       return fp
     })
+
+  // As in scanProjectDirs: a changed stub (and every network source, which
+  // re-fetches on a write run) loads its member so the parse below runs as on
+  // a full load. An unchanged one only ever contributes its dedup keys.
+  const stubs = cacheStubs(diskCache, providerName)
+  const stubServed = new Set<string>()
+  if (stubs?.size && !readOnly) {
+    await loadCacheStubs(diskCache, providerName, sources.flatMap((s, i) => {
+      const stub = stubs.get(s.path)
+      if (!stub) return []
+      const fp = sourceFingerprints[i]
+      return skipFingerprint || (fp && reconcileFile(fp, stub).action !== 'unchanged') ? [s.path] : []
+    }))
+  }
 
   for (const [sourceIndex, source] of sources.entries()) {
     allDiscoveredFiles.add(source.path)
@@ -3465,12 +3720,16 @@ export async function parseProviderSources(
     }
 
     const cached = section.files[source.path]
-    const action = reconcileFile(fp, cached)
+    const stub = cached ? undefined : stubs?.get(source.path)
+    const action = reconcileFile(fp, cached ?? stub)
     // A cached parse failure at this same fingerprint stays skipped — don't
     // re-read a file that already threw and hasn't changed. It re-parses only
     // when the file changes (then `reconcileFile` reports non-'unchanged').
-    if (!readOnly && deferToBackgroundFill(source.path, fp, cached)) {
+    if (!readOnly && deferToBackgroundFill(source.path, fp, cached ?? stub)) {
       continue
+    } else if (stub && (readOnly || action.action === 'unchanged')) {
+      if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
+      stubServed.add(source.path)
     } else if (cached && (readOnly || (action.action === 'unchanged' && (cached.failed || !cachedFileNeedsProviderReparse(providerName, source.path, cached))))) {
       if (readOnly && action.action !== 'unchanged') readOnlyServedStale = true
       unchangedSources.push({ source, cached })
@@ -3484,9 +3743,17 @@ export async function parseProviderSources(
 
   const wslHomesForOrphans = refreshWslHomesForOrphans(Object.keys(section.files), allDiscoveredFiles)
 
-  if (readOnly) {
-    for (const [path, cached] of Object.entries(section.files)) {
+  // scanProjectDirs serves Claude's orphans; the Cowork ledger pass shares
+  // the claude section and would serve every transcript a second time.
+  if (readOnly && providerName !== 'claude') {
+    for (const [path, cached] of cacheEntriesInLoadOrder(diskCache, providerName)) {
       if (allDiscoveredFiles.has(path)) continue
+      if (isCacheStub(cached)) {
+        servedSources.push({ provider: providerName, path, project: providerName })
+        allDiscoveredFiles.add(path)
+        stubServed.add(path)
+        continue
+      }
       servedSources.push({
         provider: providerName,
         path,
@@ -3522,6 +3789,7 @@ export async function parseProviderSources(
       }
     }
   }
+  for (const path of stubServed) for (const turn of stubs?.get(path)?.keys ?? []) for (const key of turn) parserDedup.add(key)
 
   // Codex rollouts are the bulk of a cold parse (multi-GB against Claude's
   // hundreds of MB), so whole-file decodes go to worker threads. A file the
@@ -3790,7 +4058,11 @@ export async function parseProviderSources(
     markCacheDirty(diskCache, providerName)
   }
 
-  if (!readOnly && !provider.durableSources) {
+  // Claude's transcript tree and Cowork's usage ledger share one provider
+  // cache section but are reconciled by two different parsers. The transcript
+  // scanner owns ordinary Claude-source eviction; the ledger pass must not
+  // interpret the transcript paths as ledger orphans and delete them.
+  if (!readOnly && !provider.durableSources && providerName !== 'claude') {
     for (const cachedPath of Object.keys(section.files)) {
       if (allDiscoveredFiles.has(cachedPath)) continue
       const wslStatus = classifyWslCachePath(cachedPath, wslHomesForOrphans)
@@ -3813,6 +4085,11 @@ export async function parseProviderSources(
       }
       delete section.files[cachedPath]
       markCacheDirty(diskCache, providerName, cachedPath)
+    }
+    // Never a WSL path (those always load in full).
+    for (const [cachedPath] of stubs ?? []) {
+      if (allDiscoveredFiles.has(cachedPath) || sources.length === 0) continue
+      evictCacheStub(diskCache, providerName, cachedPath)
     }
   }
   if (evictedCodexResultCache) await flushCodexCache()
@@ -3875,12 +4152,13 @@ export async function parseProviderSources(
   //   rows' own label — so neither a store row cached before events.jsonl
   //   existed nor an events.jsonl orphaned after a prune can split the
   //   session across two grouping keys.
-  type CopilotStamped = { ts: number; input: number; cacheRead: number; cacheWrite: number; reasoning: number; isCompaction?: boolean }
+  type CopilotStamped = { ts: number; input: number; output: number; cacheRead: number; cacheWrite: number; reasoning: number; isCompaction?: boolean }
   let copilotRecon: {
     storeKeys: Set<string>
     storeCalls: Map<string, CopilotStamped[]>
     rollupLegs: Map<string, Array<CopilotStamped & { rawTs: string; compactedAtMs: number }>>
     supplementaryStoreKeys: Set<string>
+    turnOwnedOutputKeys: Set<string>
     sessionProject: Map<string, string>
     storeProject: Map<string, string>
     nanRollupFallbackTs: Map<string, string>
@@ -3897,8 +4175,8 @@ export async function parseProviderSources(
     const storeKeys = new Set<string>()
     const storeCalls = new Map<string, CopilotStamped[]>()
     const rollupLegs = new Map<string, Array<CopilotStamped & { rawTs: string; compactedAtMs: number }>>()
-    const storeRowIds = new Map<string, Array<{ ts: number; dedupKey: string }>>()
-    const perTurnTs = new Map<string, number[]>()
+    const storeRowIds = new Map<string, Array<{ ts: number; dedupKey: string; stamped: CopilotStamped }>>()
+    const perTurnTs = new Map<string, Array<{ ts: number; hasOutput: boolean }>>()
     const sessionProject = new Map<string, string>()
     const storeProject = new Map<string, string>()
     // Stable timestamp fallbacks for rollup calls whose own stamp cannot
@@ -3939,7 +4217,7 @@ export async function parseProviderSources(
             if (project && !sessionProject.has(turn.sessionId)) sessionProject.set(turn.sessionId, project)
             if (!Number.isNaN(ts)) {
               const list = perTurnTs.get(aggKey) ?? []
-              list.push(ts)
+              list.push({ ts, hasOutput: c.usage.outputTokens > 0 })
               perTurnTs.set(aggKey, list)
             }
             continue
@@ -3948,6 +4226,10 @@ export async function parseProviderSources(
           const stamped: CopilotStamped = {
             ts,
             input: c.usage.inputTokens,
+            // Rollups carry output only for legs with no per-turn output. A
+            // store row's output is zeroed below when its per-turn partner
+            // carries output, so this never meets the per-turn calls' output.
+            output: c.usage.outputTokens,
             cacheRead: c.usage.cacheReadInputTokens,
             cacheWrite: c.usage.cacheCreationInputTokens,
             reasoning: c.usage.reasoningTokens,
@@ -3963,11 +4245,12 @@ export async function parseProviderSources(
             // where it does not, this row is indistinguishable from a user
             // request and keeps the pre-label behaviour.
             const isCompaction = c.initiator === 'compaction'
-            list.push(isCompaction ? { ...stamped, isCompaction: true } : stamped)
+            if (isCompaction) stamped.isCompaction = true
+            list.push(stamped)
             storeCalls.set(aggKey, list)
             if (!isCompaction) {
               const ids = storeRowIds.get(aggKey) ?? []
-              ids.push({ ts, dedupKey: c.deduplicationKey })
+              ids.push({ ts, dedupKey: c.deduplicationKey, stamped })
               storeRowIds.set(aggKey, ids)
             }
             if (c.project && !storeProject.has(turn.sessionId)) storeProject.set(turn.sessionId, c.project)
@@ -3990,20 +4273,30 @@ export async function parseProviderSources(
     // against a neighbor whose own row is missing and hide the crash
     // request's call weight. The residual ambiguity (a crash row landing
     // within the window of an unrecorded-row request) is a double-failure
-    // conjunction and affects only call counts, never tokens.
+    // conjunction.
+    // Pairing also decides who owns a request's output: older CLIs write it on
+    // the per-turn call AND the row, so a row paired with a per-turn call that
+    // carries output serves with output 0. CLI 1.0.8x and ACP hosts write no
+    // per-turn output, so their rows keep it — the only record of it when the
+    // session never shut down.
     const PAIR_WINDOW_MS = 2 * 60 * 1000
     const supplementaryStoreKeys = new Set<string>()
+    const turnOwnedOutputKeys = new Set<string>()
     for (const [aggKey, ids] of storeRowIds) {
       const callTs = perTurnTs.get(aggKey)
       if (!callTs?.length) continue
       ids.sort((a, b) => a.ts - b.ts)
-      callTs.sort((a, b) => a - b)
+      callTs.sort((a, b) => a.ts - b.ts)
       let i = 0
       let j = 0
       while (i < ids.length && j < callTs.length) {
-        const d = ids[i]!.ts - callTs[j]!
+        const d = ids[i]!.ts - callTs[j]!.ts
         if (Math.abs(d) <= PAIR_WINDOW_MS) {
           supplementaryStoreKeys.add(ids[i]!.dedupKey)
+          if (callTs[j]!.hasOutput && ids[i]!.stamped.output > 0) {
+            ids[i]!.stamped.output = 0
+            turnOwnedOutputKeys.add(ids[i]!.dedupKey)
+          }
           i++
           j++
         } else if (d < 0) {
@@ -4013,7 +4306,7 @@ export async function parseProviderSources(
         }
       }
     }
-    copilotRecon = { storeKeys, storeCalls, rollupLegs, supplementaryStoreKeys, sessionProject, storeProject, nanRollupFallbackTs, sessionEarliestValidTs }
+    copilotRecon = { storeKeys, storeCalls, rollupLegs, supplementaryStoreKeys, turnOwnedOutputKeys, sessionProject, storeProject, nanRollupFallbackTs, sessionEarliestValidTs }
   }
   const copilotServeProject = (sessionId: string): string | undefined =>
     copilotRecon
@@ -4059,8 +4352,13 @@ export async function parseProviderSources(
       }
       if (c.deduplicationKey.startsWith('copilot-store:')) {
         const project = copilotRecon.sessionProject.get(turn.sessionId)
-        if (project && c.project !== project) {
-          kept.push({ ...c, project })
+        let served = c
+        if (project && c.project !== project) served = { ...served, project }
+        if (copilotRecon.turnOwnedOutputKeys.has(c.deduplicationKey)) {
+          served = { ...served, usage: { ...served.usage, outputTokens: 0 } }
+        }
+        if (served !== c) {
+          kept.push(served)
           changed = true
           continue
         }
@@ -4075,16 +4373,46 @@ export async function parseProviderSources(
     return { ...turn, calls: kept, ...(turnTsValid ? {} : { timestamp: kept[0]!.timestamp }) }
   }
 
+  // An imported Cursor usage export replaces this provider's local estimates
+  // for the time it covers. Decided here, at serve time, so the cached local
+  // calls stay intact and removing the import restores them.
+  const importCoverage = replacedProviders().includes(providerName)
+    ? await loadCursorImport().then(store => store && coverageFor(store), () => null)
+    : null
+  const serveTurn = (rawTurn: CachedTurn): CachedTurn | null => {
+    const turn = reconcileCopilotCalls(rawTurn)
+    return turn && dropImportCoveredCalls(providerName, turn, importCoverage)
+  }
+
   // Query-time: derive SessionSummary from all cached turns.
   // Uses seenKeys (shared across providers) for cross-provider dedup.
-  const sessionMap = new Map<string, { project: string; projectPath?: string; workingDirectory?: string; turns: ClassifiedTurn[]; prLinks?: Set<string>; title?: string; lineage?: SessionLineage; agentName?: string; agentStartedAt?: string }>()
+  const sessionMap = new Map<string, { project: string; projectPath?: string; workingDirectory?: string; turns: ClassifiedTurn[]; prLinks?: Set<string>; title?: string; lineage?: SessionLineage; agentName?: string; agentStartedAt?: string; source?: SessionSourceMetadata }>()
 
   for (const source of servedSources) {
     const cachedFile = section.files[source.path]
-    if (!cachedFile) continue
+    if (!cachedFile) {
+      // Out of range: it adds nothing but the keys a full entry would claim here.
+      for (const keys of stubs?.get(source.path)?.keys ?? []) {
+        if (keys.some(k => seenKeys.has(k))) continue
+        for (const k of keys) seenKeys.add(k)
+      }
+      continue
+    }
+    const sourceMetadata: SessionSourceMetadata | undefined = providerName === 'claude' &&
+      source.sourceId &&
+      source.sourceLabel &&
+      source.sourcePath &&
+      source.sourceKind
+      ? {
+          id: source.sourceId,
+          label: source.sourceLabel,
+          path: source.sourcePath,
+          kind: source.sourceKind,
+        }
+      : undefined
 
     for (const rawTurn of cachedFile.turns) {
-      const turn = reconcileCopilotCalls(rawTurn)
+      const turn = serveTurn(rawTurn)
       if (!turn) continue
       const hasDup = turn.calls.some(c => seenKeys.has(c.deduplicationKey))
       if (hasDup) continue
@@ -4136,6 +4464,7 @@ export async function parseProviderSources(
         if (!existing.lineage && cachedFile.lineage) existing.lineage = cachedFile.lineage
         if (!existing.agentName && cachedFile.agentName) existing.agentName = cachedFile.agentName
         if (!existing.agentStartedAt && cachedFile.agentStartedAt) existing.agentStartedAt = cachedFile.agentStartedAt
+        if (!existing.source && sourceMetadata) existing.source = sourceMetadata
       } else {
         sessionMap.set(key, {
           project,
@@ -4147,6 +4476,7 @@ export async function parseProviderSources(
           ...(cachedFile.lineage ? { lineage: cachedFile.lineage } : {}),
           ...(cachedFile.agentName ? { agentName: cachedFile.agentName } : {}),
           ...(cachedFile.agentStartedAt ? { agentStartedAt: cachedFile.agentStartedAt } : {}),
+          ...(sourceMetadata ? { source: sourceMetadata } : {}),
         })
       }
     }
@@ -4157,7 +4487,7 @@ export async function parseProviderSources(
   // counted here so the monthly total never drops.
   // WSL orphans join them for every provider: their distro being stopped must
   // not drop the spend from the totals for the length of a shutdown (#1059).
-  if (provider.durableSources || Object.keys(section.files).some(isWslUncPath)) {
+  if (providerName !== 'claude' && (provider.durableSources || Object.keys(section.files).some(isWslUncPath))) {
     for (const [cachedPath, cachedFile] of Object.entries(section.files)) {
       if (!provider.durableSources && !isWslUncPath(cachedPath)) continue
       if (allDiscoveredFiles.has(cachedPath)) continue  // already counted above
@@ -4172,7 +4502,7 @@ export async function parseProviderSources(
       if (wslStatus === 'active' && !provider.durableSources) continue
 
       for (const rawTurn of cachedFile.turns) {
-        const turn = reconcileCopilotCalls(rawTurn)
+        const turn = serveTurn(rawTurn)
         if (!turn) continue
         const hasDup = turn.calls.some(c => seenKeys.has(c.deduplicationKey))
         if (hasDup) continue
@@ -4246,6 +4576,7 @@ export async function parseProviderSources(
         const last = coalesced[coalesced.length - 1]
         if (last && last.ts === leg.ts) {
           last.input += leg.input
+          last.output += leg.output
           last.cacheRead += leg.cacheRead
           last.cacheWrite += leg.cacheWrite
           last.reasoning += leg.reasoning
@@ -4259,7 +4590,7 @@ export async function parseProviderSources(
       let prevLegTs = -Infinity
       for (let legIdx = 0; legIdx < coalesced.length; legIdx++) {
         const leg = coalesced[legIdx]!
-        const covered = { input: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 }
+        const covered = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 }
         // An in-session compaction RESETS the CLI's rollup counters, so a leg
         // containing one describes only its post-compaction requests. Starting
         // its interval at the previous leg would subtract the whole
@@ -4281,6 +4612,7 @@ export async function parseProviderSources(
           // over-serve per compaction stands.
           if (row.ts > intervalStart || (row.isCompaction && row.ts > prevLegTs)) {
             covered.input += row.input
+            covered.output += row.output
             covered.cacheRead += row.cacheRead
             covered.cacheWrite += row.cacheWrite
             covered.reasoning += row.reasoning
@@ -4289,10 +4621,11 @@ export async function parseProviderSources(
         }
         prevLegTs = leg.ts
         const input = Math.max(0, leg.input - covered.input)
+        const output = Math.max(0, leg.output - covered.output)
         const cacheRead = Math.max(0, leg.cacheRead - covered.cacheRead)
         const cacheWrite = Math.max(0, leg.cacheWrite - covered.cacheWrite)
         const reasoning = Math.max(0, leg.reasoning - covered.reasoning)
-        if (input === 0 && cacheRead === 0 && cacheWrite === 0 && reasoning === 0) continue
+        if (input === 0 && output === 0 && cacheRead === 0 && cacheWrite === 0 && reasoning === 0) continue
         if (dateRange) {
           const ts = new Date(leg.rawTs)
           if (Number.isNaN(ts.getTime()) || ts < dateRange.start || ts > dateRange.end) continue
@@ -4301,8 +4634,8 @@ export async function parseProviderSources(
         calls.push({
           provider: 'copilot',
           model,
-          usage: { inputTokens: input, outputTokens: 0, cacheCreationInputTokens: cacheWrite, cacheReadInputTokens: cacheRead, cachedInputTokens: 0, reasoningTokens: reasoning, webSearchRequests: 0 },
-          costUSD: calculateCost(model, input, 0, cacheWrite, cacheRead, 0),
+          usage: { inputTokens: input, outputTokens: output, cacheCreationInputTokens: cacheWrite, cacheReadInputTokens: cacheRead, cachedInputTokens: 0, reasoningTokens: reasoning, webSearchRequests: 0 },
+          costUSD: calculateCost(model, input, output, cacheWrite, cacheRead, 0),
           tools: [], mcpTools: [], skills: [], subagentTypes: [],
           hasAgentSpawn: false, hasPlanMode: false,
           speed: 'standard', timestamp: leg.rawTs, bashCommands: [],
@@ -4354,12 +4687,12 @@ export async function parseProviderSources(
   // (first projectPath wins) before mergeProjectsByCrossProviderKey could see
   // distinct abs identities.
   const projectMap = new Map<string, { project: string; projectPath?: string; sessions: SessionSummary[] }>()
-  for (const [key, { project, projectPath, workingDirectory, turns, prLinks, title, lineage, agentName, agentStartedAt }] of sessionMap) {
+  for (const [key, { project, projectPath, workingDirectory, turns, prLinks, title, lineage, agentName, agentStartedAt, source }] of sessionMap) {
     const sessionId = key.split(':')[1] ?? key
     const assembledTurns = providerName === 'copilot'
       ? foldCopilotSupplementaryTurns(sessionId, turns, copilotRecon?.supplementaryStoreKeys)
       : turns
-    const session = buildSessionSummary(sessionId, project, assembledTurns)
+    const session = buildSessionSummary(sessionId, project, assembledTurns, undefined, source)
     const explicitLinks = new Set(assembledTurns.flatMap(turn => turn.prRefs ?? []))
     for (const link of prLinks ?? []) explicitLinks.add(link)
     if (explicitLinks.size) {
@@ -4695,25 +5028,50 @@ function expandTilde(pattern: string): string {
 
 /// A pattern is normalized once and matched many times: the day cache runs the
 /// filter for every project of every day, and again per provider slice.
-type CompiledPattern = { rooted: true; anchor: string | null } | { rooted: false; needle: string }
+type CompiledPattern = { rooted: true; anchor: string | null; origin: string | null; exact: boolean } | { rooted: false; needle: string; temporary?: true }
 
-export type ProjectFilterTarget = { project: string; projectPath?: string }
+/// `originKey` is the repository a day entry recorded for its path; absent, it
+/// is looked up from the path.
+export type ProjectFilterTarget = { project: string; projectPath?: string; originKey?: string }
 
-function compile(patterns: readonly string[]): CompiledPattern[] {
-  return patterns.map(pattern => isRootedProjectPattern(pattern)
-    ? { rooted: true as const, anchor: normalizeAbsProjectPathKey(expandTilde(pattern)) }
-    : { rooted: false as const, needle: pattern.toLowerCase() })
+let exactProjectPaths = false
+
+/** `--exact-project`: a rooted pattern names its folder alone, not its repository. */
+export function setExactProjectPaths(exact: boolean): void {
+  exactProjectPaths = exact
 }
 
-/// An absolute path names ONE project, so it anchors on a segment boundary (the
-/// isProxiedPath rule): "/a/proj" takes "/a/proj/sub" but not "/a/proj-ui-kit".
+/// "=/path" is one list row: its repository, or that folder without the folders
+/// under it, which are rows of their own. A plain path widens to its repository
+/// only to include: excluding one checkout must not hide its siblings, so an
+/// exclude names the repository only through "=".
+function compile(patterns: readonly string[], widen: boolean): CompiledPattern[] {
+  return patterns.map(pattern => {
+    if (pattern === TEMPORARY_PROJECTS || pattern === `=${TEMPORARY_PROJECTS}`) return { rooted: false as const, needle: '', temporary: true as const }
+    const exact = pattern.startsWith('=') && isRootedProjectPattern(pattern.slice(1))
+    if (!exact && !isRootedProjectPattern(pattern)) return { rooted: false as const, needle: pattern.toLowerCase() }
+    const path = expandTilde(exact ? pattern.slice(1) : pattern)
+    return { rooted: true as const, anchor: normalizeAbsProjectPathKey(path), origin: exactProjectPaths || !(widen || exact) ? null : linkedOriginKey(path) ?? projectOriginKey(path), exact }
+  })
+}
+
+/// A path inside a git checkout names its whole repository: every clone and
+/// worktree sharing the `origin` remote, and nothing else, so the picker row and
+/// the headline it selects are the same set. Any other absolute path names ONE
+/// project, so it anchors on a segment boundary (the isProxiedPath rule):
+/// "/a/proj" takes "/a/proj/sub" but not "/a/proj-ui-kit".
 /// Both sides key through normalizeAbsProjectPathKey (Windows casefolds, POSIX
 /// does not, #1260), and rootedness alone picks the branch, so "/" names none.
 function hit(entry: ProjectFilterTarget, pattern: CompiledPattern, key: string | null): boolean {
   if (pattern.rooted) {
+    // A folder with no known origin (deleted before it was recorded) falls
+    // back to the folder rule, so a repo path still takes its subfolders.
+    const origin = pattern.origin && (linkedOriginKey(entry.projectPath) ?? entry.originKey ?? projectOriginKey(entry.projectPath) ?? folderNameOriginKey(entry.projectPath))
+    if (origin) return origin === pattern.origin
     const anchor = pattern.anchor
-    return anchor !== null && key !== null && (key === anchor || key.startsWith(anchor + '/'))
+    return anchor !== null && key !== null && (key === anchor || (!pattern.exact && key.startsWith(anchor + '/')))
   }
+  if (pattern.temporary) return isTemporaryProjectPath(entry.projectPath) && !(linkedOriginKey(entry.projectPath) ?? entry.originKey ?? projectOriginKey(entry.projectPath) ?? folderNameOriginKey(entry.projectPath))
   return entry.project.toLowerCase().includes(pattern.needle)
     || (entry.projectPath ?? '').toLowerCase().includes(pattern.needle)
 }
@@ -4725,8 +5083,8 @@ export function makeProjectFilter(
   include?: readonly string[],
   exclude?: readonly string[],
 ): (entry: ProjectFilterTarget) => boolean {
-  const inc = compile(include ?? [])
-  const exc = compile(exclude ?? [])
+  const inc = compile(include ?? [], true)
+  const exc = compile(exclude ?? [], false)
   // The key costs a trim, a global replace and three regex passes. The day cache
   // runs this per project, per day, per provider slice, so it is only paid when
   // some pattern is rooted and can actually read it.
@@ -4804,6 +5162,57 @@ function carryLinkageFields(rebuilt: SessionSummary, original: SessionSummary): 
   if (original.agentName) rebuilt.agentName = original.agentName
   if (original.agentStartedAt) rebuilt.agentStartedAt = original.agentStartedAt
   if (original.lineage) rebuilt.lineage = original.lineage
+  if (original.projectSplit) rebuilt.projectSplit = original.projectSplit
+}
+
+/// Session-level views (session rows, PR attribution, subagent folds) need one
+/// record per session. Rejoin the per-project slices of a split session into the
+/// project holding its primary slice, or the first slice present under a filter.
+export function mergeProjectSplits(projects: ProjectSummary[]): ProjectSummary[] {
+  const groups = new Map<string, { home: ProjectSummary; slices: SessionSummary[] }>()
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      const split = session.projectSplit
+      if (!split) continue
+      const key = `${split.primaryProjectPath}\0${session.sessionId}`
+      const group = groups.get(key)
+      if (!group) groups.set(key, { home: project, slices: [session] })
+      else {
+        group.slices.push(session)
+        if (split.primary) group.home = project
+      }
+    }
+  }
+  if (groups.size === 0) return projects
+  const added = new Map<ProjectSummary, SessionSummary[]>()
+  const turnStart = (turn: ClassifiedTurn): number => Date.parse(turn.timestamp || turn.assistantCalls[0]?.timestamp || '') || 0
+  for (const { home, slices } of groups.values()) {
+    const base = slices.find(s => s.projectSplit!.primary) ?? slices[0]!
+    const turns = slices.flatMap(s => s.turns)
+      .sort((a, b) => turnStart(a) - turnStart(b) || Number(!!a.projectContinuation) - Number(!!b.projectContinuation))
+    const session = buildSessionSummary(base.sessionId, base.projectSplit!.primaryProject, turns, base.mcpInventory, base.source)
+    carryLinkageFields(session, base)
+    delete session.projectSplit
+    if (base.prRefsAtRangeStart?.length) session.prRefsAtRangeStart = base.prRefsAtRangeStart
+    const links = new Set(slices.flatMap(s => s.prLinks ?? []))
+    if (links.size) session.prLinks = [...links].sort()
+    const list = added.get(home)
+    if (list) list.push(session)
+    else added.set(home, [session])
+  }
+  const out: ProjectSummary[] = []
+  for (const project of projects) {
+    const sessions = project.sessions.filter(s => !s.projectSplit)
+    const extra = added.get(project)
+    if (!extra && sessions.length === project.sessions.length) {
+      out.push(project)
+      continue
+    }
+    if (extra) sessions.push(...extra)
+    if (sessions.length === 0 && !project.subagentAnchors?.length) continue
+    out.push({ ...project, ...summarizeProject(project.project, project.projectPath, sessions, project.subagentAnchors) })
+  }
+  return out
 }
 
 // The "PR active entering this slice", recomputed by replaying the ORIGINAL full
@@ -5132,7 +5541,7 @@ export function correlateCrossProviderPrSessions(projects: ProjectSummary[]): vo
     if (bucket) bucket.push(s)
     else unlinkedByAgentId.set(s.agentId, [s])
   }
-  for (const resolved of resolveSubagentAttribution(projects).values()) {
+  for (const resolved of resolveSubagentAttribution(mergeProjectSplits(projects), false).values()) {
     for (const child of resolved) {
       // A multi-PR spawn set is valid for folding the child's own cost, but is
       // too broad to identify which PR an independently saved nested review was
@@ -5304,6 +5713,94 @@ export function filterProjectsByCall(projects: ProjectSummary[], keep: (call: Pa
     filtered.push(summarizeProject(project.project, project.projectPath, sessions, dedupedAnchors))
   }
   return filtered.sort((a, b) => b.totalCostUSD - a.totalCostUSD)
+}
+
+const CLAUDE_LEDGER_MATCH_WINDOW_MS = 30 * 1000
+
+function claudeLedgerModelIdentity(model: string): { base: string; route?: string } {
+  const routed = getModelRoute(model)
+  return {
+    base: (routed?.baseModel ?? model).toLowerCase(),
+    ...(routed?.variant ? { route: routed.variant.toLowerCase() } : {}),
+  }
+}
+
+function claudeLedgerCallMatchesTranscript(ledgerCall: ParsedApiCall, transcriptCall: ParsedApiCall): boolean {
+  const ledgerModel = claudeLedgerModelIdentity(ledgerCall.model)
+  const transcriptModel = claudeLedgerModelIdentity(transcriptCall.model)
+  if (ledgerModel.base !== transcriptModel.base) return false
+  // Matching normalizes only the Bedrock wrapper. Pricing still receives each
+  // call's raw model id. A bare transcript model can be paired with the routed
+  // ledger id; when both sides carry an explicit route, keep different
+  // geographic SKUs separate.
+  if (ledgerModel.route && transcriptModel.route && ledgerModel.route !== transcriptModel.route) return false
+
+  const ledgerUsage = ledgerCall.usage
+  const transcriptUsage = transcriptCall.usage
+  if (
+    ledgerUsage.inputTokens !== transcriptUsage.inputTokens ||
+    ledgerUsage.outputTokens !== transcriptUsage.outputTokens ||
+    ledgerUsage.cacheCreationInputTokens !== transcriptUsage.cacheCreationInputTokens ||
+    ledgerUsage.cacheReadInputTokens !== transcriptUsage.cacheReadInputTokens ||
+    ledgerUsage.webSearchRequests !== transcriptUsage.webSearchRequests
+  ) {
+    return false
+  }
+
+  const ledgerTimestamp = Date.parse(ledgerCall.timestamp)
+  const transcriptTimestamp = Date.parse(transcriptCall.timestamp)
+  if (!Number.isFinite(ledgerTimestamp) || !Number.isFinite(transcriptTimestamp)) return false
+  return Math.abs(ledgerTimestamp - transcriptTimestamp) <= CLAUDE_LEDGER_MATCH_WINDOW_MS
+}
+
+function claudeLedgerUsageKey(call: ParsedApiCall): string {
+  const u = call.usage
+  return `${claudeLedgerModelIdentity(call.model).base}|${u.inputTokens}|${u.outputTokens}|${u.cacheCreationInputTokens}|${u.cacheReadInputTokens}|${u.webSearchRequests}`
+}
+
+/// Claude Desktop 3p writes a usage-ledger record alongside a Claude
+/// transcript. The two records have different keys, so the normal parser
+/// deduplication cannot see that they are the same request. Keep the
+/// transcript call, which carries the project, tools and turn classification,
+/// and drop a ledger call only on a one-to-one token/model/timestamp match.
+/// A ledger call whose transcript was deleted stays counted.
+function deduplicateClaudeDesktopLedger(
+  ledgerProjects: ProjectSummary[],
+  transcriptProjects: ProjectSummary[],
+): ProjectSummary[] {
+  if (ledgerProjects.length === 0) return ledgerProjects
+  const transcriptCalls = new Map<string, ParsedApiCall[]>()
+  for (const project of transcriptProjects) {
+    for (const session of project.sessions) {
+      for (const turn of session.turns) {
+        for (const call of turn.assistantCalls) {
+          const key = claudeLedgerUsageKey(call)
+          const bucket = transcriptCalls.get(key)
+          if (bucket) bucket.push(call)
+          else transcriptCalls.set(key, [call])
+        }
+      }
+    }
+  }
+  if (transcriptCalls.size === 0) return ledgerProjects
+
+  const matched = new Set<ParsedApiCall>()
+  return filterProjectsByCall(ledgerProjects, ledgerCall => {
+    let best: ParsedApiCall | undefined
+    let bestDistance = Number.POSITIVE_INFINITY
+    for (const transcriptCall of transcriptCalls.get(claudeLedgerUsageKey(ledgerCall)) ?? []) {
+      if (matched.has(transcriptCall)) continue
+      if (!claudeLedgerCallMatchesTranscript(ledgerCall, transcriptCall)) continue
+      const distance = Math.abs(Date.parse(ledgerCall.timestamp) - Date.parse(transcriptCall.timestamp))
+      if (distance < bestDistance) {
+        best = transcriptCall
+        bestDistance = distance
+      }
+    }
+    if (!best) return true
+    matched.add(best)
+    return false
+  })
 }
 
 export function filterProjectsByDateRange(projects: ProjectSummary[], dateRange: DateRange): ProjectSummary[] {
@@ -5493,7 +5990,7 @@ export async function computeCorpusFingerprint(providerFilter?: string): Promise
       envFingerprinted.add(source.provider)
       entries.push(`env:${source.provider}|${computeEnvFingerprint(source.provider)}`)
     }
-    if (source.provider === 'claude') {
+    if (source.provider === 'claude' && source.sourceKind !== 'claude-desktop-ledger') {
       for (const filePath of await collectJsonlFiles(source.path)) await record(filePath)
       continue
     }
@@ -5516,6 +6013,9 @@ export async function computeCorpusFingerprint(providerFilter?: string): Promise
     }
     await record(source.path)
   }
+  // Cursor Agent output depends on the Cursor import too (it replaces the
+  // agent's estimates), so a snapshot scoped to it must move with the import.
+  await record(cursorImportPath())
   entries.sort()
   const hash = createHash('sha256').update(entries.join('\n')).digest('hex')
   return { hash, newestMtimeMs, observedAtMs }
@@ -5557,6 +6057,33 @@ const dateFloorSkippedProviders = new Set<string>()
 // already does for the mirror-image case (same start, LATER end).
 type SinglePassScope = { range: DateRange; parses: Map<string, Promise<ProjectSummary[]>> }
 let singlePassScope: SinglePassScope | null = null
+
+// A command that asks for several ranges one after another (status: today,
+// then the month) declares their union here, so the session cache loads once
+// and every later request finds its range already held in full. Only the load
+// range widens: each request keeps its own month scope and summaries, and a
+// cached file the wider range holds in full instead of as a stub contributes
+// exactly what its stub would.
+let loadWindow: DateRange | null = null
+
+export async function withLoadWindow<T>(range: DateRange, fn: () => Promise<T>): Promise<T> {
+  const outer = loadWindow
+  loadWindow = range
+  try {
+    return await fn()
+  } finally {
+    loadWindow = outer
+  }
+}
+
+function withinLoadWindow(scope: CacheLoadScope): CacheLoadScope {
+  if (!loadWindow) return scope
+  return {
+    ...scope,
+    startMs: Math.min(scope.startMs!, loadWindow.start.getTime()),
+    endMs: Math.max(scope.endMs!, loadWindow.end.getTime()),
+  }
+}
 
 export async function withSinglePassParse<T>(range: DateRange, fn: () => Promise<T>): Promise<T> {
   const outer = singlePassScope
@@ -5702,7 +6229,7 @@ function deferToBackgroundFill(path: string, fp: { mtimeMs: number }, cached: un
 /// Vercel AI Gateway's `/v1/report` returns one cost/token/request_count per
 /// day per model, with no request id, timestamp or attribution. The local
 /// tools that were pointed at the gateway (Claude Code via
-/// ANTHROPIC_BASE_URL, Codex, OpenCode, Cline/Roo/Kilo, Cursor) record those
+/// ANTHROPIC_BASE_URL, Codex, OpenCode, Cline/Kilo, Cursor) record those
 /// same requests in their own session files, and nothing in an aggregate row
 /// can be matched against them — so a corpus holding both counts the same
 /// spend twice.
@@ -5760,7 +6287,7 @@ export function parseAllSessions(
   providerFilter?: string,
   opts?: { includeAggregateOnly?: boolean },
 ): Promise<ProjectSummary[]> {
-  const parsed = parseAllSessionsUnfiltered(dateRange, providerFilter)
+  const parsed = parseAllSessionsUnfiltered(dateRange, providerFilter).then(applyCodexSessionNames)
   if (opts?.includeAggregateOnly === true) return parsed
   return parsed.then(projects => excludeAggregateOnlyProjects(projects, providerFilter))
 }
@@ -5780,7 +6307,7 @@ function canServeCompleteSnapshot(cache: SessionCache, providerFilter?: string, 
   const sections = providerFilter && providerFilter !== 'all'
     ? ([[providerFilter, cache.providers[providerFilter]]] as const).filter((entry): entry is readonly [string, ProviderSection] => entry[1] != null)
     : Object.entries(cache.providers)
-  return sections.some(([, section]) => Object.keys(section.files).length > 0)
+  return sections.some(([name]) => hasCachedEntries(cache, name))
     && sections.every(([name, section]) => section.envFingerprint === computeEnvFingerprint(name))
 }
 
@@ -5836,10 +6363,10 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
   // unaffected (a suppressed duplicate contributes nothing either way), but for
   // a proxied key emitted under two providers the attribution can land on a
   // different provider than a full load would pick.
-  const loadScope = dateRange ? monthScopeForRange(dateRange.start, dateRange.end) : undefined
+  const loadScope = dateRange ? withinLoadWindow(monthScopeForRange(dateRange.start, dateRange.end)) : undefined
   const rangeStartMs = dateRange?.start.getTime()
   const cacheLoadStarted = performance.now()
-  let diskCache = await loadCache(loadScope)
+  let diskCache: SessionCache | null = await loadCache(loadScope)
   await cleanupOrphanedTempFiles()
   if (process.env['CODEBURN_VERBOSE'] === '1') {
     process.stderr.write(`codeburn: startup timing cache-load=${(performance.now() - cacheLoadStarted).toFixed(1)}ms complete=${isCacheComplete(diskCache, providerFilter, rangeStartMs)}\n`)
@@ -5876,7 +6403,6 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
   // A complete cache refresh is a strict read/reconcile/parse/save transaction.
   // Keep the snapshot loaded before acquisition: timeout/unavailable paths serve
   // exactly this complete snapshot and never mutate or invalidate the holder.
-  const priorSnapshot = diskCache
   // Heartbeat the WAIT too, not just the parse behind it. This is the one place
   // a healthy process is deliberately idle for a long stretch, and the desktop
   // and menubar watchdogs read silence as a dead child - which is how a waiter
@@ -5894,8 +6420,11 @@ async function parseAllSessionsInCacheScope(dateRange?: DateRange, providerFilte
     process.stderr.write(`codeburn: startup timing refresh-lock=${(performance.now() - refreshWaitStarted).toFixed(1)}ms outcome=${refresh.outcome}\n`)
   }
   if (refresh.outcome === 'timed-out' || refresh.outcome === 'unavailable') {
-    return runParse(key, priorSnapshot, dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
+    return runParse(key, diskCache, dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
   }
+  // Every other outcome reloads, so the snapshot goes first: two views of a
+  // large cache are never held at once.
+  diskCache = null
   if (refresh.outcome === 'completed-by-other') {
     return runParse(key, await loadCache(loadScope), dateRange, providerFilter, { readOnly: true, burstSig, parseStartedAt })
   }
@@ -5977,6 +6506,8 @@ async function runParseInner(
   traceTiming('discovery', ` sources=${allSources.length}`)
 
   const claudeSources = allSources.filter(s => s.provider === 'claude')
+  const claudeLedgerSources = claudeSources.filter(s => s.sourceKind === 'claude-desktop-ledger')
+  const claudeProjectSources = claudeSources.filter(s => s.sourceKind !== 'claude-desktop-ledger')
   const nonClaudeSources = allSources.filter(s => s.provider !== 'claude')
 
   const providerGroups = new Map<string, SessionSource[]>()
@@ -6011,7 +6542,7 @@ async function runParseInner(
     ...providerGroups.keys(),
   ] })
 
-  const claudeDirs = claudeSources.map(s => ({
+  const claudeDirs = claudeProjectSources.map(s => ({
     path: s.path,
     name: s.project,
     source: s.sourceId && s.sourceLabel && s.sourcePath && s.sourceKind
@@ -6031,11 +6562,33 @@ async function runParseInner(
   let claudeProjects: ProjectSummary[] = []
   if (claudeInScope) {
     try {
-      claudeProjects = await scanProjectDirs(claudeDirs, seenMsgIds, diskCache, dateRange, saveProgress, readOnly)
+      claudeProjects = await scanProjectDirs(
+        claudeDirs,
+        seenMsgIds,
+        diskCache,
+        dateRange,
+        saveProgress,
+        readOnly,
+        claudeLedgerSources.map(source => source.path),
+      )
+      if (claudeLedgerSources.length > 0) {
+        const ledgerProjects = await parseProviderSources(
+          'claude',
+          claudeLedgerSources,
+          seenKeys,
+          diskCache,
+          dateRange,
+          saveProgress,
+          readOnly,
+        )
+        claudeProjects.push(...deduplicateClaudeDesktopLedger(ledgerProjects, claudeProjects))
+      }
       if (claudeSources.length > 0) emitScanProgress({ kind: 'provider', provider: 'claude', state: 'done', files: claudeSources.length })
+      clearProviderIssue('claude', 'parse', 'eacces')
     } catch (err) {
       if (!isPermissionError(err)) throw err
       permissionSkippedProviders.add('claude')
+      recordProviderIssue('claude', 'parse', err)
       process.stderr.write(`codeburn: skipped claude data (permission denied; grant Full Disk Access to include it)\n`)
       emitScanProgress({ kind: 'provider', provider: 'claude', state: 'skipped' })
     }
@@ -6048,12 +6601,14 @@ async function runParseInner(
     try {
       const projects = await parseProviderSources(providerName, sources, seenKeys, diskCache, dateRange, saveProgress, readOnly)
       emitScanProgress({ kind: 'provider', provider: providerName, state: 'done', files: sources.length })
+      clearProviderIssue(providerName, 'parse', 'eacces')
       otherProjects.push(...projects)
     } catch (err) {
       // A permission-locked provider skips-and-continues; any other error is a
       // real bug and still aborts (per-file/DB-lock cases are handled deeper).
       if (!isPermissionError(err)) throw err
       permissionSkippedProviders.add(providerName)
+      recordProviderIssue(providerName, 'parse', err)
       process.stderr.write(`codeburn: skipped ${providerName} data (permission denied; grant Full Disk Access to include it)\n`)
       emitScanProgress({ kind: 'provider', provider: providerName, state: 'skipped' })
     }
@@ -6077,7 +6632,7 @@ async function runParseInner(
     // Skip if filtered to a different provider
     if (providerFilter && providerFilter !== 'all' && providerFilter !== providerName) continue
     const section = diskCache.providers[providerName]
-    if (!section || Object.keys(section.files).length === 0) continue
+    if (!section || !hasCachedEntries(diskCache, providerName)) continue
     const hasWslCachedSources = Object.keys(section.files).some(isWslUncPath)
     // Use the persisted durable flag (set by parseProviderSources when it first
     // processes a durableSources provider) OR the static DURABLE_PROVIDER_NAMES
@@ -6201,6 +6756,9 @@ async function runParseInner(
 
   const result = Array.from(mergedMap.values()).sort((a, b) => b.totalCostUSD - a.totalCostUSD)
   correlateCrossProviderPrSessions(result)
+  // Learn each checkout's repository while its folder still exists.
+  for (const p of result) projectOriginKey(p.projectPath)
+  if (!readOnly) saveGitOrigins()
   // A snapshot is an explicitly stale, source-unvalidated view. Publishing it
   // into either exact-key or burst reuse can suppress the reconciliation that
   // the mounted dashboard starts immediately afterward for the full TTL.

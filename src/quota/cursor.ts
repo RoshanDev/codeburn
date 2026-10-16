@@ -120,12 +120,13 @@ function planLabel(value: unknown): string | null {
   return known[raw.toLowerCase()] ?? raw
 }
 
-/** `null` when the payload carries no usable overall percentage. */
+/** `null` when the payload carries no usable percentage. */
 export function decodeCursorUsage(body: unknown): QuotaProvider | null {
   const data = body && typeof body === 'object' ? body as Record<string, any> : {}
   const plan = data.individualUsage?.plan
   const overall = data.individualUsage?.overall
   const pooled = data.teamUsage?.pooled
+  const teamOnDemand = data.teamUsage?.onDemand
   const auto = providerPercent(plan?.autoPercentUsed)
   const api = providerPercent(plan?.apiPercentUsed)
 
@@ -137,11 +138,15 @@ export function decodeCursorUsage(body: unknown): QuotaProvider | null {
     ?? ratio(overall?.used, overall?.limit)
     ?? ratio(pooled?.used, pooled?.limit)
     ?? (data.isUnlimited === true ? 0 : null)
-  if (monthly === null) return null
+  // Enterprise team seats report no individual meter; the team on-demand
+  // meter is the only structured used/limit pair in their payload.
+  const teamOnDemandPercent = teamOnDemand?.enabled === false ? null : ratio(teamOnDemand?.used, teamOnDemand?.limit)
+  const primaryPercent = monthly ?? teamOnDemandPercent
+  if (primaryPercent === null) return null
 
   const reset = resetsAt(data.billingCycleEnd)
   const start = resetsAt(data.billingCycleStart)
-  const primary: QuotaWindow = { label: 'Monthly', percent: monthly, resetsAt: reset, ...(start ? { startsAt: start } : {}) }
+  const primary: QuotaWindow = { label: monthly === null ? 'Team on-demand' : 'Monthly', percent: primaryPercent, resetsAt: reset, ...(start ? { startsAt: start } : {}) }
   const details = [primary]
   if (auto !== null) details.push({ label: 'Auto', percent: auto, resetsAt: reset })
   if (api !== null) details.push({ label: 'API', percent: api, resetsAt: reset })
@@ -150,6 +155,7 @@ export function decodeCursorUsage(body: unknown): QuotaProvider | null {
   if (onDemandPercent !== null) details.push({ label: 'On-demand', percent: onDemandPercent, resetsAt: reset })
   const teamPercent = ratio(pooled?.used, pooled?.limit)
   if (teamPercent !== null) details.push({ label: 'Team pool', percent: teamPercent, resetsAt: reset })
+  if (monthly !== null && teamOnDemandPercent !== null) details.push({ label: 'Team on-demand', percent: teamOnDemandPercent, resetsAt: reset })
 
   return {
     provider: 'cursor', connection: 'connected',
@@ -169,12 +175,7 @@ function decodeBase64Url(value: string): string | null {
   }
 }
 
-/**
- * Cursor's web session is the JWT plus the user id encoded inside it. Anything
- * that is not a live three-part token with a usable subject is an expired or
- * invalid session, never a request worth making.
- */
-export function cursorSessionCookie(token: string, now: number): string | null {
+export function cursorTokenClaims(token: string): { sub: string; exp: number | null } | null {
   const parts = token.split('.')
   if (parts.length !== 3) return null
   const payload = decodeBase64Url(parts[1]!)
@@ -186,9 +187,20 @@ export function cursorSessionCookie(token: string, now: number): string | null {
     return null
   }
   if (typeof claims.sub !== 'string') return null
+  return { sub: claims.sub, exp: num(claims.exp) }
+}
+
+/**
+ * Cursor's web session is the JWT plus the user id encoded inside it. Anything
+ * that is not a live three-part token with a usable subject is an expired or
+ * invalid session, never a request worth making.
+ */
+export function cursorSessionCookie(token: string, now: number): string | null {
+  const claims = cursorTokenClaims(token)
+  if (claims === null) return null
   const userId = claims.sub.split('|').filter(part => part.length > 0).pop()
   if (!userId || !/^[A-Za-z0-9._-]+$/.test(userId)) return null
-  const expiresAt = num(claims.exp)
+  const expiresAt = claims.exp
   // 60s skew, matching the menubar: a token about to die is already useless.
   if (expiresAt === null || expiresAt * 1000 - now <= 60_000) return null
   return `WorkosCursorSessionToken=${userId}%3A%3A${token}`

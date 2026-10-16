@@ -218,6 +218,7 @@ final class AppStore {
     /// `ProviderConnectionCatalog`.
     var capacityDockProviderSummaries: [String: QuotaSummary] = [:]
     var capacityDockProviderErrors: [String: String] = [:]
+    var capacityDockProviderStatusTitles: [String: String] = [:]
     var capacityDockProvidersLoading: Set<String> = []
     var capacityDockProviderTransientFailures: Set<String> = []
     private var capacityDockProviderRefreshGenerations: [String: UInt64] = [:]
@@ -256,6 +257,7 @@ final class AppStore {
         (CapacityDockProvider) -> Void = {
             CapacityDockPreferences.removeProvider($0)
         }
+    @ObservationIgnored var capacityDockDefaults: UserDefaults = .standard
     @ObservationIgnored var copilotQuotaRuntime: CopilotQuotaRuntime
 
     init(copilotQuotaRuntime: CopilotQuotaRuntime = .live) {
@@ -2456,11 +2458,14 @@ final class AppStore {
         capacityDockProviderRefreshGenerations[provider.id, default: 0] &+= 1
         capacityDockProviderSummaries[provider.id] = nil
         capacityDockProviderErrors[provider.id] = nil
+        capacityDockProviderStatusTitles[provider.id] = nil
         capacityDockProvidersLoading.remove(provider.id)
         capacityDockProviderTransientFailures.remove(provider.id)
     }
 
-    func disconnectCapacityDockProvider(_ provider: CapacityDockProvider) async throws {
+    /// `explicit` is the Disconnect action. Clearing an override only returns
+    /// the provider to automatic discovery, so it leaves the opt-out unset.
+    func disconnectCapacityDockProvider(_ provider: CapacityDockProvider, explicit: Bool = false) async throws {
         if let filter = provider.legacyFilter {
             switch filter {
             case .claude: disconnectSubscription()
@@ -2485,6 +2490,7 @@ final class AppStore {
         }
         capacityDockProviderSummaries[provider.id] = nil
         capacityDockProviderErrors[provider.id] = nil
+        capacityDockProviderStatusTitles[provider.id] = nil
         capacityDockProvidersLoading.remove(provider.id)
         capacityDockProviderTransientFailures.remove(provider.id)
         // Drop the provider from the persisted dock selection too. A
@@ -2492,6 +2498,7 @@ final class AppStore {
         // silently reconnected by the next scheduled refresh, undoing the
         // user's explicit disconnect.
         capacityDockProviderDeselector(provider)
+        if explicit { ProviderExplicitDisconnect.mark(provider.id, defaults: capacityDockDefaults) }
     }
 
     func connectCapacityDockProvider(_ provider: CapacityDockProvider) async {
@@ -2499,15 +2506,21 @@ final class AppStore {
             await connectQuotaProvider(filter)
             return
         }
+        ProviderExplicitDisconnect.clear(provider.id, defaults: capacityDockDefaults)
         await CapacityDockProviderRefreshInteraction.userInitiated {
             await refreshCapacityDockProvider(provider)
         }
     }
 
-    func refreshCapacityDockProvider(_ provider: CapacityDockProvider) async {
+    /// `quiet` records nothing when the provider is simply not signed in, so it
+    /// stays "Not connected" instead of "Reconnect required"; any other failure
+    /// is recorded as usual. It skips a provider the user disconnected until
+    /// they connect it again.
+    func refreshCapacityDockProvider(_ provider: CapacityDockProvider, quiet: Bool = false) async {
         guard provider.legacyFilter == nil,
               provider.catalogEntry.hasLiveCodeBurnQuotaAdapter,
-              !capacityDockProvidersLoading.contains(provider.id) else { return }
+              !capacityDockProvidersLoading.contains(provider.id),
+              !(quiet && ProviderExplicitDisconnect.isSet(provider.id, defaults: capacityDockDefaults)) else { return }
         let generation = capacityDockProviderRefreshGenerations[provider.id, default: 0]
         capacityDockProvidersLoading.insert(provider.id)
         defer {
@@ -2527,12 +2540,20 @@ final class AppStore {
             }
             capacityDockProviderSummaries[provider.id] = summary
             capacityDockProviderErrors[provider.id] = nil
+            capacityDockProviderStatusTitles[provider.id] = nil
             capacityDockProviderTransientFailures.remove(provider.id)
         } catch {
-            guard capacityDockProviderRefreshGenerations[provider.id, default: 0] == generation else {
+            guard capacityDockProviderRefreshGenerations[provider.id, default: 0] == generation,
+                  !(quiet && (error as? CapacityDockProviderFetchFailure)?.notSignedIn == true) else {
                 return
             }
-            capacityDockProviderErrors[provider.id] = sanitizeForUI(error.localizedDescription)
+            let failure = error as? CapacityDockProviderFetchFailure
+            // Without a last quota the pane offers Retry; with one it shows Disconnect.
+            let retryShown = capacityDockProviderSummaries[provider.id] == nil
+            capacityDockProviderErrors[provider.id] = sanitizeForUI(
+                (retryShown ? failure?.retryMessage : nil) ?? error.localizedDescription
+            )
+            capacityDockProviderStatusTitles[provider.id] = failure?.statusTitle
             if let failure = error as? CapacityDockProviderFetchFailure,
                failure.disposition == .transient {
                 capacityDockProviderTransientFailures.insert(provider.id)
@@ -3084,7 +3105,6 @@ enum ProviderFilter: String, CaseIterable, Identifiable {
     case pi = "Pi"
     case qwen = "Qwen"
     case omp = "OMP"
-    case rooCode = "Roo Code"
     case crush = "Crush"
     case antigravity = "Antigravity"
     case goose = "Goose"
@@ -3106,7 +3126,6 @@ enum ProviderFilter: String, CaseIterable, Identifiable {
         case .cursorAgent: ["cursor-agent", "cursor agent"]
         case .cline: ["cline"]
         case .codewhale: ["codewhale"]
-        case .rooCode: ["roo-code", "roo code"]
         case .kiloCode: ["kilo-code", "kilocode"]
         case .ibmBob: ["ibm-bob", "ibm bob"]
         case .openclaw: ["openclaw"]
@@ -3145,7 +3164,6 @@ enum ProviderFilter: String, CaseIterable, Identifiable {
         case .pi: "pi"
         case .qwen: "qwen"
         case .omp: "omp"
-        case .rooCode: "roo-code"
         case .crush: "crush"
         case .antigravity: "antigravity"
         case .goose: "goose"

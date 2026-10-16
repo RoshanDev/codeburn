@@ -47,11 +47,37 @@ import { isWslUncPath } from './wsl.js'
 // No bump for #1264: the missing-cumulative branch is a no-op on real data
 // (0 occurrences of info-without-total across 137k+ events; null-info pings
 // already take the estimate path), so cached numbers are identical and a
-// bump would only force a cold reparse. v16 was never shipped in a release.
-export const CODEX_CACHE_VERSION = 15
+// bump would only force a cold reparse.
+// v17: fork replay suppression now ends at the first timestamp gap over one
+// second, or five seconds past the fork regardless of gaps, so first real
+// work is retained. Exact entries can hold the old undercount, and resume
+// state used the old fixed cutoff; reparse both. Not 16: v16 was briefly
+// shipped by a reverted PR, so reusing it would let stale entries pass the
+// version check unreparsed.
+// v18: read response-level token_usage_record and ignore later token_count
+// twins. v17 entries miss interrupted/compaction usage and can include counts
+// now suppressed after the source handover, so they must reparse.
+// v19: codex priority-tier pricing (#1616) - turns run under Codex's Fast
+// speed setting (thread_settings_applied service_tier "priority") now bill at
+// the priority rates. This file stores each call's costUSD and speed verbatim,
+// so v18 entries carry the standard-rate cost and must be re-derived.
+// v20: `codex-auto-review` prices by date (gpt-5.4 before 30 Jul 2026, GPT-5.6
+// Luna from then on) instead of gpt-5.5. Stored costUSD is the old price.
+// v21: service_tier "flex" bills at the published Flex rates (it billed at
+// standard), and `gpt-reserve` / `gpt-5.3-spark` price as GPT-5.6 Luna /
+// GPT-5.3 Codex Spark instead of $0. Stored costUSD and speed are the old ones.
+// v22: a fork's replay burst drops only records found in the parent rollout
+// and counts the rest. v21 entries dropped the whole burst.
+export const CODEX_CACHE_VERSION = 22
 export const CODEX_LEGACY_CACHE_FILE = 'codex-results.json'
 export function codexCacheFileName(version = CODEX_CACHE_VERSION): string {
   return `codex-results.v${version}.json`
+}
+// Discovery only needs each rollout's project, so it reads this small index
+// instead of the whole results file. Keyed by the same fingerprint, so an
+// index that lags the results file only misses, never answers wrong.
+export function codexProjectsFileName(version = CODEX_CACHE_VERSION): string {
+  return `codex-projects.v${version}.json`
 }
 
 export type CodexFileFingerprint = { dev: number; ino: number; mtimeMs: number; sizeBytes: number }
@@ -82,6 +108,8 @@ type ResultCache = {
   version: number
   files: Record<string, FileEntry>
 }
+
+type ProjectEntry = Pick<FileEntry, 'dev' | 'ino' | 'mtimeMs' | 'sizeBytes' | 'project'>
 
 const cacheDirContext = new AsyncLocalStorage<string>()
 
@@ -119,6 +147,57 @@ const memCaches = new Map<string, ResultCache>()
 export function clearCodexMemCaches(): void {
   memCaches.clear()
   inFlightLoads.clear()
+  projectIndexes.clear()
+}
+
+const projectIndexes = new Map<string, Promise<Record<string, ProjectEntry>>>()
+
+function loadProjectIndex(cacheDir: string): Promise<Record<string, ProjectEntry>> {
+  let index = projectIndexes.get(cacheDir)
+  if (!index) {
+    index = readProjectIndex(cacheDir)
+    projectIndexes.set(cacheDir, index)
+  }
+  return index
+}
+
+// Missing (a cache written before the index existed): built once from the
+// results file, which is what discovery read before.
+async function readProjectIndex(cacheDir: string): Promise<Record<string, ProjectEntry>> {
+  try {
+    const parsed = JSON.parse(await readFile(join(cacheDir, codexProjectsFileName()), 'utf-8')) as { version?: unknown; files?: unknown }
+    if (parsed.version === CODEX_CACHE_VERSION && parsed.files && typeof parsed.files === 'object') return parsed.files as Record<string, ProjectEntry>
+  } catch {}
+  const cache = await loadCache(cacheDir)
+  if (Object.keys(cache.files).length > 0) await writeProjectIndex(cacheDir, cache)
+  return cache.files
+}
+
+async function writeProjectIndex(cacheDir: string, cache: ResultCache): Promise<void> {
+  const files: Record<string, ProjectEntry> = {}
+  for (const [path, e] of Object.entries(cache.files)) {
+    files[path] = { dev: e.dev, ino: e.ino, mtimeMs: e.mtimeMs, sizeBytes: e.sizeBytes, project: e.project }
+  }
+  try {
+    await writeFileAtomic(join(cacheDir, codexProjectsFileName()), JSON.stringify({ version: CODEX_CACHE_VERSION, files }))
+  } catch {}
+}
+
+async function writeFileAtomic(finalPath: string, payload: string): Promise<void> {
+  const tempPath = `${finalPath}.${randomBytes(8).toString('hex')}.tmp`
+  const handle = await open(tempPath, 'w', 0o600)
+  try {
+    await handle.writeFile(payload, { encoding: 'utf-8' })
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+  try {
+    await rename(tempPath, finalPath)
+  } catch (err) {
+    try { await unlink(tempPath) } catch {}
+    throw err
+  }
 }
 
 // Concurrent callers must share one load. The memo below is only populated
@@ -168,9 +247,9 @@ async function loadCacheFromDisk(cacheDir: string): Promise<ResultCache> {
   return empty
 }
 
-function getEntry(cache: ResultCache, filePath: string, fp: FileFingerprint): FileEntry | null {
-  if (!Object.hasOwn(cache.files, filePath)) return null
-  const entry = cache.files[filePath]
+function getEntry<T extends ProjectEntry>(files: Record<string, T>, filePath: string, fp: FileFingerprint): T | null {
+  if (!Object.hasOwn(files, filePath)) return null
+  const entry = files[filePath]
   if (
     entry
     && entry.dev === fp.dev
@@ -218,7 +297,7 @@ export async function readCachedCodexResults(
     const s = await stat(filePath)
     const cache = await loadCache(currentCacheDir())
     const fp = fingerprintFromStat(filePath, s)
-    const entry = getEntry(cache, filePath, fp)
+    const entry = getEntry(cache.files, filePath, fp)
     if (entry) return { kind: 'exact', calls: entry.calls }
     // Rollouts are append-only: the same inode, grown past a boundary we
     // recorded, can be picked up from that boundary instead of re-read whole.
@@ -245,8 +324,9 @@ export async function getCachedCodexProject(
 ): Promise<string | null> {
   try {
     const s = await stat(filePath)
-    const cache = await loadCache(currentCacheDir())
-    const entry = getEntry(cache, filePath, fingerprintFromStat(filePath, s))
+    const cacheDir = currentCacheDir()
+    const files = memCaches.get(cacheDir)?.files ?? await loadProjectIndex(cacheDir)
+    const entry = getEntry(files, filePath, fingerprintFromStat(filePath, s))
     return entry?.project ?? null
   } catch {}
   return null
@@ -323,21 +403,8 @@ export async function flushCodexCache(): Promise<void> {
     }
 
     if (!existsSync(cacheDir)) await mkdir(cacheDir, { recursive: true })
-    const finalPath = getCachePath(cacheDir)
-    const tempPath = `${finalPath}.${randomBytes(8).toString('hex')}.tmp`
-    const payload = JSON.stringify(memCache)
-    const handle = await open(tempPath, 'w', 0o600)
-    try {
-      await handle.writeFile(payload, { encoding: 'utf-8' })
-      await handle.sync()
-    } finally {
-      await handle.close()
-    }
-    try {
-      await rename(tempPath, finalPath)
-    } catch (err) {
-      try { await unlink(tempPath) } catch {}
-      throw err
-    }
+    await writeFileAtomic(getCachePath(cacheDir), JSON.stringify(memCache))
+    await writeProjectIndex(cacheDir, memCache)
+    projectIndexes.delete(cacheDir)
   } catch {}
 }

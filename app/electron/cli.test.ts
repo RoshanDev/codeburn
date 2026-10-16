@@ -298,6 +298,20 @@ describe('notFoundStage (non-sensitive telemetry enum for a not-found)', () => {
     expect(notFoundStage()).toBe('bundled-missing')
   })
 
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('reports bundled-denied when the bundled CLI exists but cannot be stat-ed', () => {
+    delete process.env.CODEBURN_BIN
+    const locked = join(dir, 'locked')
+    mkdirSync(locked)
+    writeFileSync(join(locked, 'launch.js'), '')
+    chmodSync(locked, 0o000)
+    process.env.CODEBURN_BUNDLED_CLI = join(locked, 'launch.js')
+    try {
+      expect(notFoundStage()).toBe('bundled-denied')
+    } finally {
+      chmodSync(locked, 0o755)
+    }
+  })
+
   it('reports bin-not-absolute for a relative CODEBURN_BIN override', () => {
     process.env.CODEBURN_BIN = 'relative/codeburn'
     delete process.env.CODEBURN_BUNDLED_CLI
@@ -329,6 +343,22 @@ describe('spawnSpecFor (bundled CLI runs via Electron-as-node)', () => {
     // PATH is still augmented (the bundle's own dir leads), harmless for a CLI
     // that itself shells out during pairing/sync.
     expect((spec.env.PATH ?? '').split(delimiter)[0]).toBe('/res/cli/dist')
+  })
+
+  it('runs the bundle with CODEBURN_NODE_BIN instead, as plain Node, when a host names one', () => {
+    const saved = process.env.CODEBURN_NODE_BIN
+    process.env.CODEBURN_NODE_BIN = '/usr/local/bin/node'
+    try {
+      const spec = spawnSpecFor({ kind: 'bundled', entry: '/res/cli/dist/launch.js' }, ['serve', '--stdio'])
+      expect(spec.bin).toBe('/usr/local/bin/node')
+      expect(spec.args).toEqual(['/res/cli/dist/launch.js', 'serve', '--stdio'])
+      expect(spec.env.ELECTRON_RUN_AS_NODE).toBeUndefined()
+      process.env.CODEBURN_NODE_BIN = 'node'
+      expect(spawnSpecFor({ kind: 'bundled', entry: '/res/cli/dist/launch.js' }, []).bin).toBe(process.execPath)
+    } finally {
+      if (saved === undefined) delete process.env.CODEBURN_NODE_BIN
+      else process.env.CODEBURN_NODE_BIN = saved
+    }
   })
 
   it('spawns an external CLI directly, with no run-as-node flag', () => {
@@ -444,7 +474,7 @@ describe('spawnCli', () => {
 
   it('rejects with kind "nonzero" on a non-zero exit', async () => {
     fakeBin('fail.js', 'process.stderr.write("boom"); process.exit(2)')
-    await expect(spawnCli(['status'])).rejects.toMatchObject({ kind: 'nonzero' } satisfies Partial<CliError>)
+    await expect(spawnCli(['status'])).rejects.toMatchObject({ kind: 'nonzero', exit: '2' } satisfies Partial<CliError>)
   })
 
   it('rejects with kind "bad-json" on non-JSON stdout', async () => {
@@ -475,7 +505,7 @@ describe('spawnCli', () => {
   })
 })
 
-describe('no-output watchdog (timeoutMs bounds SILENCE, not total runtime)', () => {
+describe('no-output watchdog (timeoutMs bounds SILENCE, not total runtime)', { timeout: 30_000 }, () => {
   /** First stderr write is immediate after Node boot: that only removes the extra
    *  setInterval delay. The spawn-time silence timer still includes Node boot;
    *  the larger smoke window absorbs startup. Further ticks keep the process
@@ -504,17 +534,22 @@ describe('no-output watchdog (timeoutMs bounds SILENCE, not total runtime)', () 
   })
 
   it('kills a child that goes silent, measured from its LAST byte', async () => {
-    // One byte lands ~300ms in (plus node boot), well inside the 1s window, then
-    // silence. A fixed cap kills at 1s; only a window measured from the LAST byte
-    // waits past 1.3s. The gap is wide enough that node's boot cost cannot blur it.
+    // One byte lands 300ms after the child boots, then silence. A fixed cap kills
+    // `timeoutMs` after spawn; only a window measured from the LAST byte waits a
+    // full `timeoutMs` past that byte. The child stamps when it wrote, so a slow
+    // boot shifts both sides instead of eating the margin; the window only has
+    // to outlast boot itself.
+    const wroteAtFile = join(dir, 'wrote-at')
     fakeBin(
       'talks-then-hangs.js',
-      `setTimeout(() => process.stderr.write('CODEBURN_PROGRESS {"kind":"keepalive"}\\n'), 300);
+      `setTimeout(() => {
+         require('node:fs').writeFileSync(${JSON.stringify(wroteAtFile)}, String(Date.now()));
+         process.stderr.write('CODEBURN_PROGRESS {"kind":"keepalive"}\\n');
+       }, 300);
        setInterval(() => {}, 1000);`,
     )
-    const began = Date.now()
-    await expect(spawnCli(['optimize'], { timeoutMs: 1_000 })).rejects.toMatchObject({ kind: 'timeout' })
-    expect(Date.now() - began).toBeGreaterThanOrEqual(1_250)
+    await expect(spawnCli(['optimize'], { timeoutMs: 3_000 })).rejects.toMatchObject({ kind: 'timeout' })
+    expect(Date.now() - Number(readMaybe(wroteAtFile))).toBeGreaterThanOrEqual(2_950)
   })
 
   it('keeps progress heartbeats out of the surfaced error message', async () => {
@@ -533,7 +568,12 @@ describe('no-output watchdog (timeoutMs bounds SILENCE, not total runtime)', () 
   })
 })
 
-describe('graceful kill (SIGTERM, then SIGKILL after the grace)', () => {
+// Each child installs its SIGTERM handler before its first byte, but the silence window
+// before that byte also covers node's boot. BOOT_WINDOW_MS leaves a loaded machine room to
+// boot, so the signal never lands on a child that has not installed its handler yet.
+const BOOT_WINDOW_MS = 3_000
+
+describe('graceful kill (SIGTERM, then SIGKILL after the grace)', { timeout: 30_000 }, () => {
   posixOnly('sends SIGTERM first and SIGKILLs a child that ignores it', async () => {
     const signalFile = join(dir, 'signals')
     const pidFile = join(dir, 'stubborn-pid')
@@ -546,7 +586,7 @@ describe('graceful kill (SIGTERM, then SIGKILL after the grace)', () => {
        setInterval(() => {}, 1000);`,
     )
 
-    await expect(spawnCli(['status'], { timeoutMs: 1_500 })).rejects.toMatchObject({ kind: 'timeout' })
+    await expect(spawnCli(['status'], { timeoutMs: BOOT_WINDOW_MS })).rejects.toMatchObject({ kind: 'timeout' })
     // SIGTERM arrives with the rejection; the child survives it and is SIGKILLed
     // only after KILL_GRACE_MS (5s).
     await waitFor(() => readMaybe(signalFile) === 'TERM')
@@ -575,7 +615,7 @@ describe('graceful kill (SIGTERM, then SIGKILL after the grace)', () => {
        setInterval(() => {}, 1000);`,
     )
 
-    await expect(spawnCli(['status'], { timeoutMs: 1_500 })).rejects.toMatchObject({ kind: 'timeout' })
+    await expect(spawnCli(['status'], { timeoutMs: BOOT_WINDOW_MS })).rejects.toMatchObject({ kind: 'timeout' })
     await waitFor(() => readMaybe(pidFile).length > 0)
     const pid = Number(readMaybe(pidFile))
     expect(() => process.kill(pid, 0)).not.toThrow() // alive, mid-grace
@@ -595,10 +635,10 @@ describe('graceful kill (SIGTERM, then SIGKILL after the grace)', () => {
        process.stdout.write('ready');
        setInterval(() => {}, 1000);`,
     )
-    const began = Date.now()
-    await expect(spawnCli(['status'], { timeoutMs: 1_500 })).rejects.toMatchObject({ kind: 'timeout' })
+    await expect(spawnCli(['status'], { timeoutMs: BOOT_WINDOW_MS })).rejects.toMatchObject({ kind: 'timeout' })
+    const signalledAt = Date.now()
     await waitFor(() => readMaybe(cleanupFile) === 'released')
-    expect(Date.now() - began).toBeLessThan(5_000) // never waited out the grace
+    expect(Date.now() - signalledAt).toBeLessThan(5_000) // never waited out the grace
   })
 })
 
@@ -1229,6 +1269,33 @@ describe('resident serve single-flight', { timeout: 30_000 }, () => {
     expect(readMaybe(oneShotsFile)).toBe('oooo')
   })
 
+  it('keeps restarting a resident that answers between watchdog kills', async () => {
+    const startsFile = join(dir, 'serve-starts')
+    fakeBin(
+      'answers-then-hangs-resident.js',
+      `const fs = require('node:fs'); const readline = require('node:readline');
+       if (process.argv[2] === 'serve') {
+         fs.appendFileSync(${JSON.stringify(startsFile)}, 's');
+         const rl = readline.createInterface({ input: process.stdin });
+         rl.once('line', line => {
+           const request = JSON.parse(line);
+           process.stdout.write(JSON.stringify({ id: request.id, ok: true, output: JSON.stringify({ via: 'serve' }) }) + '\\n');
+         });
+         setInterval(() => {}, 1000);
+       } else {
+         process.stdout.write(JSON.stringify({ via: 'spawn' }));
+       }`,
+    )
+    startServe()
+
+    // Each generation answers once, then goes silent and is killed by the
+    // watchdog. Those kills must not add up across healthy answers.
+    for (let attempt = 0; attempt < 10 && readMaybe(startsFile).length < 4; attempt += 1) {
+      await spawnCli(['status', '--attempt', String(attempt)], { timeoutMs: 300 })
+    }
+    expect(readMaybe(startsFile).length).toBeGreaterThanOrEqual(4)
+  })
+
   it('does not spawn a one-shot fallback after killAll destroys serve', async () => {
     const requestSeenFile = join(dir, 'request-seen')
     const oneShotsFile = join(dir, 'one-shot-reads')
@@ -1245,9 +1312,7 @@ describe('resident serve single-flight', { timeout: 30_000 }, () => {
     )
     startServe()
     const pending = spawnCli(['status', '--shutdown'], { timeoutMs: 60_000 })
-    for (let attempt = 0; attempt < 400 && !readMaybe(requestSeenFile); attempt += 1) {
-      await new Promise(resolve => setTimeout(resolve, 5))
-    }
+    await waitFor(() => readMaybe(requestSeenFile) !== '', 15_000).catch(() => {})
     const requestSeen = readMaybe(requestSeenFile)
     killAll()
 
@@ -1559,7 +1624,7 @@ describe('killAll', () => {
   })
 })
 
-describe('spawnCli concurrency scheduler', () => {
+describe('spawnCli concurrency scheduler', { timeout: 30_000 }, () => {
   // A fake CLI that records each spawn (by subcommand) and then blocks until a
   // release file named after that subcommand appears, so the test controls
   // exactly when each child exits and can observe how many run at once.
@@ -1717,9 +1782,9 @@ describe('spawnCli concurrency scheduler', () => {
     startServe()
 
     const requests = Array.from({ length: 6 }, (_, index) =>
-      spawnCli(['status', `fallback-${index}`], { timeoutMs: 5_000 }),
+      spawnCli(['status', `fallback-${index}`], { timeoutMs: 30_000 }),
     )
-    await waitUntil(() => startedList(startedFile).length >= 2)
+    await waitUntil(() => startedList(startedFile).length >= 2, 15_000)
     await delay(150)
     const admittedBeforeRelease = startedList(startedFile)
 

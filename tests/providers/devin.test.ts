@@ -155,18 +155,18 @@ describe('devin provider', () => {
 
     expect(calls).toHaveLength(2)
     expect(calls.reduce((sum, call) => sum + call.costUSD, 0)).toBeCloseTo(
-      calculateCost('claude-opus-4-6', 95, 20, 10, 5, 0) + calculateCost('claude-sonnet-4-6', 1, 0, 0, 0, 0),
+      calculateCost('claude-opus-4-6', 100, 20, 10, 5, 0) + calculateCost('claude-sonnet-4-6', 1, 0, 0, 0, 0),
       15,
     )
     expect(calls[0]).toMatchObject({
       provider: 'devin',
       model: 'Opus 4.6',
-      inputTokens: 95,
+      inputTokens: 100,
       outputTokens: 20,
       cacheCreationInputTokens: 10,
       cacheReadInputTokens: 5,
       cachedInputTokens: 5,
-      costUSD: calculateCost('claude-opus-4-6', 95, 20, 10, 5, 0),
+      costUSD: calculateCost('claude-opus-4-6', 100, 20, 10, 5, 0),
       tools: ['read_file'],
       timestamp: '2027-01-15T08:00:01.000Z',
       deduplicationKey: 'devin:session-123:2',
@@ -464,11 +464,11 @@ describe('devin provider', () => {
     expect(calls[0]).toMatchObject({
       provider: 'devin',
       model: 'Sonnet 4.6',
-      inputTokens: 190,
+      inputTokens: 200,
       outputTokens: 50,
       cacheCreationInputTokens: 20,
       cacheReadInputTokens: 10,
-      costUSD: calculateCost('claude-sonnet-4-6', 190, 50, 20, 10, 0),
+      costUSD: calculateCost('claude-sonnet-4-6', 200, 50, 20, 10, 0),
       tools: ['read_file'],
       userMessage: 'fix the bug',
       sessionId: 'v17-session',
@@ -626,6 +626,8 @@ describe('devin provider', () => {
     })
   })
 
+  // Devin's metadata.metrics input_tokens already excludes cache reads, so
+  // nothing is carved out of it (unlike ATIF prompt_tokens).
   it('falls back to metadata.metrics when step.metrics is present but empty', async () => {
     const filePath = await writeTranscript('empty-step-metrics.json', {
       session_id: 'empty-metrics-session',
@@ -646,7 +648,7 @@ describe('devin provider', () => {
 
     expect(calls).toHaveLength(1)
     expect(calls[0]).toMatchObject({
-      inputTokens: 75,
+      inputTokens: 80,
       outputTokens: 20,
       cacheReadInputTokens: 5,
       costUSD: 0,
@@ -843,9 +845,12 @@ skipUnlessSqlite('devin provider sessions.db enrichment', () => {
 
     expect(expectedKimiCost).toBeGreaterThan(0)
     expect(sum(c => (c.model === 'Kimi K3' ? c.costUSD : 0))).toBeCloseTo(expectedKimiCost, 12)
-    // swe-2-high has no pricing table entry: unpriced, never silently priced.
-    expect(getModelCosts('swe-2-high')).toBeNull()
-    expect(calls.filter(c => c.model === 'swe-2-high').every(c => c.costUSD === 0)).toBe(true)
+    // Cognition's SWE-2 list price: $3 input, $15 output, $0.30 cache read per 1M.
+    const expectedSweCost = steps
+      .filter(([model]) => model === 'swe-2-high')
+      .reduce((total, [, prompt, completion, cached]) =>
+        total + (prompt - cached) * 3e-6 + completion * 15e-6 + cached * 0.3e-6, 0)
+    expect(sum(c => (c.model === 'swe-2-high' ? c.costUSD : 0))).toBeCloseTo(expectedSweCost, 12)
 
     expect(calls[0]).toMatchObject({
       project: 'codeburn',

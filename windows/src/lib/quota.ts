@@ -109,8 +109,32 @@ function mergeProviders(previous: QuotaProvider[], next: QuotaProvider[]): Quota
   })
 }
 
+/// One Claude config directory's own answer, from the quota payload's claudeProfiles: the
+/// same window shape as a provider row, plus the directory's identity and (in separate mode)
+/// its own today totals, which the bubble renders instead of the all-provider glance today.
+export type ClaudeProfile = {
+  id: string
+  label: string
+  path?: string
+  available: boolean
+  plan?: string
+  windows: QuotaWindow[]
+  error?: string
+  today?: ProfileToday
+}
+
+export type ProfileToday = {
+  cost: number
+  calls: number
+  sessions: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+}
+
 export type DockQuota =
-  | { state: 'ready'; providers: QuotaProvider[] }
+  | { state: 'ready'; providers: QuotaProvider[]; claudeProfiles?: ClaudeProfile[] }
   | { state: 'cliOutdated' }
   | { state: 'unavailable'; message: string }
 
@@ -141,6 +165,8 @@ export type QuotaSummary = {
 export type QuotaState = {
   /// The last answer that parsed, kept across a failed refresh so the bars do not blink out.
   providers: QuotaProvider[]
+  /// The CLI's per-config-directory Claude answers; empty when there is only one directory.
+  claudeProfiles: ClaudeProfile[]
   loading: boolean
   /// Set once a refresh has failed and the last good answer is what is on screen.
   retrying: boolean
@@ -151,6 +177,7 @@ export type QuotaState = {
 
 export const EMPTY_QUOTA: QuotaState = {
   providers: [],
+  claudeProfiles: [],
   loading: false,
   retrying: false,
   cliOutdated: false,
@@ -257,6 +284,7 @@ async function run(): Promise<void> {
         failures = 0
         publish({
           providers: mergeProviders(state.providers, answer.providers),
+          claudeProfiles: answer.claudeProfiles ?? [],
           loading: false,
           retrying: false,
           cliOutdated: false,

@@ -15,7 +15,7 @@ import type { ParsedProviderCall, ProbeRoot, Provider, SessionParser, SessionSou
 //   <sessions>/<sessionId>/<sessionId>.messages.json  per-message metrics
 //
 // Kept as its own provider rather than a third root on `cline` so the shared
-// Cline-family parser (also serving Roo Code and KiloCode) stays untouched.
+// Cline-family parser (also serving KiloCode and IBM Bob) stays untouched.
 
 const PROVIDER_NAME = 'cline-cli'
 const DISPLAY_NAME = 'Cline CLI'
@@ -89,11 +89,15 @@ type ClineCliMetrics = {
 
 function parseMetrics(value: unknown): ClineCliMetrics | null {
   if (!isRecord(value)) return null
+  const cacheReadTokens = safeTokenCount(value['cacheReadTokens'])
+  const cacheWriteTokens = safeTokenCount(value['cacheWriteTokens'])
   const metrics: ClineCliMetrics = {
-    inputTokens: safeTokenCount(value['inputTokens']),
+    // Cline's inputTokens is the full prompt, cache read and write included
+    // (its own pricing bills max(0, input - cacheRead - cacheWrite) at the input rate).
+    inputTokens: Math.max(0, safeTokenCount(value['inputTokens']) - cacheReadTokens - cacheWriteTokens),
     outputTokens: safeTokenCount(value['outputTokens']),
-    cacheReadTokens: safeTokenCount(value['cacheReadTokens']),
-    cacheWriteTokens: safeTokenCount(value['cacheWriteTokens']),
+    cacheReadTokens,
+    cacheWriteTokens,
     cost: safeNonNegativeNumber(value['cost']),
     // A negative cost is not a credit we can represent — treat it as absent and
     // fall back to token pricing, rather than reporting a clamped $0 as metered.

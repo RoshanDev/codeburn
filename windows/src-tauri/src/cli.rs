@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 use tauri::AppHandle;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
@@ -159,12 +159,21 @@ pub struct CliStatus {
 }
 
 /// What the Capacity Dock renders: the provider array, or the reason there isn't one.
+/// `claude_profiles` (the per-config-directory Claude answers) rides beside
+/// `providers` as opaque JSON; it is None on a CLI that predates the field.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum DockQuota {
-    Ready { providers: Value },
+    Ready {
+        providers: Value,
+        /// `rename_all` above only covers the variant tag, not this field.
+        #[serde(rename = "claudeProfiles")]
+        claude_profiles: Option<Value>,
+    },
     CliOutdated,
-    Unavailable { message: String },
+    Unavailable {
+        message: String,
+    },
 }
 
 impl CodeburnCli {
@@ -322,15 +331,21 @@ impl CodeburnCli {
 
     /// Spawns `codeburn quota --format json` for the Capacity Dock. A CLI without the
     /// subcommand exits 1 with `unknown command`, which the dock reports as a quiet
-    /// "CLI update needed" state rather than an error.
+    /// "CLI update needed" state rather than an error. `claude_profiles` adds
+    /// `--claude-profiles` (the rail's separate-rings mode); a CLI that predates the flag
+    /// rejects it, so it is passed only when the preference asks for it.
     ///
     /// Provider keys pasted into the settings window ride along as environment variables on
     /// the child, which is the only credential channel the CLI has. They are never put on a
     /// command line and never logged.
-    pub async fn fetch_quota(&self) -> DockQuota {
+    pub async fn fetch_quota(&self, claude_profiles: bool) -> DockQuota {
+        let mut args: Vec<&str> = vec!["quota", "--format", "json"];
+        if claude_profiles {
+            args.push("--claude-profiles");
+        }
         let stdout = match self
             .run_capture_with_env(
-                &["quota", "--format", "json"],
+                &args,
                 SILENCE_SECS,
                 &crate::settings::quota_environment(),
             )
@@ -339,7 +354,9 @@ impl CodeburnCli {
             Ok(stdout) => stdout,
             Err(err) => {
                 let message = err.to_string();
-                return if message.contains("unknown command") {
+                // `unknown option` is the same verdict for a CLI too old to know
+                // `--claude-profiles` as `unknown command` is for one too old for `quota`.
+                return if message.contains("unknown command") || message.contains("unknown option") {
                     DockQuota::CliOutdated
                 } else {
                     DockQuota::Unavailable { message }
@@ -353,6 +370,7 @@ impl CodeburnCli {
                     .get("providers")
                     .cloned()
                     .unwrap_or_else(|| Value::Array(vec![])),
+                claude_profiles: payload.get("claudeProfiles").cloned(),
             },
             Err(err) => DockQuota::Unavailable {
                 message: format!("CLI returned invalid JSON: {err}"),
@@ -373,6 +391,56 @@ impl CodeburnCli {
         self.run_capture(&["export", "-f", format, "-o", &path], silence_window(warm))
             .await?;
         Ok(())
+    }
+
+    /// `codeburn update <args> --json`: hands every stdout line to `on_line` as it arrives, so
+    /// the page can show progress during a minutes-long `npm install -g`. Returns whether the
+    /// CLI exited cleanly; the lines, not the exit code, say what happened to each component.
+    pub async fn run_update_json(
+        &self,
+        args: &[&str],
+        mut on_line: impl FnMut(&str),
+    ) -> Result<bool> {
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&self.extra_args)
+            .arg("update")
+            .args(args)
+            .arg("--json")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|err| anyhow!("{}", spawn_failure_message(&self.program, &err)))?;
+        let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+        let stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
+        let activity = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+        let stderr_task = tokio::spawn(drain(stderr, MAX_STDERR_BYTES, activity));
+
+        let mut lines = BufReader::new(stdout).lines();
+        let read = timeout(Duration::from_secs(CEILING_SECS), async {
+            while let Some(line) = lines.next_line().await? {
+                on_line(&line);
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+        match read {
+            Err(_) => {
+                stop_child(&mut child).await;
+                bail!("The CLI update ran for {CEILING_SECS}s without finishing and was stopped");
+            }
+            Ok(result) => result?,
+        }
+        let status = child.wait().await?;
+        let _ = stderr_task.await;
+        Ok(status.success())
     }
 
     async fn run_capture(&self, args: &[&str], silence_secs: u64) -> Result<String> {
@@ -735,8 +803,26 @@ fn extra_search_dirs() -> Vec<PathBuf> {
         out.push(home.join("scoop").join("shims"));
         out.push(home.join(".bun").join("bin"));
     }
+    // Volta writes package shims (`codeburn.cmd`) to `%VOLTA_HOME%\bin`, not to Program Files
+    // where its installer keeps the node and npm shims, so `node` works from any prompt while
+    // `codeburn` lives wherever VOLTA_HOME points. The default home is probed above; this is
+    // the relocated one (#1532: `D:\Data\Volta`).
+    if let Some(dir) = volta_home_bin(env::var_os("VOLTA_HOME")) {
+        out.push(dir);
+    }
     out.extend(registry_path_dirs());
     out
+}
+
+/// `%VOLTA_HOME%\bin` for a set, non-empty VOLTA_HOME. A relative value is passed through and
+/// dropped by `find_in_dirs`, like every other relative search entry.
+#[cfg(windows)]
+fn volta_home_bin(volta_home: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let home = volta_home?;
+    if home.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(home).join("bin"))
 }
 
 #[cfg(not(windows))]
@@ -1199,6 +1285,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dock_quota_ready_serializes_claude_profiles_as_camel_case() {
+        let answer = DockQuota::Ready {
+            providers: serde_json::json!([]),
+            claude_profiles: Some(serde_json::json!([{"id": "x"}])),
+        };
+        let value = serde_json::to_value(&answer).unwrap();
+        assert!(value.get("claudeProfiles").is_some());
+        assert!(value.get("claude_profiles").is_none());
+    }
+
+    #[test]
     fn only_a_named_read_only_subcommand_opens_a_terminal() {
         assert!(is_allowed_subcommand(&["report"]));
         assert!(is_allowed_subcommand(&["optimize"]));
@@ -1286,6 +1383,18 @@ mod tests {
         let named = spawn_failure_message("/usr/local/bin/codeburn", &denied);
         assert!(named.contains("/usr/local/bin/codeburn"), "{}", named);
         assert!(!named.contains("desktop app"), "{}", named);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn volta_home_bin_follows_a_relocated_volta_home() {
+        use std::ffi::OsString;
+        assert_eq!(
+            volta_home_bin(Some(OsString::from(r"D:\Data\Volta"))),
+            Some(PathBuf::from(r"D:\Data\Volta\bin"))
+        );
+        assert_eq!(volta_home_bin(Some(OsString::from(""))), None);
+        assert_eq!(volta_home_bin(None), None);
     }
 
     #[test]

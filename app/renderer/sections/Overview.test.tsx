@@ -322,6 +322,23 @@ describe('Overview', () => {
     expect(ticks.at(-1)).toHaveTextContent(now.toLocaleString('en-US', { month: 'short', day: 'numeric' }))
   })
 
+  it.each([
+    ['marks', 12.4, '~$312.40'],
+    ['does not mark', 2, '$312.40'],
+  ])('%s the hero total by the shared 1%% estimated rule', async (_label, estimatedCostUSD, shown) => {
+    const payload = makePayload(new Date())
+    payload.current.providerDetails = [
+      { id: 'claude', label: 'Claude', cost: 300 - estimatedCostUSD },
+      { id: 'cursor', label: 'Cursor', cost: 12.4 + estimatedCostUSD, estimatedCostUSD },
+      { id: 'gateway', label: 'Gateway', cost: 50, estimatedCostUSD: 50, excludedFromTotal: true },
+    ]
+    getOverview.mockResolvedValue(payload)
+
+    const { container } = render(<Overview period="30days" provider="all" />)
+
+    await waitFor(() => expect(container.querySelector('.ov-hero-num')).toHaveTextContent(new RegExp(`^${shown.replace(/[$.]/g, '\\$&')}$`)))
+  })
+
   it('keeps weekday labels, and month labels on one row at least three columns apart', async () => {
     const now = new Date()
     getOverview.mockResolvedValue(makePayload(now))
@@ -560,6 +577,18 @@ describe('Overview', () => {
     render(<Overview period="30days" provider="all" />)
 
     expect(await screen.findByText(/Locate the codeburn CLI/i)).toBeInTheDocument()
+  })
+
+  it('shows the Cursor sync line under the hero only for a Cursor filter', async () => {
+    const payload = makePayload(new Date())
+    payload.cursorSync = { enabled: true, state: 'error', lastSuccessAt: null, errorCode: 'login', error: 'Cursor login expired, open Cursor to sign in again' }
+    const { container, rerender } = render(<OverviewContent period="30days" provider="cursor" overview={polled(payload)} />)
+    const line = await screen.findByText('Cursor login expired, open Cursor to sign in again')
+    expect(line).toHaveClass('cursor-sync-line', 'warn')
+    expect(line.closest('.ov-hero-figures')).not.toBeNull()
+
+    rerender(<OverviewContent period="30days" provider="claude" overview={polled(payload)} />)
+    expect(container.querySelector('.cursor-sync-line')).toBeNull()
   })
 
   it('sources Models this period from current.topModels when a provider filter is active', async () => {
@@ -1286,6 +1315,9 @@ describe('Overview refresh tiers', () => {
   })
 
   it('shows the stored savings with its age, never as a live figure', async () => {
+    // Mid-day, so a stamp a few hours back is still today and shows as a bare time.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date(2026, 8, 24, 12, 0, 0))
     const computedAt = new Date(Date.now() - 90 * 60_000)
     getOptimizeSnapshot.mockResolvedValue(snapshot(
       { findingCount: 4, savingsUSD: 31.5, topFindings: [] },
@@ -1346,6 +1378,8 @@ describe('Overview refresh tiers', () => {
 
   it('does not re-ask act or yield on live cadence ticks', async () => {
     vi.useFakeTimers()
+    // Mid-day: a local midnight inside these ten minutes is a real reason to re-ask.
+    vi.setSystemTime(new Date(2026, 8, 24, 12, 0, 0))
     try {
       getOptimizeSnapshot.mockResolvedValue(snapshot({ findingCount: 0, savingsUSD: 0, topFindings: [] }))
       render(<OverviewContent period="30days" provider="all" overview={polled(makePayload(new Date()))} />)
@@ -1390,6 +1424,9 @@ describe('Overview stored-figure honesty', () => {
   })
 
   it('dates the stored findings that sit beside live signals in the Signals card', async () => {
+    // Mid-day, so a stamp a few hours back is still today and shows as a bare time.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date(2026, 8, 24, 12, 0, 0))
     const now = new Date()
     const computedAt = new Date(Date.now() - 3 * 60 * 60_000)
     getOptimizeSnapshot.mockResolvedValue(snapshot(

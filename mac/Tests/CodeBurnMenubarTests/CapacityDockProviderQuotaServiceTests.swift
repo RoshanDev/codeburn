@@ -11,6 +11,14 @@ struct CapacityDockProviderQuotaServiceTests {
         Issue.record("Wrong adapter dispatched")
         return Self.summary()
     }
+    nonisolated private static let unusedCommandCode: @Sendable () async throws -> QuotaSummary = {
+        Issue.record("Wrong adapter dispatched")
+        return Self.summary()
+    }
+    nonisolated private static let unusedDevin: @Sendable () async throws -> QuotaSummary = {
+        Issue.record("Wrong adapter dispatched")
+        return Self.summary()
+    }
     nonisolated private static let unusedGrok: @Sendable () async throws -> QuotaSummary = {
         Issue.record("Wrong adapter dispatched")
         return Self.summary()
@@ -34,10 +42,12 @@ struct CapacityDockProviderQuotaServiceTests {
         let expected = Self.summary(percent: 0.42)
         let service = CapacityDockProviderQuotaService(dependencies: .init(
             refreshClinePass: { apiKey in
-                await capture.record(apiKey)
+                await capture.record(apiKey ?? "")
                 return expected
             },
+            refreshCommandCode: Self.unusedCommandCode,
             refreshCursor: Self.unusedCursor,
+            refreshDevin: Self.unusedDevin,
             refreshGrok: Self.unusedGrok,
             refreshGrokBot: Self.unusedGrokBot,
             refreshZai: Self.unusedZai,
@@ -65,7 +75,9 @@ struct CapacityDockProviderQuotaServiceTests {
                 Issue.record("Wrong adapter dispatched")
                 return Self.summary()
             },
+            refreshCommandCode: Self.unusedCommandCode,
             refreshCursor: Self.unusedCursor,
+            refreshDevin: Self.unusedDevin,
             refreshGrok: Self.unusedGrok,
             refreshGrokBot: Self.unusedGrokBot,
             refreshZai: { apiKey in
@@ -94,7 +106,9 @@ struct CapacityDockProviderQuotaServiceTests {
                 Issue.record("Wrong adapter dispatched")
                 return Self.summary()
             },
+            refreshCommandCode: Self.unusedCommandCode,
             refreshCursor: { expected },
+            refreshDevin: Self.unusedDevin,
             refreshGrok: Self.unusedGrok,
             refreshGrokBot: Self.unusedGrokBot,
             refreshZai: Self.unusedZai,
@@ -118,7 +132,9 @@ struct CapacityDockProviderQuotaServiceTests {
                 Issue.record("Wrong adapter dispatched")
                 return Self.summary()
             },
+            refreshCommandCode: Self.unusedCommandCode,
             refreshCursor: Self.unusedCursor,
+            refreshDevin: Self.unusedDevin,
             refreshGrok: { expected },
             refreshGrokBot: Self.unusedGrokBot,
             refreshZai: Self.unusedZai,
@@ -142,7 +158,9 @@ struct CapacityDockProviderQuotaServiceTests {
                 Issue.record("Wrong adapter dispatched")
                 return Self.summary()
             },
+            refreshCommandCode: Self.unusedCommandCode,
             refreshCursor: Self.unusedCursor,
+            refreshDevin: Self.unusedDevin,
             refreshGrok: Self.unusedGrok,
             refreshGrokBot: { expected },
             refreshZai: Self.unusedZai,
@@ -166,7 +184,9 @@ struct CapacityDockProviderQuotaServiceTests {
                 Issue.record("Wrong adapter dispatched")
                 return Self.summary()
             },
+            refreshCommandCode: Self.unusedCommandCode,
             refreshCursor: Self.unusedCursor,
+            refreshDevin: Self.unusedDevin,
             refreshGrok: Self.unusedGrok,
             refreshGrokBot: Self.unusedGrokBot,
             refreshZai: Self.unusedZai,
@@ -182,14 +202,51 @@ struct CapacityDockProviderQuotaServiceTests {
         #expect(result == expected)
     }
 
-    @Test("ClinePass requires its own saved API key")
-    func requiresClinePassKey() async throws {
+    @Test("Devin dispatches to the local CLI cache and a missing cache is terminal")
+    func dispatchesDevin() async throws {
+        let expected = Self.summary(percent: 0.04)
+        let provider = try #require(CapacityDockProvider(rawValue: "devin"))
+        let cases: [(@Sendable () async throws -> QuotaSummary, CapacityDockProviderFetchFailureDisposition?)] = [
+            ({ expected }, nil),
+            ({ throw DevinSubscriptionService.FetchError.noCache }, .terminal),
+            ({ throw DevinSubscriptionService.FetchError.outOfDate }, .transient),
+            ({ throw DevinSubscriptionService.FetchError.parseFailure }, .transient),
+        ]
+        for (refresh, expectedDisposition) in cases {
+            let service = CapacityDockProviderQuotaService(dependencies: .init(
+                refreshClinePass: { _ in
+                    Issue.record("Wrong adapter dispatched")
+                    return Self.summary()
+                },
+                refreshCommandCode: Self.unusedCommandCode,
+                refreshCursor: Self.unusedCursor,
+                refreshDevin: refresh,
+                refreshGrok: Self.unusedGrok,
+                refreshGrokBot: Self.unusedGrokBot,
+                refreshZai: Self.unusedZai,
+                refreshZcode: Self.unusedZcode
+            ))
+            do {
+                let result = try await service.fetch(provider: provider, credential: CapacityDockProviderCredential())
+                #expect(expectedDisposition == nil)
+                #expect(result == expected)
+            } catch let failure as CapacityDockProviderFetchFailure {
+                #expect(failure.disposition == expectedDisposition)
+            }
+        }
+    }
+
+    @Test("ClinePass without a saved key falls back to the Cline sign-in")
+    func clinePassWithoutSavedKey() async throws {
+        let capture = SecretCapture()
         let service = CapacityDockProviderQuotaService(dependencies: .init(
-            refreshClinePass: { _ in
-                Issue.record("Adapter must not run without a key")
-                return Self.summary()
+            refreshClinePass: { apiKey in
+                await capture.record(apiKey ?? "<none>")
+                throw ClinePassSubscriptionService.FetchError.noCredentials
             },
+            refreshCommandCode: Self.unusedCommandCode,
             refreshCursor: Self.unusedCursor,
+            refreshDevin: Self.unusedDevin,
             refreshGrok: Self.unusedGrok,
             refreshGrokBot: Self.unusedGrokBot,
             refreshZai: Self.unusedZai,
@@ -197,22 +254,80 @@ struct CapacityDockProviderQuotaServiceTests {
         ))
         let provider = try #require(CapacityDockProvider(rawValue: "clinepass"))
 
-        await #expect(throws: CapacityDockProviderFetchFailure.self) {
-            try await service.fetch(
-                provider: provider,
-                credential: CapacityDockProviderCredential(sourceMode: "api", apiKey: "  ")
-            )
-        }
-
         do {
             _ = try await service.fetch(
                 provider: provider,
-                credential: CapacityDockProviderCredential(sourceMode: "api", apiKey: "")
+                credential: CapacityDockProviderCredential(sourceMode: "api", apiKey: "  ")
             )
-            Issue.record("Expected a terminal missing-key failure")
+            Issue.record("Expected a terminal missing-credential failure")
         } catch let failure as CapacityDockProviderFetchFailure {
             #expect(failure.disposition == .terminal)
-            #expect(failure.message == "Enter a ClinePass API key or token, then press Save & Connect.")
+            #expect(failure.message == "Sign in with Cline, or enter a ClinePass API key, then click Retry.")
+        }
+        #expect(await capture.values == ["<none>"])
+    }
+
+    @Test("An expired Cline sign-in is retried with its guidance; a rejected key is terminal")
+    func clinePassExpiredSignInIsTransient() async throws {
+        let provider = try #require(CapacityDockProvider(rawValue: "clinepass"))
+        let cases: [(ClinePassSubscriptionService.FetchError, CapacityDockProviderFetchFailureDisposition)] = [
+            (.signInExpired(age: "3h ago"), .transient),
+            (.authenticationRejected, .terminal),
+            (.noCredentials, .terminal),
+        ]
+        for (error, expectedDisposition) in cases {
+            let service = CapacityDockProviderQuotaService(dependencies: .init(
+                refreshClinePass: { _ in throw error },
+                refreshCommandCode: Self.unusedCommandCode,
+                refreshCursor: Self.unusedCursor,
+                refreshDevin: Self.unusedDevin,
+                refreshGrok: Self.unusedGrok,
+                refreshGrokBot: Self.unusedGrokBot,
+                refreshZai: Self.unusedZai,
+                refreshZcode: Self.unusedZcode
+            ))
+            do {
+                _ = try await service.fetch(provider: provider, credential: CapacityDockProviderCredential())
+                Issue.record("Expected \(error) to fail")
+            } catch let failure as CapacityDockProviderFetchFailure {
+                #expect(failure.disposition == expectedDisposition)
+                #expect(failure.message == error.localizedDescription)
+            }
+        }
+    }
+
+    @Test("Command Code dispatches to the CLI key and an expired session is terminal")
+    func dispatchesCommandCode() async throws {
+        let expected = Self.summary(percent: 0.5)
+        let provider = try #require(CapacityDockProvider(rawValue: "commandcode"))
+        let cases: [(@Sendable () async throws -> QuotaSummary, CapacityDockProviderFetchFailureDisposition?)] = [
+            ({ expected }, nil),
+            ({ throw CommandCodeSubscriptionService.FetchError.noCredentials }, .terminal),
+            ({ throw CommandCodeSubscriptionService.FetchError.authenticationRejected }, .terminal),
+            ({ throw CommandCodeSubscriptionService.FetchError.network }, .transient),
+            ({ throw CommandCodeSubscriptionService.FetchError.parseFailure }, .transient),
+        ]
+        for (refresh, expectedDisposition) in cases {
+            let service = CapacityDockProviderQuotaService(dependencies: .init(
+                refreshClinePass: { _ in
+                    Issue.record("Wrong adapter dispatched")
+                    return Self.summary()
+                },
+                refreshCommandCode: refresh,
+                refreshCursor: Self.unusedCursor,
+                refreshDevin: Self.unusedDevin,
+                refreshGrok: Self.unusedGrok,
+                refreshGrokBot: Self.unusedGrokBot,
+                refreshZai: Self.unusedZai,
+                refreshZcode: Self.unusedZcode
+            ))
+            do {
+                let result = try await service.fetch(provider: provider, credential: CapacityDockProviderCredential())
+                #expect(expectedDisposition == nil)
+                #expect(result == expected)
+            } catch let failure as CapacityDockProviderFetchFailure {
+                #expect(failure.disposition == expectedDisposition)
+            }
         }
     }
 
@@ -223,7 +338,9 @@ struct CapacityDockProviderQuotaServiceTests {
                 Issue.record("Wrong adapter dispatched")
                 return Self.summary()
             },
+            refreshCommandCode: Self.unusedCommandCode,
             refreshCursor: Self.unusedCursor,
+            refreshDevin: Self.unusedDevin,
             refreshGrok: Self.unusedGrok,
             refreshGrokBot: Self.unusedGrokBot,
             refreshZai: Self.unusedZai,
@@ -248,7 +365,9 @@ struct CapacityDockProviderQuotaServiceTests {
     func classifiesAuthenticationFailure() async throws {
         let service = CapacityDockProviderQuotaService(dependencies: .init(
             refreshClinePass: { _ in throw ClinePassSubscriptionService.FetchError.authenticationRejected },
+            refreshCommandCode: Self.unusedCommandCode,
             refreshCursor: Self.unusedCursor,
+            refreshDevin: Self.unusedDevin,
             refreshGrok: Self.unusedGrok,
             refreshGrokBot: Self.unusedGrokBot,
             refreshZai: Self.unusedZai,
@@ -276,7 +395,9 @@ struct CapacityDockProviderQuotaServiceTests {
         for error in errors {
             let service = CapacityDockProviderQuotaService(dependencies: .init(
                 refreshClinePass: { _ in throw error },
+                refreshCommandCode: Self.unusedCommandCode,
                 refreshCursor: Self.unusedCursor,
+                refreshDevin: Self.unusedDevin,
                 refreshGrok: Self.unusedGrok,
                 refreshGrokBot: Self.unusedGrokBot,
                 refreshZai: Self.unusedZai,
@@ -315,7 +436,9 @@ struct CapacityDockProviderQuotaServiceTests {
                     Issue.record("Wrong adapter dispatched")
                     return Self.summary()
                 },
+                refreshCommandCode: Self.unusedCommandCode,
                 refreshCursor: Self.unusedCursor,
+                refreshDevin: Self.unusedDevin,
                 refreshGrok: { throw error },
                 refreshGrokBot: Self.unusedGrokBot,
                 refreshZai: Self.unusedZai,
@@ -351,7 +474,9 @@ struct CapacityDockProviderQuotaServiceTests {
                     Issue.record("Wrong adapter dispatched")
                     return Self.summary()
                 },
+                refreshCommandCode: Self.unusedCommandCode,
                 refreshCursor: Self.unusedCursor,
+                refreshDevin: Self.unusedDevin,
                 refreshGrok: Self.unusedGrok,
                 refreshGrokBot: Self.unusedGrokBot,
                 refreshZai: Self.unusedZai,
@@ -370,11 +495,59 @@ struct CapacityDockProviderQuotaServiceTests {
         }
     }
 
+    @Test("an expired Cline login sets a status title, keeps the last quota, and a success clears it")
+    func clineExpiredStatusTitle() async throws {
+        let provider = try #require(CapacityDockProvider(rawValue: "clinepass"))
+        let expired = ExpiryToggle()
+        let store = AppStore()
+        store.capacityDockCredentialLoader = { _ in CapacityDockProviderCredential() }
+        store.capacityDockProviderQuotaService = CapacityDockProviderQuotaService(dependencies: .init(
+            refreshClinePass: { _ in
+                if expired.isOn { throw ClinePassSubscriptionService.FetchError.signInExpired(age: "3h ago") }
+                return Self.summary(percent: 0.3)
+            },
+            refreshCommandCode: Self.unusedCommandCode,
+            refreshCursor: Self.unusedCursor,
+            refreshDevin: Self.unusedDevin,
+            refreshGrok: Self.unusedGrok,
+            refreshGrokBot: Self.unusedGrokBot,
+            refreshZai: Self.unusedZai,
+            refreshZcode: Self.unusedZcode
+        ))
+
+        expired.isOn = true
+        await store.refreshCapacityDockProvider(provider)
+        #expect(store.capacityDockProviderStatusTitles[provider.id] == "Cline login expired")
+        #expect(store.capacityDockQuotaSummary(for: provider)?.connection == .transientFailure)
+        #expect(store.capacityDockProviderErrors[provider.id]
+            == "Cline login expired 3h ago. Send a message in Cline or run `cline auth cline`, then press Retry.")
+
+        expired.isOn = false
+        await store.refreshCapacityDockProvider(provider)
+        #expect(store.capacityDockProviderStatusTitles[provider.id] == nil)
+
+        expired.isOn = true
+        await store.refreshCapacityDockProvider(provider)
+        #expect(store.capacityDockProviderStatusTitles[provider.id] == "Cline login expired")
+        let kept = store.capacityDockQuotaSummary(for: provider)
+        #expect(kept?.connection == .stale)
+        #expect(kept?.primary?.percent == 0.3)
+        #expect(store.capacityDockProviderErrors[provider.id]
+            == "Cline login expired 3h ago. Send a message in Cline or run `cline auth cline`; CodeBurn picks up the new login on its next refresh.")
+    }
+
+    private final class ExpiryToggle: @unchecked Sendable {
+        var isOn = false
+    }
+
     @Test("disconnect invalidates an in-flight provider refresh")
     func disconnectWinsOverInFlightRefresh() async throws {
         let provider = try #require(CapacityDockProvider(rawValue: "clinepass"))
         let gate = AdapterGate()
         let store = AppStore()
+        let (defaults, suiteName) = TestDefaults.make("CodeBurnMenubarTests.DockQuota.\(#function)")
+        defer { TestDefaults.forget(suiteName) }
+        store.capacityDockDefaults = defaults
         store.capacityDockCredentialLoader = { _ in
             CapacityDockProviderCredential(sourceMode: "api", apiKey: "synthetic")
         }
@@ -385,7 +558,9 @@ struct CapacityDockProviderQuotaServiceTests {
                 await gate.pause()
                 return Self.summary(percent: 0.73)
             },
+            refreshCommandCode: Self.unusedCommandCode,
             refreshCursor: Self.unusedCursor,
+            refreshDevin: Self.unusedDevin,
             refreshGrok: Self.unusedGrok,
             refreshGrokBot: Self.unusedGrokBot,
             refreshZai: Self.unusedZai,
@@ -400,6 +575,101 @@ struct CapacityDockProviderQuotaServiceTests {
 
         #expect(store.capacityDockProviderSummaries[provider.id] == nil)
         #expect(!store.capacityDockProvidersLoading.contains(provider.id))
+    }
+
+    @Test("a quiet probe connects a signed-in provider, leaves a signed-out one untouched, and records other failures")
+    func quietProbe() async throws {
+        let provider = try #require(CapacityDockProvider(rawValue: "cursor"))
+        let (defaults, suiteName) = TestDefaults.make("CodeBurnMenubarTests.DockQuota.\(#function)")
+        defer { TestDefaults.forget(suiteName) }
+        func store(_ refreshCursor: @escaping @Sendable () async throws -> QuotaSummary) -> AppStore {
+            let store = AppStore()
+            store.capacityDockDefaults = defaults
+            store.capacityDockCredentialLoader = { _ in CapacityDockProviderCredential() }
+            store.capacityDockProviderQuotaService = CapacityDockProviderQuotaService(dependencies: .init(
+                refreshClinePass: { _ in throw CancellationError() },
+                refreshCommandCode: Self.unusedCommandCode,
+                refreshCursor: refreshCursor,
+                refreshDevin: Self.unusedDevin,
+                refreshGrok: Self.unusedGrok,
+                refreshGrokBot: Self.unusedGrokBot,
+                refreshZai: Self.unusedZai,
+                refreshZcode: Self.unusedZcode
+            ))
+            return store
+        }
+
+        let signedIn = store { Self.summary(percent: 0.4) }
+        await signedIn.refreshCapacityDockProvider(provider, quiet: true)
+        #expect(signedIn.capacityDockQuotaSummary(for: provider)?.connection == .connected)
+
+        let signedOut = store { throw CursorSubscriptionService.FetchError.noCredentials }
+        await signedOut.refreshCapacityDockProvider(provider, quiet: true)
+        #expect(signedOut.capacityDockQuotaSummary(for: provider) == nil)
+        #expect(signedOut.capacityDockProviderErrors[provider.id] == nil)
+        #expect(!signedOut.capacityDockProvidersLoading.contains(provider.id))
+
+        let failing = store { throw CursorSubscriptionService.FetchError.network }
+        await failing.refreshCapacityDockProvider(provider, quiet: true)
+        #expect(failing.capacityDockProviderErrors[provider.id] != nil)
+        #expect(failing.capacityDockProviderTransientFailures.contains(provider.id))
+    }
+
+    @Test("clearing an override keeps the pane probe; Disconnect stops it until Connect")
+    func explicitDisconnectBlocksQuietProbe() async throws {
+        let provider = try #require(CapacityDockProvider(rawValue: "cursor"))
+        let (defaults, suiteName) = TestDefaults.make("CodeBurnMenubarTests.DockQuota.\(#function)")
+        defer { TestDefaults.forget(suiteName) }
+        let fetches = FetchCounter()
+        let store = AppStore()
+        store.capacityDockDefaults = defaults
+        store.capacityDockCredentialLoader = { _ in CapacityDockProviderCredential() }
+        store.capacityDockCredentialRemover = { _ in }
+        store.capacityDockProviderDeselector = { _ in }
+        store.capacityDockProviderQuotaService = CapacityDockProviderQuotaService(dependencies: .init(
+            refreshClinePass: { _ in throw CancellationError() },
+            refreshCommandCode: Self.unusedCommandCode,
+            refreshCursor: {
+                fetches.increment()
+                return Self.summary(percent: 0.4)
+            },
+            refreshDevin: Self.unusedDevin,
+            refreshGrok: Self.unusedGrok,
+            refreshGrokBot: Self.unusedGrokBot,
+            refreshZai: Self.unusedZai,
+            refreshZcode: Self.unusedZcode
+        ))
+
+        await store.refreshCapacityDockProvider(provider, quiet: true)
+        #expect(store.capacityDockProviderIsConnected(provider))
+
+        try await store.disconnectCapacityDockProvider(provider)
+        #expect(!ProviderExplicitDisconnect.isSet(provider.id, defaults: defaults))
+        await store.refreshCapacityDockProvider(provider, quiet: true)
+        #expect(fetches.count == 2)
+        #expect(store.capacityDockProviderIsConnected(provider))
+
+        try await store.disconnectCapacityDockProvider(provider, explicit: true)
+        #expect(ProviderExplicitDisconnect.isSet(provider.id, defaults: defaults))
+        await store.refreshCapacityDockProvider(provider, quiet: true)
+        #expect(fetches.count == 2)
+        #expect(store.capacityDockQuotaSummary(for: provider) == nil)
+
+        CapacityDockPreferences.autoSeedFromConnected([.claude, provider], defaults: defaults)
+        #expect(!CapacityDockPreferences.load(defaults: defaults).selectedProviders.contains(provider))
+
+        await store.connectCapacityDockProvider(provider)
+        #expect(fetches.count == 3)
+        #expect(store.capacityDockProviderIsConnected(provider))
+        await store.refreshCapacityDockProvider(provider, quiet: true)
+        #expect(fetches.count == 4)
+    }
+
+    private final class FetchCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+        var count: Int { lock.withLock { value } }
+        func increment() { lock.withLock { value += 1 } }
     }
 
     @Test("failed credential deletion preserves connection state and surfaces the error")
@@ -425,6 +695,9 @@ struct CapacityDockProviderQuotaServiceTests {
     func disconnectDeselectsFromDock() async throws {
         let provider = try #require(CapacityDockProvider(rawValue: "cursor"))
         let store = AppStore()
+        let (defaults, suiteName) = TestDefaults.make("CodeBurnMenubarTests.DockQuota.\(#function)")
+        defer { TestDefaults.forget(suiteName) }
+        store.capacityDockDefaults = defaults
         store.capacityDockCredentialRemover = { _ in }
         var deselected: [CapacityDockProvider] = []
         store.capacityDockProviderDeselector = { deselected.append($0) }
@@ -436,8 +709,7 @@ struct CapacityDockProviderQuotaServiceTests {
 
     @Test("removeProvider drops only the target and keeps manual selection unlatched")
     func removeProviderPersistence() throws {
-        let suiteName = "CodeBurnMenubarTests.CapacityDockRemove.\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let (defaults, suiteName) = TestDefaults.make("CodeBurnMenubarTests.CapacityDockRemove")
         defer { TestDefaults.forget(suiteName) }
         let cursor = try #require(CapacityDockProvider(rawValue: "cursor"))
         defaults.set(["codex", "cursor"], forKey: CapacityDockPreferences.selectedProvidersKey)

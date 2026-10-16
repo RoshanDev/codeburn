@@ -1,4 +1,5 @@
 import { localeTag, t } from '../i18n'
+import type { MenubarPayload } from './types'
 
 export type ActiveCurrency = { code: string; symbol: string; rate: number }
 
@@ -16,11 +17,35 @@ export function formatUsd(n: number): string {
   return formatUsdWithCurrency(n, activeCurrency)
 }
 
+/** Same rule as the CLI (src/format.ts isEstimatedCost): a row is marked `~`
+ *  once its estimated portion is at least 1% of its cost, unless the amount
+ *  reads as zero in the active currency. */
+export function isEstimatedCost(cost: number, estimatedCost: number | undefined): boolean {
+  const estimated = estimatedCost ?? 0
+  return estimated > 0 && estimated >= cost * 0.01 && /[1-9]/.test(formatUsd(cost))
+}
+
+/** The estimated share of a payload's total: the provider split carries it on
+ *  current CLIs; the model split is the fallback for a CLI that predates that. */
+export function estimatedPortion(current: MenubarPayload['current']): number {
+  const providers = current.providerDetails?.filter(row => !row.excludedFromTotal)
+  if (providers?.some(row => row.estimatedCostUSD !== undefined)) {
+    return providers.reduce((sum, row) => sum + (row.estimatedCostUSD ?? 0), 0)
+  }
+  return (current.topModels ?? []).reduce((sum, row) => sum + (row.estimatedCostUSD ?? 0), 0)
+}
+
 /** Raw-USD input formatted against an explicit payload currency. This keeps a
  * persisted exact snapshot correct on its very first paint, before App's
  * global active-currency effect has had a chance to run. */
 export function formatUsdWithCurrency(n: number, currency: ActiveCurrency): string {
   return `${currency.symbol}${(n * currency.rate).toLocaleString(localeTag(), { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+}
+
+/** a − b as displayed: the difference of the two rounded figures, so shown numbers add up. */
+export function formatUsdDifference(a: number, b: number): string {
+  const shown = (n: number) => Number((n * activeCurrency.rate).toFixed(2))
+  return formatConverted(shown(a) - shown(b))
 }
 
 /**
@@ -115,4 +140,19 @@ export function asOfLabel(at: number | string | null | undefined): string | null
   return sameDay
     ? t('common.asOf', { time })
     : t('common.asOfDate', { date: when.toLocaleDateString(localeTag(), { month: 'short', day: 'numeric' }), time })
+}
+
+/** Time left until a quota window resets, or null when it is unknown. */
+export function formatResetTime(resetsAt: string | null): string | null {
+  if (!resetsAt) return null
+  const reset = Date.parse(resetsAt)
+  if (!Number.isFinite(reset)) return null
+  const remainingMinutes = Math.floor((reset - Date.now()) / 60_000)
+  if (remainingMinutes <= 0) return t('plans.reset.now')
+  const days = Math.floor(remainingMinutes / (24 * 60))
+  const hours = Math.floor((remainingMinutes % (24 * 60)) / 60)
+  const minutes = remainingMinutes % 60
+  if (days > 0) return hours > 0 ? t('plans.reset.daysHours', { days, hours }) : t('plans.reset.days', { days })
+  if (hours > 0) return minutes > 0 ? t('plans.reset.hoursMinutes', { hours, minutes }) : t('plans.reset.hours', { hours })
+  return t('plans.reset.minutes', { minutes })
 }

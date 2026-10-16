@@ -3,6 +3,7 @@ import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { formatDayLong } from '../lib/format'
 import { EMPTY_FILTERS } from '../lib/investigation'
 import type { SessionDrillRow, SessionRow } from '../lib/types'
 import { INITIAL_VISIBLE, sessionRowKey, Sessions } from './Sessions'
@@ -242,7 +243,9 @@ describe('Sessions', () => {
     const drawer = screen.getByRole('dialog', { name: /session details/i })
     expect(drawer).toBeInTheDocument()
     expect(within(drawer).getByText(/claude · projects\/codeburn/)).toBeInTheDocument()
-    expect(within(drawer).getByText(/Jul 11, 2026 → Jul 11, 2026 · 1h 35m/)).toBeInTheDocument()
+    // Local dates: 10:00Z is already Jul 12 at UTC+14.
+    const span = `${formatDayLong('2026-07-11T10:00:00.000Z')} → ${formatDayLong('2026-07-11T11:35:00.000Z')} · 1h 35m`
+    expect(within(drawer).getByText(new RegExp(span))).toBeInTheDocument()
     expect(container.querySelectorAll('.session-row')).toHaveLength(6)
     expect(container.querySelector('.drawer-lead')).toHaveTextContent('This session cost $8.41, about 2.8x your usual.')
     for (const label of ['Cost', 'Turns', 'Duration']) {
@@ -281,6 +284,45 @@ describe('Sessions', () => {
     expect(fold).toHaveAttribute('open')
     for (const label of ['Input', 'Output', 'Cache read', 'Cache write']) {
       expect(within(fold as HTMLElement).getByText(label)).toBeInTheDocument()
+    }
+  })
+
+  it('lists folded subagents on the parent row and breaks them down in the drawer', async () => {
+    const user = userEvent.setup()
+    const parent = {
+      ...rows[0]!,
+      subagents: [
+        session({ sessionId: 'agent-small', project: rows[0]!.project, provider: 'claude', cost: 0.4 }),
+        session({ sessionId: 'agent-big', project: rows[0]!.project, provider: 'claude', cost: 2.1 }),
+      ],
+    }
+    getSessions.mockResolvedValue([parent, ...rows.slice(1)])
+    const { container } = render(<Sessions period="30days" provider="all" openSessionId={sessionRowKey(parent)} />)
+    const drawer = await screen.findByRole('dialog', { name: /session details/i })
+
+    expect([...container.querySelectorAll('.session-row .session-project')].map(node => node.textContent)).toContain('claude-session-123 · 2 subagents')
+    const fold = [...drawer.querySelectorAll('details')].find(node => node.textContent?.includes('2 subagents, $2.50'))!
+    expect(fold).toBeDefined()
+    const labels = [...fold.querySelectorAll('.drawer-breakdown-label')].map(node => node.textContent)
+    expect(labels).toEqual(['agent-big', 'agent-small'])
+  })
+
+  it('finds a parent by its subagent, opens the parent for a subagent key, and counts subagents apart', async () => {
+    const user = userEvent.setup()
+    const child = session({ sessionId: 'agent-needle', title: 'Fix flaky login', project: 'elsewhere', provider: 'claude', cost: 0.4 })
+    const parent = { ...rows[0]!, subagents: [child] }
+    getSessions.mockResolvedValue([parent, ...rows.slice(1)])
+    const { container } = render(<Sessions period="30days" provider="all" openSessionId={sessionRowKey(child)} />)
+    const drawer = await screen.findByRole('dialog', { name: /session details/i })
+
+    expect(within(drawer).getAllByText(/claude-session-123/).length).toBeGreaterThan(0)
+    expect(container.querySelector('.sessions-summary')?.textContent).toMatch(/^6 sessions \+ 1 subagent · /)
+    expect(screen.getByText(`Showing 6 of 6 top-level sessions`)).toBeInTheDocument()
+
+    for (const query of ['agent-needle', 'flaky login']) {
+      await user.clear(screen.getByLabelText('Search sessions'))
+      await user.type(screen.getByLabelText('Search sessions'), query)
+      expect([...container.querySelectorAll('.session-row .session-project')].map(node => node.textContent)).toEqual(['claude-session-123 · 1 subagent'])
     }
   })
 

@@ -84,8 +84,8 @@ links, PR correlation, the Codex result cache) stays on the main thread. A file
 whose keys were already claimed by an earlier file, or whose worker failed, is
 re-parsed in-process — so the output is identical to the serial path either way.
 That overlap check is what makes a forked Codex rollout safe: it replays its
-parent's token_count history under the parent's key namespace, collides, and is
-re-parsed against the real dedup set.
+parent's `token_count` and `token_usage_record` history under the parent's key
+namespace, collides, and is re-parsed against the real dedup set.
 
 A Codex worker never touches `src/codex-cache.ts`: it returns the cache entry it
 would have written and the parent writes it, in install order, so
@@ -137,7 +137,7 @@ Three caches under `~/.cache/codeburn/` (override with `CODEBURN_CACHE_DIR`):
 | File | Owner | Invalidation |
 |---|---|---|
 | `codex-results.v<n>.json` | `src/codex-cache.ts` | `mtimeMs + sizeBytes` per Codex `.jsonl`. Unsuffixed `codex-results.json` is adopted when versions match and never overwritten. |
-| `cursor-results.v<n>.json` | `src/cursor-cache.ts` | `mtimeMs + sizeBytes` of the Cursor SQLite db. Unsuffixed `cursor-results.json` is adopted when versions match and never overwritten. |
+| `cursor-results.v<n>.json` | `src/cursor-cache.ts` | Resolved database path plus combined modification time and size of the Cursor SQLite db and its WAL, when present. Unsuffixed `cursor-results.json` is adopted when versions match and never overwritten. |
 | `daily-cache.json` | `src/daily-cache.ts` | Tracks `lastComputedDate`; new days are backfilled, old days are reused. |
 
 All three use atomic write (temp file + `rename`) and write with mode `0o600`. All three carry a numeric `version` field; bumping it forces a recompute next run.
@@ -193,7 +193,7 @@ type Provider = {
 
 `src/providers/index.ts` registers providers across two tiers:
 
-- **Eager**: `claude`, `cline`, `cline-cli`, `codewhale`, `codebuff`, `codex`, `copilot`, `devin`, `droid`, `dsh`, `gemini`, `hermes`, `ibm-bob`, `kilo-code`, `kiro`, `kimi`, `kimicode`, `lingtai-tui`, `mistral-vibe`, `mux`, `openclaw`, `openclaude`, `open-design`, `pi`, `omp`, `qwen`, `quickdesk`, `roo-code`, `zerostack`, `grok`. Imported at module load.
+- **Eager**: `claude`, `cline`, `cline-cli`, `codewhale`, `codebuff`, `codex`, `copilot`, `devin`, `droid`, `dsh`, `gemini`, `hermes`, `ibm-bob`, `kilo-code`, `kiro`, `kimi`, `kimicode`, `lingtai-tui`, `mistral-vibe`, `mux`, `openclaw`, `openclaude`, `open-design`, `pi`, `omp`, `qwen`, `quickdesk`, `zerostack`, `grok`, `grokbot`, `amp`, `command-code`. Imported at module load.
 - **Lazy**: `antigravity`, `forge`, `goose`, `cursor`, `opencode`, `cursor-agent`, `crush`, `warp`, `vercel-gateway`, `zcode`, `zed`. Imported via dynamic `import()` so the heavy dependencies (SQLite, protobuf, network clients) do not touch users who do not have those tools installed.
 
 Both lists hit the same `getAllProviders()` aggregator. A failed lazy import is silent and excludes that provider from the run.
@@ -212,7 +212,7 @@ Two knock-on rules:
 
 Session `cwd` values recorded inside WSL are Linux paths (`/home/me/proj`) that name nothing on the Windows filesystem. `resolveCanonicalProjectPath` (`src/parser.ts`) already refuses to walk a path that is not absolute *on the current platform*, so those are attributed to the recorded `cwd` verbatim instead of being walked or canonicalized.
 
-`src/providers/vscode-cline-parser.ts` is a shared helper consumed by `cline`, `ibm-bob`, `kilo-code`, and `roo-code`. It is not registered as a provider on its own.
+`src/providers/vscode-cline-parser.ts` is a shared helper consumed by `cline`, `ibm-bob`, and `kilo-code`. It is not registered as a provider on its own.
 
 For the per-provider data location, storage format, parser quirks, and test coverage, see `docs/providers/`.
 
@@ -223,7 +223,7 @@ Every report keys a model row on `modelRowKey(model, route)`, never on the raw i
 A **route** is the door, and it has two sources feeding one `route` field on the call (`ParsedProviderCall` → `ParsedApiCall` → `CachedCall`):
 
 - the model id, when the door renames the model. `getModelRoute(id)` recognises Bedrock's `<vendor>.<model>[-vN:M]` with an optional cross-region profile prefix (`us.`, `eu.`, `global.`, …) for the vendors with coding sessions on disk (`anthropic`, `openai`). The profile is a dearer SKU and stays a distinct row (the `(Bedrock us)` variant).
-- the provider's own endpoint field, when it does not. `routeFromProviderField(value)` maps Hermes' `billing_provider` and OpenCode's `providerID`: `bedrock`, exact `amazon-bedrock`, and exact `openrouter` become registered routes; direct doors (`anthropic`, `openai`, …) map to nothing, because the unsuffixed row *is* the direct row. Only doors with usage-bearing sessions on disk are registered, the same rule the id shapes follow.
+- the provider's own endpoint field, when it does not. `routeFromProviderField(value)` maps Hermes' `billing_provider` and OpenCode's `providerID`: `bedrock`, exact `amazon-bedrock`, exact `openrouter`, and exact `google-vertex` / `google-vertex-anthropic` become registered routes; direct doors (`anthropic`, `openai`, …) map to nothing, because the unsuffixed row *is* the direct row. Only doors with usage-bearing sessions on disk are registered, the same rule the id shapes follow.
 
 A call can also carry an optional **billing mode**: `metered` for a provider-recorded actual charge or a registered metered route, and `subscription` only when the provider records that the usage was included. Absence stays unknown; neither provider name, model name, calculated cost, nor plan ownership fills it. `models`, `sessions`, `export`, and `audit` expose call-level `--route` and `--billing` filters. `--route direct` is the complement of registered routes and therefore includes unknown doors. Filtered work-unit grouping is rejected rather than inferring a missing root; durable `today`/`status` and payload filtering wait for a cache schema that preserves this dimension.
 

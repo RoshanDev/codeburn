@@ -8,7 +8,7 @@ export type SessionSource = {
   sourceId?: string
   sourceLabel?: string
   sourcePath?: string
-  sourceKind?: 'claude-config' | 'claude-desktop'
+  sourceKind?: 'claude-config' | 'claude-desktop' | 'claude-desktop-ledger'
   // OMP stores each crewmate transcript under its parent-session directory.
   // These fields retain that per-agent identity through the shared cache path.
   agentName?: string
@@ -49,6 +49,11 @@ export type ParsedProviderCall = {
   // update still reaches it. Orthogonal to `costIsEstimated`: a credit rate is
   // an estimate of dollars, but it is still billing-derived.
   costFromBilling?: boolean
+  // A cost the tool recorded for this call, used only while CodeBurn prices
+  // the call's tokens at $0 (an id the catalog does not know). Kept on the
+  // cached call so the fallback survives the cache, while a later catalog row
+  // or price override for the id still wins.
+  fallbackCostUSD?: number
   tools: string[]
   bashCommands: string[]
   // Subagent types spawned in this call (e.g. 'general-purpose'). Feeds the
@@ -58,7 +63,7 @@ export type ParsedProviderCall = {
   // breakdown; optional since most providers don't expose it.
   skills?: string[]
   timestamp: string
-  speed: 'standard' | 'fast'
+  speed: 'standard' | 'fast' | 'flex'
   deduplicationKey: string
   // Lines added/removed by this call's edits, counted from the provider's diff
   // records (Codex: `patch_apply_end.changes[*].unified_diff`). Numbers only;

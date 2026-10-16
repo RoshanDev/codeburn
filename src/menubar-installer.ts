@@ -1,11 +1,10 @@
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { createWriteStream, constants as fsConstants } from 'node:fs'
+import { once } from 'node:events'
+import { constants as fsConstants } from 'node:fs'
 import { access, chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir, platform, tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
-import { pipeline } from 'node:stream/promises'
-import { Readable } from 'node:stream'
 import { ProxyAgent, fetch as undiciFetch } from 'undici'
 
 import { getCodeburnCacheDir } from './cache-dir.js'
@@ -17,7 +16,22 @@ import {
 /// Public GitHub repo that hosts macOS release builds. Normal installs use direct
 /// versioned release asset URLs; the API scan is only a fallback for missing assets.
 const RELEASE_API = 'https://api.github.com/repos/getagentseal/codeburn/releases?per_page=20'
-const RELEASE_DOWNLOAD_BASE = 'https://github.com/getagentseal/codeburn/releases/download'
+const DEFAULT_RELEASE_DOWNLOAD_BASE = 'https://github.com/getagentseal/codeburn/releases/download'
+/// `CODEBURN_RELEASE_BASE` points installs and update checks at a local feed server for the
+/// update end-to-end test. Only loopback http or another GitHub releases/download base is taken;
+/// every signature pin still applies, so an override can only offer builds we signed.
+export function resolveReleaseBase(value: string | undefined): string {
+  const loopback = /^http:\/\/127\.0\.0\.1:(\d{1,5})$/.exec(value ?? '')
+  if (loopback && Number(loopback[1]) > 0 && Number(loopback[1]) < 65536) return value!
+  if (/^https:\/\/github\.com\/[\w-]+\/[\w.-]+\/releases\/download$/.test(value ?? '')) return value!
+  return DEFAULT_RELEASE_DOWNLOAD_BASE
+}
+export const RELEASE_DOWNLOAD_BASE = resolveReleaseBase(process.env['CODEBURN_RELEASE_BASE'])
+/// Written by release-menubar.yml to the rolling `update-feeds` prerelease after a mac-v*
+/// release's assets are verified, so "latest" never depends on which release line GitHub calls Latest.
+export const MAC_FEED_URL = `${RELEASE_DOWNLOAD_BASE}/update-feeds/menubar-latest.json`
+/// Only builds signed by AgentSeal's Developer ID team install; an ad-hoc or foreign signature is refused.
+export const MAC_TEAM_REQUIREMENT = 'anchor apple generic and certificate leaf[subject.OU] = "XRVP7P7F9M"'
 const APP_BUNDLE_NAME = 'CodeBurnMenubar.app'
 const EXPECTED_BUNDLE_ID = 'org.agentseal.codeburn-menubar'
 const VERSIONED_ASSET_PATTERN = /^CodeBurnMenubar-v.+\.zip$/
@@ -147,7 +161,7 @@ function matchesNoProxy(hostname: string, noProxy?: string): boolean {
   })
 }
 
-function fetchWithProxy(url: string, options: FetchOptions = {}) {
+export function fetchWithProxy(url: string, options: FetchOptions = {}) {
   const proxyUrl = resolveProxyUrlForUrl(url)
   const dispatcher = proxyUrl ? new ProxyAgent(proxyUrl) : undefined
   return undiciFetch(url, dispatcher ? { ...options, dispatcher } : options)
@@ -195,6 +209,13 @@ export function resolveVersionedMenubarReleaseAssets(cliVersion: string, spec: R
     zip,
     checksum,
   }
+}
+
+/// The fallbacks can only name what is published, which trails the CLI during a release, so
+/// taking it unconditionally would replace a newer installed copy with an older one.
+export function isFallbackUpgrade(assets: ResolvedAssets, installedVersion: string | null, spec: ReleaseSpec = MAC_RELEASE): boolean {
+  if (!installedVersion) return true
+  return compareMenubarVersions(assets.release.tag_name.slice(spec.tagPrefix.length), installedVersion) > 0
 }
 
 export function shouldFallbackToReleaseApi(status: number): boolean {
@@ -473,6 +494,24 @@ async function fetchLatestReleaseAssets(spec: ReleaseSpec = MAC_RELEASE, fetchIm
   return resolveLatestMenubarReleaseAssets(body, spec)
 }
 
+/// The feed only names a version; assets still come from that mac-v* release, so the .sha256 and
+/// the team pin gate the download exactly as for a versioned install. A missing, unreadable, or
+/// inconsistent feed falls back to the release-API scan.
+export async function fetchLatestMacReleaseAssets(fetchImpl: ReleaseApiFetch = fetchWithProxy): Promise<ResolvedAssets> {
+  try {
+    const response = await fetchImpl(MAC_FEED_URL, { headers: { 'User-Agent': 'codeburn-menubar-installer' } })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const feed = await response.json() as { version?: unknown; url?: unknown }
+    if (typeof feed.version !== 'string') throw new Error('no version')
+    const assets = resolveVersionedMenubarReleaseAssets(feed.version)
+    if (feed.url !== assets.zip.browser_download_url) throw new Error(`url ${String(feed.url)} does not match ${assets.zip.browser_download_url}`)
+    return assets
+  } catch (err) {
+    console.log(`Update feed unavailable (${err instanceof Error ? err.message : String(err)}). Scanning releases instead...`)
+    return fetchLatestReleaseAssets(MAC_RELEASE, fetchImpl)
+  }
+}
+
 /// 5xx means "GitHub/the CDN is unhappy right now" and is worth another attempt. 4xx is not:
 /// 404/410 must keep falling through to the release-API path untouched, and a 403/429 rate limit
 /// cannot clear inside a 1.5s backoff window, and hammering it would only spend more of the budget,
@@ -622,10 +661,10 @@ export async function downloadToFile(
     // A 2xx with no body is the most retryable response there is; throw so the retry picks it up
     // rather than writing a zero-byte file that verifyChecksum would later reject as a mismatch.
     if (response.body === null) throw new Error('response had no body')
-    // fetch's ReadableStream needs to be wrapped for Node streams.
-    const nodeStream = Readable.fromWeb(response.body as never)
+    // Read whole, not piped: Electron's Node 24 undici asserts and kills the process when a
+    // server closes the socket while a paused body waits on the file write.
     try {
-      await pipeline(nodeStream, createWriteStream(destPath))
+      await writeFile(destPath, Buffer.from(await new Response(response.body as BodyInit).arrayBuffer()))
     } catch (err) {
       // A mid-stream drop leaves a truncated file. Remove it before re-throwing so the retry
       // starts clean and a genuine failure never leaves a partial artifact behind.
@@ -689,6 +728,14 @@ async function captureCommand(command: string, args: string[]): Promise<string> 
   })
 }
 
+export async function readBundleVersion(appPath: string): Promise<string | null> {
+  return captureCommand('/usr/libexec/PlistBuddy', [
+    '-c',
+    'Print :CFBundleShortVersionString',
+    join(appPath, 'Contents', 'Info.plist'),
+  ]).catch(() => null)
+}
+
 async function verifyBundleIdentity(appPath: string): Promise<void> {
   const bundleID = await captureCommand('/usr/libexec/PlistBuddy', [
     '-c',
@@ -701,8 +748,24 @@ async function verifyBundleIdentity(appPath: string): Promise<void> {
   await verifyBundleSignature(appPath)
 }
 
-async function verifyBundleSignature(appPath: string): Promise<void> {
-  await runCommand('/usr/bin/codesign', ['--verify', '--deep', '--strict', appPath])
+export async function verifyBundleSignature(
+  appPath: string,
+  run: (command: string, args: string[]) => Promise<unknown> = captureCommand,
+): Promise<void> {
+  const checks: [string, string[]][] = [
+    ['/usr/bin/codesign', ['--verify', '--deep', '--strict', `-R=${MAC_TEAM_REQUIREMENT}`, appPath]],
+    ['/usr/sbin/spctl', ['--assess', '--type', 'execute', appPath]],
+  ]
+  for (const [command, args] of checks) {
+    try {
+      await run(command, args)
+    } catch (err) {
+      throw new Error(
+        'Refusing to install: the downloaded CodeBurn Menubar is not signed and notarized by AgentSeal ' +
+        `(Developer ID team XRVP7P7F9M). ${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
+  }
 }
 
 async function resolvePersistentCodeburnPath(): Promise<string> {
@@ -754,26 +817,114 @@ export async function hasRunnableRecordedCli(recordPath: string = PERSISTED_CLI_
 /// `-x`, not `-f`: the executable inside the bundle is named exactly CodeBurnMenubar, and
 /// matching the whole command line instead would also hit an editor with the bundle's
 /// Info.plist open, or a tail on a log path. The name is the same from either Applications
-/// folder, so a copy running from the other one is still matched. killRunningApp must use
-/// the same matcher, or this reports a process that was never signalled.
-async function isAppRunning(): Promise<boolean> {
-  return new Promise((resolve) => {
-    const proc = spawn('/usr/bin/pgrep', ['-x', APP_PROCESS_NAME])
-    proc.on('close', (code) => resolve(code === 0))
-    proc.on('error', () => resolve(false))
-  })
+/// folder, so a copy running from the other one is still matched. `-a`: pgrep leaves out its
+/// own ancestors by default, and the app's Update button runs this install as the app's
+/// child, so without it the app asking for the update is never seen (#1541).
+export async function runningAppPids(name: string = APP_PROCESS_NAME): Promise<number[]> {
+  // -U: another user's menubar (fast user switching) is not ours to stop or wait for.
+  const out = await captureCommand('/usr/bin/pgrep', ['-a', '-U', String(process.getuid!()), '-x', name]).catch(() => '')
+  return out.split('\n').map(Number).filter(pid => Number.isInteger(pid) && pid > 0)
 }
 
-async function killRunningApp(): Promise<void> {
-  await new Promise<void>((resolve) => {
-    const proc = spawn('/usr/bin/pkill', ['-x', APP_PROCESS_NAME])
-    proc.on('close', () => resolve())
-    proc.on('error', () => resolve())
-  })
-  for (let i = 0; i < 10; i++) {
-    if (!(await isAppRunning())) return
+async function isAppRunning(): Promise<boolean> {
+  return (await runningAppPids()).length > 0
+}
+
+/// Every ancestor of `pid` in `ps -A -o pid= -o ppid=` output, nearest first, stopping at
+/// launchd.
+export function ancestorsOf(pid: number, psOutput: string): Set<number> {
+  const parent = new Map<number, number>()
+  for (const line of psOutput.split('\n')) {
+    const [child, ppid] = line.trim().split(/\s+/).map(Number)
+    if (child && ppid !== undefined && Number.isInteger(ppid)) parent.set(child, ppid)
+  }
+  const ancestors = new Set<number>()
+  for (let p = parent.get(pid); p !== undefined && p > 1 && !ancestors.has(p); p = parent.get(p)) ancestors.add(p)
+  return ancestors
+}
+
+async function killRunningApp(pids: number[]): Promise<void> {
+  for (const pid of pids) {
+    try { process.kill(pid, 'SIGTERM') } catch {}
+  }
+  for (let i = 0; i < 10 && pids.some(pidIsLive); i++) {
     await new Promise(r => setTimeout(r, 500))
   }
+}
+
+/// Runs detached in its own session, so nothing that happens to the app or to this CLI
+/// reaches it. Waits for the CLI and every process between it and the app ($1) to exit first:
+/// the app reads the CLI's output and waits on its exit status, so the app must outlive them.
+/// Then asks the app ($2) to go, forces it after 5s, and launches the new bundle only once no
+/// old copy is left for `open` to re-activate instead. The 120s cap covers the desktop step
+/// that `codeburn update` runs after this install.
+const RELAUNCH_SCRIPT = `waits=$1 pids=$2; shift 2
+alive() { for p in $1; do kill -0 "$p" 2>/dev/null && return 0; done; return 1; }
+i=0; while alive "$waits" && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done
+kill -TERM $pids 2>/dev/null
+i=0; while alive "$pids" && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+kill -KILL $pids 2>/dev/null
+i=0; while alive "$pids" && [ $i -lt 20 ]; do sleep 0.1; i=$((i+1)); done
+exec "$@"`
+
+/// This process and every ancestor below the app. After a CLI update `codeburn update` re-runs
+/// itself, so the app's own child is the parent engine, which still prints the final result
+/// once this process has exited.
+export function pidsBelowApp(pid: number, appPids: number[], ancestors: Set<number>): number[] {
+  const out = [pid]
+  for (const p of ancestors) {
+    if (appPids.includes(p)) break
+    out.push(p)
+  }
+  return out
+}
+
+async function relaunchAfterExit(waitPids: number[], appPids: number[], launch: string[]): Promise<void> {
+  const child = spawn('/bin/sh', ['-c', RELAUNCH_SCRIPT, 'codeburn-relaunch', waitPids.join(' '), appPids.join(' '), ...launch], {
+    detached: true,
+    stdio: 'ignore',
+  })
+  await once(child, 'spawn')
+  child.unref()
+}
+
+export type RelaunchHooks = {
+  processName?: string
+  /// Replaces `open` (and `open -n`); the target path is appended.
+  launchCommand?: string[]
+}
+
+/// Put the staged bundle in place and restart the app into it. From a terminal the running
+/// copy is stopped first, as it always was. From the app's own Update button the running copy
+/// is this process's ancestor: stopping it here would take down the reader of this process's
+/// stderr, so the bundle is swapped while it runs (it keeps running from the unlinked copy)
+/// and a detached helper stops and relaunches it after this process has exited.
+export async function replaceAndRelaunch(
+  unpackedApp: string,
+  targetPath: string,
+  stopRunning: boolean,
+  hooks: RelaunchHooks = {},
+): Promise<void> {
+  const running = stopRunning ? await runningAppPids(hooks.processName) : []
+  if (running.length > 0) {
+    const ancestors = ancestorsOf(process.pid, await captureCommand('/bin/ps', ['-A', '-o', 'pid=', '-o', 'ppid=']).catch(() => ''))
+    if (running.some(pid => ancestors.has(pid))) {
+      await placeMenubarBundle(unpackedApp, targetPath)
+      // -n: the old copy is gone by now, but Launch Services can take a moment to notice,
+      // and a plain `open` in that window re-activates it instead of launching anything.
+      await relaunchAfterExit(pidsBelowApp(process.pid, running, ancestors), running, [...(hooks.launchCommand ?? ['/usr/bin/open', '-n']), targetPath])
+      console.log('CodeBurn Menubar will restart into the new version.')
+      return
+    }
+  }
+  await killRunningApp(running)
+  // Only now, with the new bundle downloaded, checksummed and its identity verified, is
+  // the installed copy touched at all — and it is moved aside, not deleted, until this
+  // returns.
+  await placeMenubarBundle(unpackedApp, targetPath)
+  console.log('Launching CodeBurn Menubar...')
+  const [command, ...args] = hooks.launchCommand ?? ['/usr/bin/open']
+  await runCommand(command!, [...args, targetPath])
 }
 
 /// Windows mirror of the mac install below: pin the release to the CLI's own version, fall back
@@ -1163,9 +1314,12 @@ async function uninstallWindowsMenubar(options: InstallOptions): Promise<Install
 /// or `reg` by bare name lets anything dropped next to the CLI impersonate a system tool. Same
 /// rule the tray app follows (windows/src-tauri/src/cli.rs: system32_path).
 export function resolveSystem32Path(exe: string, env: NodeJS.ProcessEnv = process.env): string {
+  return `${windowsDir(env)}\\System32\\${exe}`
+}
+
+function windowsDir(env: NodeJS.ProcessEnv): string {
   const root = env.SystemRoot
-  const base = root && /^[a-zA-Z]:[\\/]/.test(root) ? root.replace(/[\\/]+$/, '') : 'C:\\Windows'
-  return `${base}\\System32\\${exe}`
+  return root && /^[a-zA-Z]:[\\/]/.test(root) ? root.replace(/[\\/]+$/, '') : 'C:\\Windows'
 }
 
 /// Reads `reg query ... /s` output, which prints one blank-line separated block per subkey.
@@ -1205,6 +1359,8 @@ export const STORE_IDENTITY_NAME = 'Codeburn.CodeBurn'
 /// Where the tray app sits inside that package: electron-builder puts extraResources under
 /// `app\resources`, and app/build/appx-extensions.xml names the same path in its startup task.
 const STORE_TRAY_SEGMENTS = ['app', 'resources', 'menubar', WINDOWS_BINARY_NAME]
+/// The package's one Application (app/package.json, build.appx.applicationId). Same drift test.
+export const STORE_APP_ID = 'CodeBurn'
 /// Get-AppxPackage on a warm machine answers well inside a second, but a cold PowerShell behind
 /// a slow disk or a policy-loaded profile can take much longer, and `codeburn menubar` is
 /// interactive. Past this the answer is "no Store install" and the .msi route takes over.
@@ -1259,7 +1415,16 @@ export async function findStoreMenubar(
   return (await exists(exePath)) ? { installLocation, exePath } : undefined
 }
 
-async function queryStoreInstallLocation(env: NodeJS.ProcessEnv): Promise<string> {
+/// The AppUserModelID to activate the Store package by, read off its install folder, which
+/// Windows names after the package full name: `<Name>_<Version>_<Arch>_<ResourceId>_<PublisherId>`.
+/// The family name is `<Name>_<PublisherId>`.
+export function storeAppUserModelId(installLocation: string): string | undefined {
+  const folder = installLocation.split(/[\\/]/).filter(Boolean).pop() ?? ''
+  const match = /^([^_]+)_[^_]+_[^_]+_[^_]*_([^_]+)$/.exec(folder)
+  return match ? `${match[1]}_${match[2]}!${STORE_APP_ID}` : undefined
+}
+
+export async function queryStoreInstallLocation(env: NodeJS.ProcessEnv): Promise<string> {
   // Same rule msiexec and reg follow above: an absolute System32 path, never a bare name.
   const powershell = resolveSystem32Path('WindowsPowerShell\\v1.0\\powershell.exe', env)
   return captureBounded(powershell, [
@@ -1435,8 +1600,15 @@ async function installWindowsMenubarApp(options: InstallOptions): Promise<Instal
     if (installed) {
       log(`A separate .msi install is also present at ${installed.exePath}; leaving it in place and using the Store copy.`)
     }
-    launch(store.exePath)
-    log('Launched CodeBurn Menubar.')
+    // Files under WindowsApps run only inside their package, so spawning the tray exe from a
+    // console fails with EPERM (#1520). Activating the package starts the desktop app, which
+    // starts the tray app when its Menu bar switch is on (the default).
+    const aumid = storeAppUserModelId(store.installLocation)
+    if (!aumid) {
+      throw new Error(`Could not work out how to open the Store package at ${store.installLocation}; open CodeBurn from the Start menu instead.`)
+    }
+    launch(`${windowsDir(env)}\\explorer.exe`, [`shell:AppsFolder\\${aumid}`])
+    log('Opened the CodeBurn desktop app, which starts CodeBurn Menubar. If the tray icon does not appear, turn on Menu bar in the app.')
     return { installedPath: store.exePath, launched: true }
   }
   if (decision.storePresent) {
@@ -1473,6 +1645,10 @@ async function installWindowsMenubarApp(options: InstallOptions): Promise<Instal
       if (!cliVersion || !isMissingDirectAssetError(err)) throw err
       log(`CodeBurn Menubar v${cliVersion} assets were not found. Looking up the latest CodeBurn Menubar release...`)
       assets = await fetchLatestReleaseAssets(WINDOWS_RELEASE, hooks.apiFetch)
+      if (installed && !isFallbackUpgrade(assets, installed.version, WINDOWS_RELEASE)) {
+        log(`The newest published CodeBurn Menubar (${assets.release.tag_name}) is not newer than the installed ${installed.version}; leaving it alone.`)
+        return { installedPath: installed.exePath, launched: false }
+      }
       msiPath = await stageWindowsInstaller(assets, stagingDir, hooks, log)
     }
 
@@ -1544,7 +1720,7 @@ export async function installMenubarApp(options: InstallOptions = {}): Promise<I
     assets = resolveVersionedMenubarReleaseAssets(cliVersion)
   } else {
     console.log('Looking up the latest CodeBurn Menubar release...')
-    assets = await fetchLatestReleaseAssets()
+    assets = await fetchLatestMacReleaseAssets()
   }
 
   const stagingDir = await mkdtemp(join(tmpdir(), 'codeburn-menubar-'))
@@ -1555,24 +1731,19 @@ export async function installMenubarApp(options: InstallOptions = {}): Promise<I
     } catch (err) {
       if (!cliVersion || !isMissingDirectAssetError(err)) throw err
       console.log(`CodeBurn Menubar v${cliVersion} assets were not found. Looking up the latest CodeBurn Menubar release...`)
-      assets = await fetchLatestReleaseAssets()
+      assets = await fetchLatestMacReleaseAssets()
+      const installedVersion = installedPath ? await readBundleVersion(installedPath) : null
+      if (installedPath && !isFallbackUpgrade(assets, installedVersion)) {
+        console.log(`The newest published CodeBurn Menubar (${assets.release.tag_name}) is not newer than the installed ${installedVersion}; leaving it alone.`)
+        return { installedPath, launched: false }
+      }
       unpackedApp = await stageMenubarApp(assets, stagingDir)
     }
 
     await mkdir(dirname(targetPath), { recursive: true })
-    if (installedPath) {
-      // Kill the running copy before replacing its bundle so `mv` can proceed cleanly and the
-      // user ends up on the new version. The match is on the process name, so a copy running
-      // from the other Applications folder is asked to go too.
-      await killRunningApp()
-    }
-    // Only now, with the new bundle downloaded, checksummed and its identity verified, is
-    // the installed copy touched at all — and it is moved aside, not deleted, until this
-    // returns.
-    await placeMenubarBundle(unpackedApp, targetPath)
-
-    console.log('Launching CodeBurn Menubar...')
-    await runCommand('/usr/bin/open', [targetPath])
+    // The match is on the process name, so a copy running from the other Applications
+    // folder is asked to go too.
+    await replaceAndRelaunch(unpackedApp, targetPath, Boolean(installedPath))
     reportLeftoverBundles(otherCopies(found, targetPath))
     return { installedPath: targetPath, launched: true }
   } finally {

@@ -12,6 +12,7 @@ import {
   transientRead,
   visibleFooterLines,
   type Connection,
+  type ProfileToday,
   type QuotaState,
 } from './lib/quota'
 import {
@@ -37,6 +38,7 @@ import {
   todayFor,
   type ProviderToday,
   refreshGlanceToday,
+  sessionsForSource,
   subscribeDailyBudget,
   subscribeGlance,
   thousands,
@@ -100,7 +102,17 @@ type Provider = {
   error?: string
   connection?: string
   lastKnown?: boolean
+  /// On the per-profile rows a separate rail draws in place of the claude row: the base
+  /// provider the row stands for, its own today totals, and its caption. Provider-id
+  /// addressing (the settings' set, glyphs, colours, the connect button) uses `baseId`.
+  baseId?: string
+  today?: ProfileToday
+  caption?: string
 }
+
+/// A profile row is a Provider carrying a baseId that is not its own id.
+const isProfileRow = (provider: Provider): boolean =>
+  provider.baseId !== undefined && provider.baseId !== provider.id
 
 type Rect = { x: number; y: number; w: number; h: number }
 type DockFrame = {
@@ -263,11 +275,13 @@ function Row({ m, shape, provider, loading, style, onEnter, onLeave, onClick }: 
       <span className="dock-gauge">
         <Ring m={m} shape={shape} percent={percent} />
         <span className={`dock-glyph${loading ? ' is-loading' : ''}`}>
-          <ProviderGlyph id={provider.id} size={m.providerIconSize} />
+          <ProviderGlyph id={provider.baseId ?? provider.id} size={m.providerIconSize} />
         </span>
         {provider.error && !provider.lastKnown && !transientRead(provider) ? <span className="dock-row-alert" /> : null}
       </span>
       <span className={`dock-pct${sev ? ` is-${sev}` : ' is-empty'}`}>{percent === null ? '--' : `${percent}%`}</span>
+      {/* Two Claude rings are told apart by their captions and nothing else. */}
+      {provider.caption ? <span className="dock-row-caption">{provider.caption}</span> : null}
     </button>
   )
 }
@@ -307,7 +321,8 @@ function footerLines(provider: Provider, fetchedAt: number | null, now: number):
 function instruction(provider: Provider, quota: QuotaState): string {
   if (quota.cliOutdated) return 'CLI update needed for live quota. Run npm install -g codeburn.'
   if (quota.error) return quota.error
-  return `Sign in with the ${provider.name} app or CLI. The dock checks again on the quota refresh cadence.`
+  const name = PROVIDER_NAMES[provider.baseId ?? provider.id] ?? provider.name
+  return `Sign in with the ${name} app or CLI. The dock checks again on the quota refresh cadence.`
 }
 
 /// A percentage drawn as its own gauge (PercentGaugeText): the glyphs sit dim, and the
@@ -382,7 +397,7 @@ function drawsWindows(connection: Connection): boolean {
 }
 
 /// Cost burned beside the token and call counts: the Today strip and the This cycle strip.
-function UsageFigures({ totals }: { totals: ProviderToday }) {
+function UsageFigures({ totals }: { totals: Pick<ProviderToday, 'cost' | 'calls' | 'inputTokens' | 'outputTokens'> }) {
   return (
     <div className="dock-today">
       <span className="dock-today-figure">
@@ -433,22 +448,27 @@ function Detail({
   const g = glanceMetrics(m.detailScale)
   const now = Date.now()
   const connection: Connection = loading ? 'loading' : connectionFor(provider, quota)
-  const sessions = sessionsFor(glance, provider.id)
-  const today = todayFor(glance, provider.id)
-  const cycleTotals = cycle ? providerTotals(cycle.rows, provider.id) : null
+  const profile = isProfileRow(provider)
+  // A profile ring's bubble shows its own sessions and today totals, never the
+  // all-provider glance figures the base rows show.
+  const sessions = profile ? sessionsForSource(glance, provider.id) : sessionsFor(glance, provider.id)
+  const today = profile && provider.today ? provider.today : todayFor(glance, provider.id)
+  const cycleTotals = !profile && cycle ? providerTotals(cycle.rows, provider.id) : null
   const windows = provider.windows.slice(0, MAX_WINDOW_COLUMNS)
   const footer = footerLines(provider, fetchedAt, now)
   const action = loading ? null : connectionAction(provider)
   // A single window has no siblings to line up with, so it reads as a left-aligned figure
   // rather than as a lone centred digit.
   const windowAlign = windows.length === 1 ? 'start' : 'center'
+  const baseId = provider.baseId ?? provider.id
+  const title = profile ? `${PROVIDER_NAMES[baseId] ?? baseId} · ${provider.name}` : provider.name
   return (
     <div className="dock-glance">
       <header className="dock-glance-head has-rule">
         <span className="dock-glance-glyph">
-          <ProviderGlyph id={provider.id} size={m.detailGlyphSize} />
+          <ProviderGlyph id={baseId} size={m.detailGlyphSize} />
         </span>
-        <span className="dock-glance-name">{provider.name}</span>
+        <span className="dock-glance-name">{title}</span>
         {provider.plan ? <span className="dock-glance-plan">{provider.plan}</span> : null}
       </header>
 
@@ -552,8 +572,8 @@ function Detail({
           <button
             type="button"
             className="dock-connect"
-            style={{ background: providerColor(provider.id) }}
-            onClick={() => void invoke('open_settings_window', { section: provider.id })}
+            style={{ background: providerColor(baseId) }}
+            onClick={() => void invoke('open_settings_window', { section: baseId })}
           >
             {actionTitle(provider, action)}
           </button>
@@ -574,6 +594,9 @@ function dockVars(m: Metrics): CSSProperties {
     '--dock-gauge-size': `${m.ringSize}px`,
     '--dock-ring-margin': `${m.ringMargin}px`,
     '--dock-pct-size': `${m.percentTextSize}px`,
+    '--dock-caption-size': `${m.captionTextSize}px`,
+    '--dock-caption-line': `${m.captionLine}px`,
+    '--dock-caption-gap': `${m.captionGap}px`,
     '--dock-alert-size': `${m.alertSize}px`,
     // The mac hangs the badge 19 points out from the ring centre, at 12 points across.
     '--dock-alert-inset': `${Math.round(m.ringSize / 2 - m.alertOffset - m.alertSize / 2)}px`,
@@ -705,6 +728,16 @@ export function Dock() {
   // event and they are applied in one render, below.
   const m = metrics(layoutScale)
 
+  // Switching the profiles mode changes what the CLI is asked for (the --claude-profiles
+  // flag rides on the preference), so the rail asks for a fresh answer instead of drawing
+  // dashed list-mode rings until the cadence ticks.
+  const profilesModeRef = useRef(prefs.claudeProfiles)
+  useEffect(() => {
+    if (profilesModeRef.current === prefs.claudeProfiles) return
+    profilesModeRef.current = prefs.claudeProfiles
+    if (prefsLoaded) void refreshQuota()
+  }, [prefs.claudeProfiles, prefsLoaded])
+
   // Until the user edits the set in the settings window, the dock follows what is connected,
   // up to the mac's five. The write reaches the settings window through the same event, so a
   // window open on the Capacity Dock section fills its switches in as the answer arrives.
@@ -718,15 +751,39 @@ export function Dock() {
   // Providers: the ones the CLI reports signed in, narrowed to the settings window's choice
   // when one has been made, else the preferred one as a dashed stand-in. An empty choice is
   // "nobody has picked yet", which is why it means everything rather than nothing.
-  const all = quota.providers
+  // In separate mode the claude row is drawn as one captioned row per config directory;
+  // provider-id addressing keeps using 'claude', and a 'claude' resting choice rests on the
+  // first ring.
+  const separateProfiles = prefs.claudeProfiles === 'separate' && quota.claudeProfiles.length > 1
+  const profileRows: Provider[] = quota.claudeProfiles.map((profile) => ({
+    id: profile.id,
+    baseId: 'claude',
+    name: profile.label,
+    // A list-mode answer (fetched while the preference was still combined) carries no
+    // windows or availability yet; those rows read as unknown rings until the next refresh.
+    available: profile.available ?? false,
+    ...(profile.plan ? { plan: profile.plan } : {}),
+    windows: profile.windows ?? [],
+    ...(profile.error ? { error: profile.error } : {}),
+    ...(profile.today ? { today: profile.today } : {}),
+    caption: profile.label === 'Default Claude' ? 'Default' : profile.label,
+  }))
+  const rowBase = (p: Provider) => p.baseId ?? p.id
+  const all = separateProfiles
+    ? quota.providers.flatMap((p) => (p.id === 'claude' ? profileRows : [p]))
+    : quota.providers
   const signedIn = all.filter((p) => p.available)
   const chosenIds = prefs.providers
   // A chosen provider stays on the rail after it drops out, as it does on the mac: a dashed
   // ring and a Reconnect button say more than a row that quietly disappeared. Nothing chosen
   // yet means everything signed in, which is what the empty set is for until the seed runs.
-  const available = chosenIds.length > 0 ? all.filter((p) => chosenIds.includes(p.id)) : signedIn
+  const available = chosenIds.length > 0 ? all.filter((p) => chosenIds.includes(rowBase(p))) : signedIn
+  const rowIds = available.map((p) => p.id)
+  // A 'claude' resting choice means the Claude rail; drawn per profile, that is its first ring.
+  const restingChoice =
+    separateProfiles && prefs.preferred === 'claude' ? profileRows[0]?.id ?? prefs.preferred : prefs.preferred
   const resolvedPreferredId =
-    normalizedPreferred(prefs.preferred, available.map((p) => p.id)) ?? prefs.preferred ?? all[0]?.id ?? 'claude'
+    normalizedPreferred(restingChoice, rowIds) ?? restingChoice ?? all[0]?.id ?? 'claude'
   const preferred: Provider = all.find((p) => p.id === resolvedPreferredId) ?? {
     id: resolvedPreferredId,
     name: PROVIDER_NAMES[resolvedPreferredId] ?? resolvedPreferredId,
@@ -737,12 +794,18 @@ export function Dock() {
   const displayed = presentationExpanded
     ? [preferred, ...selected.filter((p) => p.id !== preferred.id)]
     : [preferred]
+  // Profile rings carry a caption, and every row shares their taller pitch because the
+  // hit-test assumes a uniform one. Rails without a Claude ring keep today's height.
+  const captioned = separateProfiles && selected.some((p) => rowBase(p) === 'claude')
+  const rowExtent = m.rowHeight + (captioned ? m.captionGap + m.captionLine : 0)
   const anchor = frame?.anchor ?? 'start'
   const ordered = anchor === 'end' ? [...displayed].reverse() : displayed
   orderedRef.current = ordered
   const loading = quota.fetchedAt === null && quota.error === null
 
-  const expanded = isExpanded(interaction)
+  // With the preference on the rail never rests on one ring: it reads as pinned, so every
+  // selected row stays out and the hover-out collapse has nothing to do.
+  const expanded = prefs.keepExpanded || isExpanded(interaction)
   useEffect(() => {
     if (expanded) setPresentationExpanded(true)
   }, [expanded])
@@ -1080,7 +1143,7 @@ export function Dock() {
   useEffect(() => {
     let stale = false
     void invoke<DockFrame>('dock_set_layout', {
-      request: { rows, totalRows, expanded: presentationExpanded, detail: detailRequest },
+      request: { rows, totalRows, expanded: presentationExpanded, detail: detailRequest, captioned },
     }).then((next) => {
       if (!stale) setFrame(next)
     })
@@ -1089,7 +1152,7 @@ export function Dock() {
     }
     // detailRequest is derived from the two scalars below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rows, totalRows, presentationExpanded, detailRow, detailHeight, m])
+  }, [rows, totalRows, presentationExpanded, detailRow, detailHeight, m, captioned])
 
   // Entering: the card is placed while invisible, then slides in on the next frame.
   const detailPlaced = frame?.detail != null && detailRequest != null
@@ -1122,12 +1185,18 @@ export function Dock() {
   // wallpaper, with a brighter rim than graphite gets.
   const glass = prefs.theme === 'glass'
   const surfaceFill = glass ? 'url(#dock-glass-fill)' : 'url(#dock-rail-fill)'
+  // The bubble may keep its own surface: a Glass rail can carry a Graphite bubble so the
+  // figures stay readable over any wallpaper. `match` is what it always did.
+  const bubbleGlass = prefs.detailTheme === 'match' ? glass : prefs.detailTheme === 'glass'
+  const bubbleFill = bubbleGlass ? 'url(#dock-glass-fill)' : 'url(#dock-rail-fill)'
   const edge = flareEdge
   const vertical = railVertical
   const cross = vertical ? m.railWidth : m.horizontalRailWidth
   const pad = alongPad(m, attachment)
-  const restLength = railLength(m, 1, attachment)
-  const targetLength = railLength(m, rows, attachment)
+  // The shape grows by the same caption allowance the rows and Rust's layout already carry.
+  const rowM = captioned ? { ...m, rowHeight: rowExtent } : m
+  const restLength = railLength(rowM, 1, attachment)
+  const targetLength = railLength(rowM, rows, attachment)
   const railRect = frame?.rail ?? { x: 0, y: 0, w: cross, h: restLength }
   // The layout rail is the box the window was sized for. Growing the painted
   // ball past it (the expand animation finishing before the next layout) shifts
@@ -1163,7 +1232,7 @@ export function Dock() {
   const hoveredProvider = hovered ? (ordered.find((p) => p.id === hovered) ?? null) : null
   // The window the ball's percentage is read from, so the strip covers the same stretch.
   const hoveredSince =
-    hoveredProvider?.available ? cycleStart(headlineWindow(hoveredProvider.windows)) : null
+    hoveredProvider?.available && !isProfileRow(hoveredProvider) ? cycleStart(headlineWindow(hoveredProvider.windows)) : null
   useEffect(() => {
     if (!hoveredSince) return
     let cancelled = false
@@ -1283,8 +1352,8 @@ export function Dock() {
                 provider={provider}
                 loading={loading}
                 style={{
-                  width: vertical ? cross - m.railCrossPad * 2 : m.rowHeight,
-                  height: vertical ? m.rowHeight : cross - m.railCrossPad * 2,
+                  width: vertical ? cross - m.railCrossPad * 2 : rowExtent,
+                  height: vertical ? rowExtent : cross - m.railCrossPad * 2,
                   opacity: isPreferred ? 1 : progress,
                   transform: vertical ? `translateY(${reveal}px)` : `translateX(${reveal}px)`,
                 }}
@@ -1307,12 +1376,12 @@ export function Dock() {
         >
           {detailH > 0 ? (
             <svg className="dock-surface" width={detailW} height={detailH} viewBox={`0 0 ${detailW} ${detailH}`} aria-hidden="true">
-              <path d={bubblePath(tailEdge, detailW, detailH, tail)} fill={surfaceFill} />
+              <path d={bubblePath(tailEdge, detailW, detailH, tail)} fill={bubbleFill} />
               <path d={bubblePath(tailEdge, detailW, detailH, tail)} fill="url(#dock-rail-glow)" />
               <path
                 d={bubblePath(tailEdge, detailW, detailH, tail)}
                 fill="none"
-                stroke={glass ? 'rgba(255,255,255,0.20)' : 'rgba(255,255,255,0.09)'}
+                stroke={bubbleGlass ? 'rgba(255,255,255,0.20)' : 'rgba(255,255,255,0.09)'}
                 strokeWidth={Math.max(0.5, m.detailScale)}
               />
             </svg>

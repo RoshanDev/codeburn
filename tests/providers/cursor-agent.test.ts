@@ -185,6 +185,7 @@ describe('cursor-agent provider', () => {
     expect(calls[0]!.outputTokens).toBe(estimateTokensFromChars(assistantText.length))
     expect(calls[0]!.reasoningTokens).toBe(0)
     expect(calls[0]!.deduplicationKey).toBe(`cursor-agent:${FIXED_UUID}:0`)
+    expect(calls[0]!.costIsEstimated).toBe(true)
   })
 
   it('parses without sqlite db and defaults model', async () => {
@@ -247,6 +248,27 @@ describe('cursor-agent provider', () => {
     stderrSpy.mockRestore()
   })
 
+  it('does not warn for a jsonl transcript that ended before any assistant message', async () => {
+    const baseDir = await makeBaseDir()
+    const sessionDir = join(baseDir, 'projects', 'stub-proj', 'agent-transcripts', FIXED_UUID)
+    await mkdir(sessionDir, { recursive: true })
+    await writeFile(
+      join(sessionDir, `${FIXED_UUID}.jsonl`),
+      '{"type":"turn_ended","status":"error","error":"Other Models usage limit reached"}\n',
+    )
+
+    const provider = createCursorAgentProvider(baseDir)
+    const source = (await provider.discoverSessions())[0]!
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+
+    const calls = await collectCalls(provider, source)
+
+    expect(calls).toHaveLength(0)
+    expect(stderrSpy).not.toHaveBeenCalled()
+
+    stderrSpy.mockRestore()
+  })
+
   it('discovers jsonl transcripts stored directly under project dir (workspace-less layout)', async () => {
     const baseDir = await makeBaseDir()
     const fixtureRoot = join(import.meta.dirname, '../fixtures/cursor-agent/workspace-less')
@@ -297,6 +319,113 @@ describe('cursor-agent provider', () => {
     expect(callsFirst[0]!.sessionId).toBe(callsSecond[0]!.sessionId)
     expect(callsFirst[0]!.deduplicationKey).toBe(callsSecond[0]!.deduplicationKey)
   })
+
+  it('counts every assistant message after one user message (jsonl)', async () => {
+    const baseDir = await makeBaseDir()
+    const sessionDir = join(baseDir, 'projects', 'multi-proj', 'agent-transcripts', FIXED_UUID)
+    await mkdir(sessionDir, { recursive: true })
+    await writeFile(
+      join(sessionDir, `${FIXED_UUID}.jsonl`),
+      '{"role":"user","message":{"content":[{"type":"text","text":"<user_query>do it</user_query>"}]}}\n' +
+      '{"role":"assistant","message":{"content":[{"type":"text","text":"step one"}]}}\n' +
+      '{"role":"assistant","message":{"content":[{"type":"text","text":"step two"}]}}\n' +
+      '{"role":"assistant","message":{"content":[{"type":"text","text":"step three"}]}}\n',
+    )
+
+    const provider = createCursorAgentProvider(baseDir)
+    const source = (await provider.discoverSessions())[0]!
+    const calls = await collectCalls(provider, source)
+
+    expect(calls).toHaveLength(3)
+    expect(calls.map(c => c.deduplicationKey)).toEqual([
+      `cursor-agent:${FIXED_UUID}:0`,
+      `cursor-agent:${FIXED_UUID}:1`,
+      `cursor-agent:${FIXED_UUID}:2`,
+    ])
+    expect(calls.every(c => c.userMessage === 'do it')).toBe(true)
+    expect(calls.map(c => c.inputTokens)).toEqual([estimateTokensFromChars('do it'.length), 0, 0])
+  })
+
+  it('dates jsonl turns by their prompt timestamp, not the file write', async () => {
+    const baseDir = await makeBaseDir()
+    const sessionDir = join(baseDir, 'projects', 'p', 'agent-transcripts', FIXED_UUID)
+    await mkdir(sessionDir, { recursive: true })
+    const file = join(sessionDir, `${FIXED_UUID}.jsonl`)
+    const prompt = (stamp: string) => JSON.stringify({ role: 'user', message: { content: [{ type: 'text', text: `<timestamp>${stamp}</timestamp>\n<user_query>redacted</user_query>` }] } })
+    const step = JSON.stringify({ role: 'assistant', message: { content: [{ type: 'text', text: 'x' }] } })
+    await writeFile(file, [prompt('Tuesday, Oct 6, 2026, 8:58 AM (UTC-7)'), step, step, prompt('Tuesday, Oct 6, 2026, 9:04 AM (UTC-7)'), step].join('\n') + '\n')
+    const { utimes } = await import('fs/promises')
+    await utimes(file, new Date('2026-10-06T16:07:08Z'), new Date('2026-10-06T16:07:08Z'))
+
+    const provider = createCursorAgentProvider(baseDir)
+    const calls = await collectCalls(provider, (await provider.discoverSessions())[0]!)
+
+    expect(calls.map(c => c.timestamp)).toEqual([
+      '2026-10-06T15:58:00.000Z',
+      '2026-10-06T15:58:00.000Z',
+      '2026-10-06T16:04:00.000Z',
+    ])
+  })
+
+  it('counts tool_use inputs in output tokens (jsonl)', async () => {
+    const baseDir = await makeBaseDir()
+    const sessionDir = join(baseDir, 'projects', 'tool-proj', 'agent-transcripts', FIXED_UUID)
+    await mkdir(sessionDir, { recursive: true })
+    const toolInput = { path: '/some/very/long/path/to/a/file/that/adds/chars.txt' }
+    await writeFile(
+      join(sessionDir, `${FIXED_UUID}.jsonl`),
+      '{"role":"user","message":{"content":[{"type":"text","text":"<user_query>read it</user_query>"}]}}\n' +
+      `{"role":"assistant","message":{"content":[{"type":"text","text":"ok"},{"type":"tool_use","name":"Read","input":${JSON.stringify(toolInput)}}]}}\n`,
+    )
+
+    const provider = createCursorAgentProvider(baseDir)
+    const source = (await provider.discoverSessions())[0]!
+    const calls = await collectCalls(provider, source)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.tools).toEqual(['cursor:read'])
+    expect(calls[0]!.outputTokens).toBe(
+      estimateTokensFromChars(('ok\n' + JSON.stringify(toolInput)).trim().length),
+    )
+  })
+
+  it('accounts full user text while keeping display truncated (jsonl)', async () => {
+    const baseDir = await makeBaseDir()
+    const sessionDir = join(baseDir, 'projects', 'long-proj', 'agent-transcripts', FIXED_UUID)
+    await mkdir(sessionDir, { recursive: true })
+    const longText = 'x'.repeat(2000)
+    await writeFile(
+      join(sessionDir, `${FIXED_UUID}.jsonl`),
+      `{"role":"user","message":{"content":[{"type":"text","text":"<user_query>${longText}</user_query>"}]}}\n` +
+      '{"role":"assistant","message":{"content":[{"type":"text","text":"done"}]}}\n',
+    )
+
+    const provider = createCursorAgentProvider(baseDir)
+    const source = (await provider.discoverSessions())[0]!
+    const calls = await collectCalls(provider, source)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.inputTokens).toBe(estimateTokensFromChars(longText.length))
+    expect(calls[0]!.userMessage).toHaveLength(500)
+  })
+
+  it('counts every assistant block after one user block (txt)', async () => {
+    const baseDir = await makeBaseDir()
+    const transcriptDir = join(baseDir, 'projects', 'txt-multi', 'agent-transcripts')
+    await mkdir(transcriptDir, { recursive: true })
+    await writeFile(
+      join(transcriptDir, `${FIXED_UUID}.txt`),
+      'user:\n<user_query>go</user_query>\nA:\nfirst\nA:\nsecond\n',
+    )
+
+    const provider = createCursorAgentProvider(baseDir)
+    const source = (await provider.discoverSessions())[0]!
+    const calls = await collectCalls(provider, source)
+
+    expect(calls).toHaveLength(2)
+    expect(calls.every(c => c.userMessage === 'go')).toBe(true)
+    expect(calls.map(c => c.inputTokens)).toEqual([estimateTokensFromChars('go'.length), 0])
+  })
 })
 
 skipUnlessSqlite('cursor-agent sqlite metadata', () => {
@@ -326,5 +455,186 @@ skipUnlessSqlite('cursor-agent sqlite metadata', () => {
     expect(calls).toHaveLength(1)
     expect(calls[0]!.model).toBe('claude-4.6-sonnet')
     expect(calls[0]!.timestamp).toBe('2025-01-01T00:00:00.000Z')
+  })
+})
+
+const STORE_AGENT_ID = '0b9e6f3a-5c2d-4e8f-9a1b-2c3d4e5f6a7b'
+
+function protoVarint(n: number): number[] {
+  const out: number[] = []
+  while (n >= 128) {
+    out.push((n % 128) | 0x80)
+    n = Math.floor(n / 128)
+  }
+  out.push(n)
+  return out
+}
+
+function protoBytes(field: number, bytes: Uint8Array): number[] {
+  return [...protoVarint(field * 8 + 2), ...protoVarint(bytes.length), ...bytes]
+}
+
+type StoreFixture = { roots: object[][]; createdAt?: number; meta?: string; workspace?: string }
+
+// Shape redacted from a real Cursor CLI store.db: hex JSON meta under key '0',
+// JSON message blobs and protobuf conversation roots in `blobs`.
+function writeStoreDb(dbPath: string, fixture: StoreFixture): void {
+  const { createHash } = require('crypto')
+  withTestDb(dbPath, (db) => {
+    db.exec('CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB); CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)')
+    const insert = db.prepare('INSERT OR IGNORE INTO blobs (id, data) VALUES (?, ?)')
+    let latest = ''
+    for (const messages of fixture.roots) {
+      const root: number[] = []
+      for (const message of messages) {
+        const data = Buffer.from(JSON.stringify(message))
+        const id = createHash('sha256').update(data).digest()
+        insert.run(id.toString('hex'), data)
+        root.push(...protoBytes(1, id))
+      }
+      root.push(...protoBytes(9, Buffer.from(fixture.workspace ?? 'file:///Users/dev/Projects/store-app')))
+      root.push(...protoVarint(26 * 8), ...protoVarint(fixture.createdAt ?? 1788443573805))
+      const rootData = Buffer.from(root)
+      latest = createHash('sha256').update(rootData).digest('hex')
+      insert.run(latest, rootData)
+    }
+    const meta = fixture.meta ?? Buffer.from(JSON.stringify({
+      agentId: STORE_AGENT_ID,
+      latestRootBlobId: latest,
+      name: 'New Agent',
+      mode: 'default',
+      isRunEverything: false,
+      createdAt: fixture.createdAt ?? 1788443573805,
+      blobEncryptionKey: 'fixture-secret-never-read',
+    })).toString('hex')
+    db.prepare('INSERT INTO meta (key, value) VALUES (?, ?)').run('0', meta)
+  })
+}
+
+async function makeStore(baseDir: string, fixture: StoreFixture): Promise<string> {
+  const dir = join(baseDir, 'chats', '1fcd87990ff06081250de865a4bb5c27', STORE_AGENT_ID)
+  await mkdir(dir, { recursive: true })
+  const dbPath = join(dir, 'store.db')
+  writeStoreDb(dbPath, fixture)
+  return dbPath
+}
+
+const SYSTEM_MSG = { role: 'system', content: 'You are an AI coding assistant.' }
+const USER_INFO_MSG = { role: 'user', content: '<user_info>\nOS Version: darwin\n</user_info>' }
+const PROMPT_MSG = {
+  role: 'user',
+  content: [{ type: 'text', text: '<timestamp>Thursday, Sep 3, 2026, 6:52 AM (UTC-7)</timestamp>\n<user_query>\nfix the build\n</user_query>' }],
+}
+const STEP_ONE = {
+  id: '1',
+  role: 'assistant',
+  content: [
+    { type: 'reasoning', text: 'Looking at the build.', signature: 'sig', providerOptions: { cursor: { modelName: 'claude-4.6-sonnet' } } },
+    { type: 'tool-call', toolCallId: 'toolu_1', toolName: 'Shell', args: { command: 'npm run build' } },
+  ],
+}
+const TOOL_RESULT = { role: 'tool', content: [{ type: 'tool-result', toolCallId: 'toolu_1', toolName: 'Shell', result: 'ok' }] }
+const STEP_TWO = { id: '1', role: 'assistant', content: [{ type: 'text', text: 'Build fixed.' }] }
+
+skipUnlessSqlite('cursor-agent store.db sessions', () => {
+  it('reads a store-only session with the transcript accounting rules', async () => {
+    const baseDir = await makeBaseDir()
+    const dbPath = await makeStore(baseDir, {
+      roots: [[SYSTEM_MSG, USER_INFO_MSG, PROMPT_MSG, STEP_ONE, TOOL_RESULT, { role: 'assistant', content: [] }, STEP_TWO]],
+    })
+
+    const provider = createCursorAgentProvider(baseDir)
+    const sources = await provider.discoverSessions()
+    expect(sources.map(s => s.path)).toEqual([dbPath])
+
+    const calls = await collectCalls(provider, sources[0]!)
+    expect(calls).toHaveLength(2)
+    expect(calls.map(c => c.deduplicationKey)).toEqual([`cursor-agent:${STORE_AGENT_ID}:0`, `cursor-agent:${STORE_AGENT_ID}:1`])
+    expect(calls[0]!.inputTokens).toBe(estimateTokensFromChars('fix the build'.length))
+    expect(calls[1]!.inputTokens).toBe(0)
+    expect(calls[0]!.outputTokens).toBe(estimateTokensFromChars(JSON.stringify({ command: 'npm run build' }).length))
+    expect(calls[0]!.reasoningTokens).toBe(estimateTokensFromChars('Looking at the build.'.length))
+    expect(calls[0]!.tools).toEqual(['cursor:shell'])
+    expect(calls.every(c => c.model === CURSOR_AGENT_DEFAULT_MODEL)).toBe(true)
+    expect(calls.every(c => c.timestamp === '2026-09-03T13:52:00.000Z')).toBe(true)
+    expect(calls.every(c => c.costIsEstimated && c.sessionId === STORE_AGENT_ID && c.project === 'app')).toBe(true)
+    expect(calls[0]!.userMessage).toBe('fix the build')
+  })
+
+  it('skips a store whose session has a transcript, so it counts once', async () => {
+    const baseDir = await makeBaseDir()
+    await makeStore(baseDir, { roots: [[SYSTEM_MSG, PROMPT_MSG, STEP_TWO]] })
+    const transcriptDir = join(baseDir, 'projects', 'Users-dev-Projects-store-app', 'agent-transcripts', STORE_AGENT_ID)
+    await mkdir(transcriptDir, { recursive: true })
+    const transcriptPath = join(transcriptDir, `${STORE_AGENT_ID}.jsonl`)
+    await writeFile(transcriptPath, [
+      JSON.stringify({ role: 'user', message: { content: [{ type: 'text', text: '<user_query>fix the build</user_query>' }] } }),
+      JSON.stringify({ role: 'assistant', message: { content: [{ type: 'text', text: 'Build fixed.' }] } }),
+    ].join('\n'))
+
+    const sources = await createCursorAgentProvider(baseDir).discoverSessions()
+    expect(sources.map(s => s.path)).toEqual([transcriptPath])
+  })
+
+  it('leaves transcripts and stores of Cursor IDE chats to the cursor provider', async () => {
+    const baseDir = await makeBaseDir()
+    const ideId = 'aaaaaaaa-1111-4222-8333-444444444444'
+    const subId = 'bbbbbbbb-1111-4222-8333-444444444444'
+    const cliId = 'cccccccc-1111-4222-8333-444444444444'
+    const ideDbPath = join(baseDir, 'state.vscdb')
+    withTestDb(ideDbPath, (db) => {
+      db.exec('CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)')
+      const insert = db.prepare('INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)')
+      for (const id of [ideId, subId, STORE_AGENT_ID]) insert.run(`composerData:${id}`, '{}')
+      insert.run(`bubbleId:${ideId}:x`, '{}')
+    })
+    await makeStore(baseDir, { roots: [[SYSTEM_MSG, PROMPT_MSG, STEP_TWO]] })
+    const transcripts = join(baseDir, 'projects', 'proj', 'agent-transcripts')
+    const line = JSON.stringify({ role: 'user', message: { content: [{ type: 'text', text: '<user_query>hi</user_query>' }] } })
+    await mkdir(join(transcripts, ideId, 'subagents'), { recursive: true })
+    await mkdir(join(transcripts, cliId), { recursive: true })
+    await writeFile(join(transcripts, ideId, `${ideId}.jsonl`), line)
+    await writeFile(join(transcripts, ideId, 'subagents', `${subId}.jsonl`), line)
+    const cliPath = join(transcripts, cliId, `${cliId}.jsonl`)
+    await writeFile(cliPath, line)
+
+    const sources = await createCursorAgentProvider(baseDir, ideDbPath).discoverSessions()
+    expect(sources.map(s => s.path)).toEqual([cliPath])
+    expect(await createCursorAgentProvider(baseDir, join(baseDir, 'missing.vscdb')).discoverSessions()).toHaveLength(4)
+  })
+
+  it('keeps messages Cursor summarized out of the latest root', async () => {
+    const baseDir = await makeBaseDir()
+    const summary = { role: 'user', content: [{ type: 'text', text: '[Previous conversation summary] ...' }] }
+    const secondPrompt = { role: 'user', content: [{ type: 'text', text: '<timestamp>Thursday, Sep 3, 2026, 11:05 PM (UTC-7)</timestamp>\n<user_query>now ship it</user_query>' }] }
+    const shipped = { role: 'assistant', content: [{ type: 'text', text: 'Shipped.' }] }
+    await makeStore(baseDir, {
+      roots: [
+        [SYSTEM_MSG, PROMPT_MSG, STEP_ONE],
+        [SYSTEM_MSG, PROMPT_MSG, STEP_ONE, TOOL_RESULT, STEP_TWO],
+        [SYSTEM_MSG, summary, secondPrompt, shipped],
+      ],
+    })
+
+    const provider = createCursorAgentProvider(baseDir)
+    const calls = await collectCalls(provider, (await provider.discoverSessions())[0]!)
+    expect(calls.map(c => c.userMessage)).toEqual(['fix the build', 'fix the build', 'now ship it'])
+    expect(calls.map(c => c.inputTokens > 0)).toEqual([true, false, true])
+    expect(calls[2]!.timestamp).toBe('2026-09-04T06:05:00.000Z')
+  })
+
+  it('skips a store with malformed meta without leaking it', async () => {
+    const baseDir = await makeBaseDir()
+    await makeStore(baseDir, { roots: [[PROMPT_MSG, STEP_TWO]], meta: 'zz-not-hex-fixture-secret' })
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+
+    const provider = createCursorAgentProvider(baseDir)
+    const calls = await collectCalls(provider, (await provider.discoverSessions())[0]!)
+    const written = stderr.mock.calls.map(c => String(c[0])).join('')
+    stderr.mockRestore()
+
+    expect(calls).toEqual([])
+    expect(written).toContain('unrecognized cursor-agent store')
+    expect(written).not.toContain('fixture-secret')
   })
 })

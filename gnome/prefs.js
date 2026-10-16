@@ -7,6 +7,7 @@ const PROVIDERS = [
   { id: 'claude', label: 'Claude' },
   { id: 'codex', label: 'Codex' },
   { id: 'copilot', label: 'Copilot' },
+  { id: 'amp', label: 'Amp' },
   { id: 'cursor', label: 'Cursor' },
   { id: 'devin', label: 'Devin' },
   { id: 'droid', label: 'Droid' },
@@ -19,7 +20,6 @@ const PROVIDERS = [
   { id: 'opencode', label: 'OpenCode' },
   { id: 'pi', label: 'Pi' },
   { id: 'qwen', label: 'Qwen' },
-  { id: 'roo-code', label: 'Roo Code' },
   { id: 'antigravity', label: 'Antigravity' },
 ];
 
@@ -29,6 +29,11 @@ const PERIODS = [
   { id: '30days', label: '30 Days' },
   { id: 'month', label: 'Month' },
   { id: 'all', label: '6 Months' },
+];
+
+const SCOPES = [
+  { id: 'local', label: 'This device' },
+  { id: 'combined', label: 'All devices' },
 ];
 
 export default class CodeBurnPreferences extends ExtensionPreferences {
@@ -100,6 +105,25 @@ export default class CodeBurnPreferences extends ExtensionPreferences {
         settings.set_string('default-period', PERIODS[idx].id);
     });
     displayGroup.add(periodRow);
+
+    const scopeModel = new Gtk.StringList();
+    for (const scope of SCOPES)
+      scopeModel.append(scope.label);
+
+    const scopeRow = new Adw.ComboRow({
+      title: 'Default Scope',
+      subtitle: 'Show this device or all paired devices when opened',
+      model: scopeModel,
+    });
+    const currentScope = settings.get_string('default-scope');
+    const scopeIndex = SCOPES.findIndex(s => s.id === currentScope);
+    scopeRow.set_selected(scopeIndex >= 0 ? scopeIndex : 0);
+    scopeRow.connect('notify::selected', () => {
+      const idx = scopeRow.get_selected();
+      if (idx >= 0 && idx < SCOPES.length)
+        settings.set_string('default-scope', SCOPES[idx].id);
+    });
+    displayGroup.add(scopeRow);
 
     const alertsGroup = new Adw.PreferencesGroup({
       title: 'Budget Alerts',

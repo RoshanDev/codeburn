@@ -1,12 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises'
+import { mkdtemp, mkdir, readFile, writeFile, rm, utimes } from 'fs/promises'
 import { join, posix, win32 } from 'path'
 import { tmpdir } from 'os'
 import { createRequire } from 'node:module'
 import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { copilot, createCopilotProvider, getVSCodeGlobalStorageDirs, getVSCodeWorkspaceStorageDirs } from '../../src/providers/copilot.js'
+import { ChatCompletionContentPartKind, copilot, createCopilotProvider, findJetBrainsModelToken, getVSCodeGlobalStorageDirs, getVSCodeWorkspaceStorageDirs } from '../../src/providers/copilot.js'
 import { isSqliteAvailable, isSqliteBusyError } from '../../src/sqlite.js'
 import { calculateCost } from '../../src/models.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
@@ -474,6 +474,7 @@ describe('copilot provider - JSONL parsing', () => {
     ])
     const calls = await collectCalls({ path: eventsPath, project: 'test', provider: 'copilot', sourceType: 'jsonl' })
     expect(calls.map(c => c.subagentTypes)).toEqual([['refactor'], ['refactor']])
+    expect(calls.map(c => c.costIsEstimated)).toEqual([undefined, undefined])
   })
 
   it('infers OpenAI auto bucket for transcript toolCallId prefix call_', async () => {
@@ -493,6 +494,8 @@ describe('copilot provider - JSONL parsing', () => {
 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.model).toBe('copilot-openai-auto')
+    // A transcript records no tokens: the $0 is unknown usage, not a measured zero.
+    expect(calls[0]!.costIsEstimated).toBe(true)
     // Each transcript is its own session, keyed by file basename — NOT the
     // shared parent dir name 'transcripts', which would collapse every
     // transcript into one session and one dedup namespace.
@@ -1084,6 +1087,62 @@ describe('copilot provider - chatSessions parsing', () => {
     vi.unstubAllEnvs()
   })
 
+  it('reads request-level input tokens from snapshots, appended requests and patches', async () => {
+    // VS Code serializes usage.promptTokens directly on the request, even
+    // when the extension result has no metadata. Include an input-only row.
+    const filePath = fileURLToPath(new URL('../fixtures/copilot/request-token-journal.jsonl', import.meta.url))
+    const calls = await collectCalls({ path: filePath, project: 'myproject', provider: 'copilot', sourceType: 'chatsession' })
+
+    expect(calls.map(c => [c.inputTokens, c.outputTokens])).toEqual([[12345, 678], [1000, 0]])
+    expect(calls.map(c => c.costUSD)).toEqual([
+      calculateCost('gpt-4o', 12345, 678, 0, 0, 0),
+      calculateCost('gpt-4o', 1000, 0, 0, 0, 0),
+    ])
+  })
+
+  it.each(['json-first', 'journal-first'])('deduplicates root usage across both formats (%s)', async order => {
+    const journalPath = fileURLToPath(new URL('../fixtures/copilot/request-token-journal.jsonl', import.meta.url))
+    const snapshot = JSON.parse((await readFile(journalPath, 'utf8')).split('\n')[0]!).v
+    snapshot.requests.push({ requestId: 'input-only', modelId: 'copilot/gpt-4o', promptTokens: 1000, completionTokens: 0 })
+    const jsonPath = join(tmpDir, 'root-usage.json')
+    await writeFile(jsonPath, JSON.stringify(snapshot))
+    const seen = new Set<string>()
+    const paths = order === 'json-first' ? [jsonPath, journalPath] : [journalPath, jsonPath]
+    const first = await collectCalls({ path: paths[0]!, project: 'p', provider: 'copilot', sourceType: 'chatsession' }, seen)
+    const second = await collectCalls({ path: paths[1]!, project: 'p', provider: 'copilot', sourceType: 'chatsession' }, seen)
+    expect(first.map(c => [c.inputTokens, c.outputTokens])).toEqual([[12345, 678], [1000, 0]])
+    expect(second).toEqual([])
+    expect([...seen]).toEqual(['copilot-chatsession:chat-root-usage:snapshot', 'copilot-chatsession:chat-root-usage:input-only'])
+  })
+
+  it.each([undefined, 0, -5, '500', null])('falls back to root input for invalid or absent metadata (%s)', async metadataInput => {
+    const path = join(tmpDir, 'fallback.jsonl')
+    await createChatSessionFile(path, [{ kind: 0, v: { sessionId: 'fallback', requests: [{
+      requestId: 'r', promptTokens: 1000, completionTokens: 20,
+      modelId: 'copilot/gpt-4o', result: { metadata: { promptTokens: metadataInput } },
+    }] } }])
+    const calls = await collectCalls({ path, project: 'p', provider: 'copilot', sourceType: 'chatsession' })
+    expect(calls.map(c => [c.inputTokens, c.outputTokens])).toEqual([[1000, 20]])
+  })
+
+  it('keeps metadata precedence without summing duplicate token fields', async () => {
+    const path = join(tmpDir, 'precedence.jsonl')
+    await createChatSessionFile(path, [{ kind: 0, v: { sessionId: 'precedence', requests: [{
+      requestId: 'r', promptTokens: 1000, completionTokens: 490, modelId: 'copilot/gpt-4o',
+      result: { metadata: { promptTokens: 500, outputTokens: 60 } },
+    }] } }])
+    const calls = await collectCalls({ path, project: 'p', provider: 'copilot', sourceType: 'chatsession' })
+    expect(calls.map(c => [c.inputTokens, c.outputTokens])).toEqual([[500, 60]])
+  })
+
+  it.each([0, -1, '1000', null])('skips invalid or zero root usage without estimating text (%s)', async promptTokens => {
+    const path = join(tmpDir, 'invalid.jsonl')
+    await createChatSessionFile(path, [{ kind: 0, v: { sessionId: 'invalid', requests: [{
+      requestId: 'r', promptTokens, completionTokens: 0, message: { text: 'No reported usage' },
+    }] } }])
+    expect(await collectCalls({ path, project: 'p', provider: 'copilot', sourceType: 'chatsession' })).toEqual([])
+  })
+
   it('parses sample journal token counts and cost', async () => {
     const filePath = join(tmpDir, 'sample.jsonl')
     await createChatSessionFile(filePath, [
@@ -1410,6 +1469,8 @@ describe('copilot provider - discoverSessions', () => {
   })
 
   it('includes VSCodium workspaceStorage paths on all supported platforms', () => {
+    vi.stubEnv('APPDATA', undefined)
+    vi.stubEnv('XDG_CONFIG_HOME', undefined)
     expect(getVSCodeWorkspaceStorageDirs('/Users/test', 'darwin')).toContain(
       posix.join('/Users/test', 'Library', 'Application Support', 'VSCodium', 'User', 'workspaceStorage'),
     )
@@ -1422,6 +1483,8 @@ describe('copilot provider - discoverSessions', () => {
   })
 
   it('includes VSCodium globalStorage paths on all supported platforms', () => {
+    vi.stubEnv('APPDATA', undefined)
+    vi.stubEnv('XDG_CONFIG_HOME', undefined)
     expect(getVSCodeGlobalStorageDirs('/Users/test', 'darwin')).toContain(
       posix.join('/Users/test', 'Library', 'Application Support', 'VSCodium', 'User', 'globalStorage'),
     )
@@ -2003,6 +2066,157 @@ describe('copilot provider - OTel cache token parsing', () => {
     for (const kw of ['for', 'do', 'done']) {
       expect(bash).not.toContain(kw)
     }
+  })
+})
+
+describe('copilot provider - OTel workspace attribution (#1529)', () => {
+  let tmpDir: string
+  let dbPath: string
+  let wsDir: string
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'copilot-otel-ws-test-'))
+    dbPath = join(tmpDir, 'agent-traces.db')
+    wsDir = join(tmpDir, 'workspaceStorage')
+    vi.stubEnv('CODEBURN_COPILOT_OTEL_DB', dbPath)
+    vi.stubEnv('CODEBURN_COPILOT_DISABLE_OTEL', '')
+  })
+
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true })
+    vi.unstubAllEnvs()
+  })
+
+  async function workspace(hash: string, workspaceJson: object | null, sessionFiles: string[], mtime?: Date): Promise<void> {
+    const dir = join(wsDir, hash, 'chatSessions')
+    await mkdir(dir, { recursive: true })
+    if (workspaceJson) await writeFile(join(wsDir, hash, 'workspace.json'), JSON.stringify(workspaceJson))
+    for (const file of sessionFiles) {
+      const path = join(dir, file)
+      const sessionId = file.replace(/\.jsonl?$/, '')
+      await writeFile(path, JSON.stringify({ kind: 0, v: { version: 3, creationDate: 1780157113020, sessionId, requests: [] } }) + '\n')
+      if (mtime) await utimes(path, mtime, mtime)
+    }
+  }
+
+  function chatSpan(spanId: string, conversationId: string, extra: Record<string, string | number> = {}): void {
+    insertSpan(dbPath, {
+      spanId, traceId: `trace-${spanId}`, operationName: 'chat', startTimeMs: 1780157113020,
+      attrs: {
+        'gen_ai.conversation.id': conversationId,
+        'gen_ai.response.model': 'gpt-4.1',
+        'gen_ai.usage.input_tokens': 1000,
+        'gen_ai.usage.output_tokens': 100,
+        'copilot_chat.repo.head_branch_name': 'main',
+        'copilot_chat.repo.head_commit_hash': 'abc123',
+        ...extra,
+      },
+    })
+  }
+
+  async function projectsBySpan(): Promise<Record<string, string>> {
+    const provider = createCopilotProvider('/nonexistent/jsonl', wsDir, '/nonexistent/global')
+    const sources = await provider.discoverSessions()
+    const otel = sources.filter(s => s.path === dbPath)
+    expect(otel).toHaveLength(1)
+    const out: Record<string, string> = {}
+    for await (const call of provider.createSessionParser(otel[0]!, new Set()).parse()) {
+      out[call.deduplicationKey!.replace('copilot-otel:', '')] = call.project!
+    }
+    return out
+  }
+
+  it('attributes each conversation to the workspace whose chatSessions hold its id', async () => {
+    if (!isSqliteAvailable()) return
+    createOtelDb(dbPath)
+
+    await workspace('h-win', { folder: 'file:///c%3A/Users/dev/wkspace-example' }, ['conv-win.jsonl'])
+    await workspace('h-multi', { workspace: 'file:///home/dev/team%20apps.code-workspace' }, ['conv-multi.jsonl'])
+    await workspace('h-wsl', { folder: 'vscode-remote://wsl%2Bubuntu/home/dev/wsl-app' }, ['conv-wsl.jsonl'])
+    await workspace('h-ssh', { folder: 'vscode-remote://ssh-remote%2Bbox/srv/ssh-app/' }, ['conv-ssh.jsonl'])
+    await workspace('h-untitled', { workspace: 'file:///Users/dev/Library/Application%20Support/Code/Workspaces/1780000000000/workspace.json' }, ['conv-untitled.jsonl'])
+    await workspace('h-nojson', null, ['conv-nojson.jsonl'])
+    await workspace('h-legacy', { folder: 'file:///home/dev/legacy-app' }, ['conv-legacy.json'])
+    await workspace('h-repo', { folder: 'file:///home/dev/checkout-dir' }, ['conv-repo.jsonl'])
+
+    chatSpan('s-win', 'conv-win')
+    chatSpan('s-multi', 'conv-multi')
+    chatSpan('s-wsl', 'conv-wsl')
+    chatSpan('s-ssh', 'conv-ssh')
+    chatSpan('s-untitled', 'conv-untitled')
+    chatSpan('s-nojson', 'conv-nojson')
+    chatSpan('s-legacy', 'conv-legacy')
+    chatSpan('s-unknown', 'conv-unknown')
+    chatSpan('s-repo', 'conv-repo', { 'github.copilot.git.repository': 'org/real-repo' })
+
+    expect(await projectsBySpan()).toEqual({
+      's-win': 'wkspace-example',
+      's-multi': 'team apps',
+      's-wsl': 'wsl-app',
+      's-ssh': 'ssh-app',
+      's-untitled': 'copilot-chat',
+      's-nojson': 'copilot-chat',
+      's-legacy': 'legacy-app',
+      's-unknown': 'copilot-chat',
+      's-repo': 'real-repo',
+    })
+  })
+
+  it('links through copilot_chat.chat_session_id when the conversation id is a request id', async () => {
+    if (!isSqliteAvailable()) return
+    createOtelDb(dbPath)
+    await workspace('h1', { folder: 'file:///home/dev/app-one' }, ['vscode-session-1.jsonl'])
+    // Older Copilot Chat builds set gen_ai.conversation.id on chat spans to the
+    // request id; the VS Code session id rides on copilot_chat.chat_session_id.
+    chatSpan('s-req', 'request-7f3a', { 'copilot_chat.chat_session_id': 'vscode-session-1' })
+    // A subagent's chat span carries its invocation id as chat_session_id and
+    // the owning VS Code session as parent_chat_session_id.
+    chatSpan('s-sub', 'request-9c1d', {
+      'copilot_chat.chat_session_id': 'subagent-invocation-1',
+      'copilot_chat.parent_chat_session_id': 'vscode-session-1',
+    })
+
+    expect(await projectsBySpan()).toEqual({ 's-req': 'app-one', 's-sub': 'app-one' })
+  })
+
+  it('picks the most recently written copy when one conversation is in two workspaces', async () => {
+    if (!isSqliteAvailable()) return
+    createOtelDb(dbPath)
+    await workspace('h-old', { folder: 'file:///home/dev/old-name' }, ['conv-moved.jsonl'], new Date('2026-09-01T00:00:00Z'))
+    await workspace('h-new', { folder: 'file:///home/dev/new-name' }, ['conv-moved.jsonl'], new Date('2026-09-20T00:00:00Z'))
+    chatSpan('s-moved', 'conv-moved')
+
+    expect(await projectsBySpan()).toEqual({ 's-moved': 'new-name' })
+  })
+
+  it('changes only the project, never the tokens or cost', async () => {
+    if (!isSqliteAvailable()) return
+    createOtelDb(dbPath)
+    chatSpan('s-a', 'conv-a')
+    chatSpan('s-b', 'conv-b', { 'gen_ai.usage.cache_read.input_tokens': 5000 })
+
+    const parse = async (dir: string) => {
+      const provider = createCopilotProvider('/nonexistent/jsonl', dir, '/nonexistent/global')
+      const [source] = (await provider.discoverSessions()).filter(s => s.path === dbPath)
+      const calls: ParsedProviderCall[] = []
+      for await (const call of provider.createSessionParser(source!, new Set()).parse()) calls.push(call)
+      return calls.sort((x, y) => x.deduplicationKey!.localeCompare(y.deduplicationKey!))
+    }
+    const before = await parse('/nonexistent/ws')
+    await workspace('h-a', { folder: 'file:///home/dev/proj-a' }, ['conv-a.jsonl'])
+    const after = await parse(wsDir)
+
+    expect(before.map(c => c.project)).toEqual(['copilot-chat', 'copilot-chat'])
+    expect(after.map(c => c.project)).toEqual(['proj-a', 'copilot-chat'])
+    expect(after.map(c => ({ ...c, project: '' }))).toEqual(before.map(c => ({ ...c, project: '' })))
+  })
+
+  it('names a multi-root workspace after its .code-workspace file for chatSessions too', async () => {
+    await workspace('h-multi', { workspace: 'file:///home/dev/team.code-workspace' }, ['chat-multi-root.jsonl'])
+    vi.stubEnv('CODEBURN_COPILOT_DISABLE_OTEL', '1')
+    const provider = createCopilotProvider('/nonexistent/jsonl', wsDir, '/nonexistent/global')
+    const sources = await provider.discoverSessions()
+    expect(sources.filter(s => s.path.includes('chat-multi-root')).map(s => s.project)).toEqual(['team'])
   })
 })
 
@@ -3418,6 +3632,672 @@ describe('copilot provider - JetBrains dedup key stability across store rewrites
   })
 })
 
+describe('copilot provider - legacy JSON format', () => {
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), 'copilot-legacy-'))
+  })
+  afterEach(async () => {
+    await rm(tmpDir, { recursive: true, force: true })
+  })
+
+  it('parses legacy JSON session with string message and markdownContent response', async () => {
+    const session = {
+      sessionId: 'sess-json-001',
+      creationDate: 1718000000000,
+      requests: [
+        {
+          requestId: 'req-1',
+          message: 'explain quantum physics',
+          modelId: 'copilot/gpt-4o',
+          response: [
+            {
+              kind: 'markdownContent',
+              content: { value: 'Quantum physics is...' }
+            }
+          ]
+        }
+      ]
+    }
+
+    const filePath = join(tmpDir, 'session-1.json')
+    await writeFile(filePath, JSON.stringify(session))
+
+    const source = { path: filePath, project: 'test-project', provider: 'copilot', sourceType: 'chatsession' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.provider).toBe('copilot')
+    expect(calls[0]!.model).toBe('gpt-4o')
+    expect(calls[0]!.userMessage).toBe('explain quantum physics')
+    expect(calls[0]!.inputTokens).toBeGreaterThan(0)
+    expect(calls[0]!.outputTokens).toBeGreaterThan(0)
+  })
+
+  it('strips the older github.copilot-chat/ namespace so the model prices', async () => {
+    const session = {
+      sessionId: 'sess-json-ghcc',
+      creationDate: 1718000000000,
+      requests: [
+        {
+          requestId: 'req-1',
+          message: 'hi',
+          modelId: 'github.copilot-chat/claude-sonnet-4',
+          response: [{ kind: 'markdownContent', content: { value: 'hello there' } }]
+        }
+      ]
+    }
+
+    const filePath = join(tmpDir, 'session-ghcc.json')
+    await writeFile(filePath, JSON.stringify(session))
+
+    const source = { path: filePath, project: 'test-project', provider: 'copilot', sourceType: 'chatsession' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.model).toBe('claude-sonnet-4')
+  })
+
+  it('infers model when modelId is missing on the request', async () => {
+    const session = {
+      requests: [
+        {
+          requestId: 'req-1',
+          message: 'hello',
+          response: [
+            {
+              kind: 'toolInvocationSerialized',
+              toolCallId: 'tooluse_abc123',
+              toolId: 'read_file'
+            }
+          ]
+        }
+      ]
+    }
+
+    const filePath = join(tmpDir, 'session-2.json')
+    await writeFile(filePath, JSON.stringify(session))
+
+    const source = { path: filePath, project: 'test-project', provider: 'copilot', sourceType: 'chatsession' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.model).toBe('copilot-anthropic-auto')
+  })
+
+  it('extracts thinking/reasoning text and reasoning tokens', async () => {
+    const session = {
+      requests: [
+        {
+          requestId: 'req-1',
+          message: 'solve this',
+          modelId: 'copilot/claude-sonnet-4.5',
+          response: [
+            {
+              kind: 'thinking',
+              value: 'Let me analyze the problem step by step.'
+            },
+            {
+              kind: 'markdownContent',
+              content: { value: 'The solution is 42.' }
+            }
+          ]
+        }
+      ]
+    }
+
+    const filePath = join(tmpDir, 'session-3.json')
+    await writeFile(filePath, JSON.stringify(session))
+
+    const source = { path: filePath, project: 'test-project', provider: 'copilot', sourceType: 'chatsession' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.reasoningTokens).toBeGreaterThan(0)
+    expect(calls[0]!.outputTokens).toBeGreaterThan(0)
+  })
+
+  it('extracts tool result content from serialized tool invocations', async () => {
+    const base64Data = Buffer.from('simulated file read content', 'utf8').toString('base64')
+    const session = {
+      requests: [
+        {
+          requestId: 'req-1',
+          message: 'read file',
+          modelId: 'copilot/gpt-4o',
+          response: [
+            {
+              kind: 'toolInvocationSerialized',
+              toolId: 'read_file',
+              resultDetails: {
+                output: {
+                  type: 'data',
+                  mimeType: 'text/plain',
+                  base64Data: base64Data
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+
+    const filePath = join(tmpDir, 'session-4.json')
+    await writeFile(filePath, JSON.stringify(session))
+
+    const source = { path: filePath, project: 'test-project', provider: 'copilot', sourceType: 'chatsession' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    // inputTokens should include the message + decoded base64 tool result (approx 7 + 7 tokens)
+    expect(calls[0]!.inputTokens).toBe(10)
+  })
+
+  it('uses exact root token properties when present', async () => {
+    const session = {
+      requests: [
+        {
+          requestId: 'req-1',
+          message: 'hello',
+          modelId: 'copilot/gpt-4o',
+          promptTokens: 100,
+          completionTokens: 200
+        }
+      ]
+    }
+
+    const filePath = join(tmpDir, 'session-5.json')
+    await writeFile(filePath, JSON.stringify(session))
+
+    const source = { path: filePath, project: 'test-project', provider: 'copilot', sourceType: 'chatsession' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of copilot.createSessionParser(source, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.inputTokens).toBe(100)
+    expect(calls[0]!.outputTokens).toBe(200)
+    expect(calls[0]!.costIsEstimated).toBe(false)
+  })
+
+  it('bills reasoning tokens at output price instead of web search requests ($0.01/search)', async () => {
+    // 8,000 chars of thinking is 2,000 reasoning tokens.
+    // At $0.01/search (web search price), 2,000 would bill $20.
+    // At claude-sonnet-4.6 output price ($15/MTok), 2,000 tokens is ~$0.03.
+    const session = {
+      sessionId: 'sess-reasoning-001',
+      requests: [
+        {
+          requestId: 'req-reasoning',
+          message: 'Solve a hard math problem',
+          modelId: 'copilot/claude-sonnet-4.6',
+          response: [
+            {
+              kind: 'thinking',
+              value: 'A'.repeat(8000),
+            },
+            {
+              kind: 'markdownContent',
+              content: { value: 'Result is 42.' },
+            },
+          ],
+        },
+      ],
+    }
+
+    const filePath = join(tmpDir, 'reasoning.json')
+    await writeFile(filePath, JSON.stringify(session))
+
+    const source = { path: filePath, project: 'test-project', provider: 'copilot', sourceType: 'chatsession' }
+    const calls = await collectCalls(source)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.model).toBe('claude-sonnet-4.6')
+    expect(calls[0]!.reasoningTokens).toBe(2001)
+    // Cost must be ~0.03, definitely NOT >= $1 (which would happen if billed as web search)
+    expect(calls[0]!.costUSD).toBeLessThan(0.1)
+    expect(calls[0]!.costUSD).toBeGreaterThan(0.02)
+  })
+
+  it('extracts split tokens in .jsonl (metadata.promptTokens + root completionTokens) and skips 0-token rows', async () => {
+    const filePath = join(tmpDir, 'split-tokens.jsonl')
+    await createChatSessionFile(filePath, [
+      {
+        kind: 0,
+        v: {
+          version: 3,
+          creationDate: 1780157113020,
+          sessionId: 'chat-split-tokens',
+          requests: [],
+        },
+      },
+      {
+        kind: 2,
+        k: ['requests'],
+        v: [
+          // Row 1: Real-data shape with promptTokens in metadata and completionTokens at root (no metadata.outputTokens)
+          {
+            requestId: 'req-split-1',
+            modelId: 'copilot/claude-sonnet-4.6',
+            completionTokens: 490,
+            result: {
+              metadata: {
+                promptTokens: 32543,
+                resolvedModel: 'claude-sonnet-4-6',
+              },
+            },
+          },
+          // Row 2: No token fields at all; must be skipped in .jsonl (never char-estimated)
+          {
+            requestId: 'req-empty-tokens',
+            modelId: 'copilot/claude-sonnet-4.6',
+            message: 'A message with no tokens recorded',
+            response: [{ kind: 'markdownContent', content: { value: 'Some output text' } }],
+          },
+          // Row 3: Zero tokens; must be skipped in .jsonl
+          {
+            requestId: 'req-zero-tokens',
+            modelId: 'copilot/claude-sonnet-4.6',
+            promptTokens: 0,
+            completionTokens: 0,
+          },
+          // Row 4: metadata.outputTokens is 0, must fall back to root completionTokens (250)
+          {
+            requestId: 'req-split-2',
+            modelId: 'copilot/claude-sonnet-4.6',
+            completionTokens: 250,
+            result: {
+              metadata: {
+                promptTokens: 500,
+                outputTokens: 0,
+                resolvedModel: 'claude-sonnet-4-6',
+              },
+            },
+          },
+        ],
+      },
+    ])
+
+    const calls = await collectCalls({ path: filePath, project: 'myproject', provider: 'copilot', sourceType: 'chatsession' })
+
+    expect(calls).toHaveLength(2)
+    expect(calls[0]!.inputTokens).toBe(32543)
+    expect(calls[0]!.outputTokens).toBe(490)
+    expect(calls[0]!.costUSD).toBe(calculateCost('claude-sonnet-4-6', 32543, 490, 0, 0, 0))
+
+    expect(calls[1]!.inputTokens).toBe(500)
+    expect(calls[1]!.outputTokens).toBe(250)
+    expect(calls[1]!.costUSD).toBe(calculateCost('claude-sonnet-4-6', 500, 250, 0, 0, 0))
+  })
+
+  const roundWithThinking = {
+    summary: 'Reading the file',
+    phase: 'execute',
+    response: 'done',
+    toolCalls: [{ name: 'read_file', id: 'call_9f3a2b7c1d', arguments: '{}' }],
+    thinking: { id: 'think-1', text: 'x'.repeat(8000) },
+  }
+
+  it('keeps .jsonl tools, cost and userMessage identical to main when thinking and round metadata are present', async () => {
+    const filePath = join(tmpDir, 'jsonl-parity.jsonl')
+    await createChatSessionFile(filePath, [
+      {
+        kind: 0,
+        v: {
+          version: 3,
+          creationDate: 1780157113020,
+          sessionId: 'chat-jsonl-parity',
+          requests: [
+            {
+              requestId: 'req-parity',
+              modelId: 'copilot/claude-sonnet-4.6',
+              message: { text: 'y'.repeat(800), parts: [] },
+              result: {
+                metadata: {
+                  promptTokens: 32543,
+                  outputTokens: 60,
+                  resolvedModel: 'claude-sonnet-4-6',
+                  toolCallRounds: [roundWithThinking],
+                },
+              },
+            },
+          ],
+        },
+      },
+    ])
+
+    const calls = await collectCalls({ path: filePath, project: 'myproject', provider: 'copilot', sourceType: 'chatsession' })
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.tools).toEqual(['Read'])
+    expect(calls[0]!.reasoningTokens).toBe(0)
+    expect(calls[0]!.costUSD).toBe(calculateCost('claude-sonnet-4-6', 32543, 60, 0, 0, 0))
+    expect(calls[0]!.userMessage).toBe('y'.repeat(800))
+  })
+
+  it('does not treat round summary, phase or tool call ids as tool names in legacy .json', async () => {
+    const session = {
+      sessionId: 'sess-json-tools',
+      requests: [
+        {
+          requestId: 'req-1',
+          modelId: 'copilot/claude-sonnet-4.6',
+          message: 'read it',
+          promptTokens: 32543,
+          completionTokens: 60,
+          result: { metadata: { toolCallRounds: [roundWithThinking] } },
+        },
+      ],
+    }
+    const filePath = join(tmpDir, 'session-tools.json')
+    await writeFile(filePath, JSON.stringify(session))
+
+    const calls = await collectCalls({ path: filePath, project: 'test-project', provider: 'copilot', sourceType: 'chatsession' })
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.tools).toEqual(['Read'])
+    expect(calls[0]!.reasoningTokens).toBe(0)
+    expect(calls[0]!.costIsEstimated).toBe(false)
+    expect(calls[0]!.costUSD).toBe(calculateCost('claude-sonnet-4-6', 32543, 60, 0, 0, 0))
+  })
+
+  it('preserves dotted model IDs without replacing dots with dashes', async () => {
+    const session = {
+      sessionId: 'sess-dotted-models',
+      requests: [
+        {
+          requestId: 'req-gemini',
+          modelId: 'copilot/gemini-2.0-flash-001',
+          promptTokens: 1000,
+          completionTokens: 1000,
+        },
+        {
+          requestId: 'req-gpt45',
+          modelId: 'copilot/gpt-4.5-preview',
+          promptTokens: 1000,
+          completionTokens: 1000,
+        },
+        {
+          requestId: 'req-gpt53',
+          modelId: 'copilot/gpt-5.3-codex-spark',
+          promptTokens: 1000,
+          completionTokens: 1000,
+        },
+      ],
+    }
+
+    const filePath = join(tmpDir, 'dotted-models.json')
+    await writeFile(filePath, JSON.stringify(session))
+
+    const calls = await collectCalls({ path: filePath, project: 'myproject', provider: 'copilot', sourceType: 'chatsession' })
+
+    expect(calls).toHaveLength(3)
+    expect(calls[0]!.model).toBe('gemini-2.0-flash-001')
+    expect(calls[0]!.costUSD).toBeGreaterThan(0)
+
+    expect(calls[1]!.model).toBe('gpt-4.5-preview')
+    expect(calls[1]!.costUSD).toBeGreaterThan(0)
+
+    expect(calls[2]!.model).toBe('gpt-5.3-codex-spark')
+    expect(calls[2]!.costUSD).toBeGreaterThan(0)
+  })
+
+  it('defaults unresolvable model to unknown with $0 cost', async () => {
+    const session = {
+      sessionId: 'sess-unresolvable',
+      requests: [
+        {
+          requestId: 'req-unresolvable',
+          message: 'Hello mystery model',
+          response: [
+            {
+              kind: 'markdownContent',
+              content: { value: 'Mystery response' },
+            },
+          ],
+        },
+      ],
+    }
+
+    const filePath = join(tmpDir, 'unresolvable.json')
+    await writeFile(filePath, JSON.stringify(session))
+
+    const calls = await collectCalls({ path: filePath, project: 'myproject', provider: 'copilot', sourceType: 'chatsession' })
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.model).toBe('unknown')
+    expect(calls[0]!.costUSD).toBe(0)
+  })
+
+  it('suppresses transcripts when workspace has only legacy .json chatSessions', async () => {
+    const wsDir = join(tmpDir, 'vscode-ws-legacy-json')
+    const hashDir = join(wsDir, 'hash-json-only')
+    const chatSessionsDir = join(hashDir, 'chatSessions')
+    const transcriptsDir = join(hashDir, 'GitHub.copilot-chat', 'transcripts')
+    await mkdir(chatSessionsDir, { recursive: true })
+    await mkdir(transcriptsDir, { recursive: true })
+    await writeFile(join(hashDir, 'workspace.json'), JSON.stringify({ folder: 'file:///home/user/legacyapp' }))
+
+    const session = {
+      sessionId: 'sess-json-suppress',
+      requests: [
+        {
+          requestId: 'req-1',
+          message: 'test',
+          modelId: 'copilot/gpt-4o',
+          promptTokens: 50,
+          completionTokens: 50,
+        },
+      ],
+    }
+    await writeFile(join(chatSessionsDir, 'chat.json'), JSON.stringify(session))
+    await writeFile(join(transcriptsDir, 'transcript.jsonl'), transcriptSessionStart('trans-1') + '\n')
+
+    const provider = createCopilotProvider('/nonexistent/legacy', wsDir, '/nonexistent/global')
+    const sessions = await provider.discoverSessions()
+
+    // Must discover only the chatSessions source and suppress the transcript
+    expect(sessions).toHaveLength(1)
+    expect((sessions[0] as { sourceType?: string }).sourceType).toBe('chatsession')
+    expect(sessions[0]!.path).toContain('chat.json')
+  })
+
+  it('deduplicates between .json and .jsonl when sharing sessionId and requestId', async () => {
+    const sessionId = 'shared-session-guid-123'
+    const requestId = 'req-shared-456'
+
+    const jsonSession = {
+      sessionId,
+      requests: [
+        {
+          requestId,
+          message: 'hello from json',
+          modelId: 'copilot/gpt-4o',
+          promptTokens: 100,
+          completionTokens: 200,
+        },
+      ],
+    }
+    const jsonPath = join(tmpDir, 'session.json')
+    await writeFile(jsonPath, JSON.stringify(jsonSession))
+
+    const jsonlPath = join(tmpDir, 'session.jsonl')
+    await createChatSessionFile(jsonlPath, [
+      {
+        kind: 0,
+        v: {
+          version: 3,
+          creationDate: 1780157113020,
+          sessionId,
+          requests: [],
+        },
+      },
+      {
+        kind: 2,
+        k: ['requests'],
+        v: [
+          {
+            requestId,
+            modelId: 'copilot/gpt-4o',
+            promptTokens: 100,
+            completionTokens: 200,
+          },
+        ],
+      },
+    ])
+
+    const seenKeys = new Set<string>()
+    const callsJson = await collectCalls({ path: jsonPath, project: 'proj', provider: 'copilot', sourceType: 'chatsession' }, seenKeys)
+    const callsJsonl = await collectCalls({ path: jsonlPath, project: 'proj', provider: 'copilot', sourceType: 'chatsession' }, seenKeys)
+
+    expect(callsJson).toHaveLength(1)
+    expect(callsJsonl).toHaveLength(0) // Second parse is deduplicated against seenKeys
+    expect(seenKeys.has(`copilot-chatsession:${sessionId}:${requestId}`)).toBe(true)
+  })
+
+  it('estimates cacheCreation and cacheRead tokens from renderedGlobalContext and renderedUserMessage with CacheBreakpoint and toolCallRounds', async () => {
+    const session = {
+      sessionId: 'sess-rendered-cache',
+      requests: [
+        {
+          requestId: 'req-cache',
+          message: 'Find bugs in the code',
+          modelId: 'copilot/gpt-4o',
+          result: {
+            metadata: {
+              renderedGlobalContext: [
+                {
+                  type: ChatCompletionContentPartKind.Text,
+                  text: 'Global system prompt: you are an AI programming assistant with extensive context.\n'.repeat(10),
+                },
+                {
+                  type: ChatCompletionContentPartKind.CacheBreakpoint,
+                },
+              ],
+              renderedUserMessage: [
+                {
+                  type: ChatCompletionContentPartKind.Text,
+                  text: 'Find bugs in the code\nAdditional context and file attachments here.\n'.repeat(10),
+                },
+                {
+                  type: ChatCompletionContentPartKind.CacheBreakpoint,
+                },
+              ],
+              toolCallRounds: [
+                {
+                  summary: 'Search for references',
+                  phase: 'Executing',
+                  toolCalls: [{ id: 'call_grep_1', name: 'grep_search' }],
+                  thinking: { tokens: 120 },
+                },
+              ],
+            },
+          },
+          response: [
+            {
+              kind: 'markdownContent',
+              content: { value: 'No bugs found in the code.' },
+            },
+          ],
+        },
+      ],
+    }
+
+    const filePath = join(tmpDir, 'rendered-cache.json')
+    await writeFile(filePath, JSON.stringify(session))
+
+    const calls = await collectCalls({ path: filePath, project: 'test-project', provider: 'copilot', sourceType: 'chatsession' })
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.costIsEstimated).toBe(true)
+    expect(calls[0]!.cacheReadInputTokens).toBeGreaterThan(0)
+    expect(calls[0]!.cacheCreationInputTokens).toBeGreaterThan(0)
+    expect(calls[0]!.reasoningTokens).toBe(120)
+    expect(calls[0]!.tools).toContain('Search')
+  })
+
+  it('does not count a binary tool output (screenshot) as input text', async () => {
+    const png = Buffer.alloc(200_000, 137).toString('base64')
+    const session = {
+      sessionId: 'sess-image',
+      requests: [
+        {
+          requestId: 'req-1',
+          message: 'screenshot',
+          modelId: 'copilot/claude-sonnet-4.5',
+          response: [
+            { kind: 'toolInvocationSerialized', toolId: 'browser_screenshot', resultDetails: { output: { type: 'data', mimeType: 'image/png', base64Data: png } } },
+            { kind: 'markdownContent', content: { value: 'Here is the page.' } },
+          ],
+        },
+      ],
+    }
+    const filePath = join(tmpDir, 'image.json')
+    await writeFile(filePath, JSON.stringify(session))
+
+    const calls = await collectCalls({ path: filePath, project: 'test-project', provider: 'copilot', sourceType: 'chatsession' })
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.inputTokens).toBe(3)
+    expect(calls[0]!.costUSD).toBeLessThan(0.001)
+  })
+
+  it('uses the recorded thinking token count over the char estimate, summed per round', async () => {
+    const session = {
+      sessionId: 'sess-thinking-tokens',
+      requests: [
+        {
+          requestId: 'req-1',
+          message: 'hi',
+          modelId: 'copilot/claude-sonnet-4.5',
+          result: {
+            metadata: {
+              toolCallRounds: [
+                { response: 'ok', toolCalls: [], thinking: { text: 'x'.repeat(4000), tokens: 300 } },
+                { response: 'done', toolCalls: [], thinking: { text: 'y'.repeat(4000), tokens: 200 } },
+                { response: 'end', toolCalls: [], thinking: { text: 'z'.repeat(400) } },
+              ],
+            },
+          },
+        },
+      ],
+    }
+    const filePath = join(tmpDir, 'thinking-tokens.json')
+    await writeFile(filePath, JSON.stringify(session))
+
+    const calls = await collectCalls({ path: filePath, project: 'test-project', provider: 'copilot', sourceType: 'chatsession' })
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.reasoningTokens).toBe(300 + 200 + 101)
+  })
+
+  it('prices the Copilot spellings of the pre-2026 Claude SKUs', async () => {
+    const session = {
+      sessionId: 'sess-legacy-claude',
+      requests: [
+        { requestId: 'r35', modelId: 'copilot/claude-3.5-sonnet', promptTokens: 1_000_000, completionTokens: 0 },
+        { requestId: 'r37', modelId: 'copilot/claude-3.7-sonnet', promptTokens: 1_000_000, completionTokens: 0 },
+        { requestId: 'r37t', modelId: 'copilot/claude-3.7-sonnet-thought', promptTokens: 1_000_000, completionTokens: 0 },
+        { requestId: 'r41', modelId: 'copilot/claude-opus-4.1', promptTokens: 1_000_000, completionTokens: 0 },
+      ],
+    }
+    const filePath = join(tmpDir, 'legacy-claude.json')
+    await writeFile(filePath, JSON.stringify(session))
+
+    const calls = await collectCalls({ path: filePath, project: 'test-project', provider: 'copilot', sourceType: 'chatsession' })
+
+    expect(calls.map(c => [c.model, c.costUSD])).toEqual([
+      ['claude-3.5-sonnet', calculateCost('claude-3-5-sonnet', 1_000_000, 0, 0, 0, 0)],
+      ['claude-3.7-sonnet', calculateCost('claude-3-7-sonnet', 1_000_000, 0, 0, 0, 0)],
+      ['claude-3.7-sonnet-thought', calculateCost('claude-3-7-sonnet', 1_000_000, 0, 0, 0, 0)],
+      ['claude-opus-4.1', calculateCost('claude-opus-4-1', 1_000_000, 0, 0, 0, 0)],
+    ])
+    for (const c of calls) expect(c.costUSD).toBeGreaterThan(0)
+  })
+})
 // ═══════════════════════════════════════════════════════════════════════════
 // Dedup-key shapes are a CACHE contract, not an implementation detail
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3497,5 +4377,49 @@ describe('copilot deduplication key prefixes (durable-union contract)', () => {
     // position renames under insertion, and a renamed key double-counts at a
     // receiver that was already sent the old name.
     expect(/:shutdown-residual:[^:]+:\d{13}$/.test(residual)).toBe(true)
+  })
+})
+
+describe('copilot provider - JetBrains model token scan', () => {
+  // #1530: a token must not capture a newer version — `gpt-5` is not
+  // `gpt-5.7-terra`, nor `claude-opus-4` `claude-opus-4.9`. A dot only counts
+  // as a version continuation when a digit follows it; an end-of-sentence
+  // period or a file extension stays a token boundary.
+  it('does not match a token inside a newer dotted version', () => {
+    expect(findJetBrainsModelToken('running on gpt-5.7-terra for coding')).toBe('')
+    expect(findJetBrainsModelToken('switched to claude-opus-4.9 today')).toBe('')
+    expect(findJetBrainsModelToken('gpt-5.4.1 beta')).toBe('')
+  })
+
+  // The ids JetBrains writes today must match their own token, not fall
+  // through to the anthropic-auto bucket (#1531 review).
+  it('recognises the current dotted ids, longest first', () => {
+    expect(findJetBrainsModelToken('"model":"gpt-5.5"')).toBe('gpt-5.5')
+    expect(findJetBrainsModelToken('running on gpt-5.6-luna for coding')).toBe('gpt-5.6-luna')
+    expect(findJetBrainsModelToken('running on gpt-5.6-terra for coding')).toBe('gpt-5.6-terra')
+    expect(findJetBrainsModelToken('"model":"gpt-5.6"')).toBe('gpt-5.6')
+    expect(findJetBrainsModelToken('gpt-5.4-mini beta')).toBe('gpt-5.4-mini')
+    expect(findJetBrainsModelToken('switched to claude-opus-4.8 today')).toBe('claude-opus-4-8')
+    expect(findJetBrainsModelToken('switched to claude-opus-4.7 today')).toBe('claude-opus-4-7')
+    expect(findJetBrainsModelToken('switched to claude-opus-4.6 today')).toBe('claude-opus-4-6')
+    expect(findJetBrainsModelToken('switched to claude-sonnet-4.6 today')).toBe('claude-sonnet-4-6')
+    expect(findJetBrainsModelToken('switched to claude-haiku-4.5 today')).toBe('claude-haiku-4-5')
+  })
+
+  it('prices a JetBrains claude-opus-4.7 chunk at the Opus 4.7 rate', () => {
+    const model = findJetBrainsModelToken('"model":"claude-opus-4.7"')
+    expect(model).toBe('claude-opus-4-7')
+    expect(calculateCost(model, 1_000_000, 1_000_000, 0, 0, 0)).toBeCloseTo(30, 6)
+  })
+
+  it('still matches tokens followed by sentence punctuation or file extensions', () => {
+    expect(findJetBrainsModelToken('switched to gpt-5. thanks')).toBe('gpt-5')
+    expect(findJetBrainsModelToken('see configs/gpt-5.json for details')).toBe('gpt-5')
+    expect(findJetBrainsModelToken('running on claude-opus-4.5.')).toBe('claude-opus-4-5')
+    expect(findJetBrainsModelToken('"model":"gpt-5"')).toBe('gpt-5')
+  })
+
+  it('does not match inside words', () => {
+    expect(findJetBrainsModelToken('iso3166 codes')).toBe('')
   })
 })

@@ -7,6 +7,7 @@ import { basename, join } from 'path'
 import { homedir } from 'os'
 
 import { isReadShapedBashCommand } from './bash-utils.js'
+import { EDIT_TOOLS } from './classifier.js'
 import { readSessionLines, readSessionFileSync } from './fs-utils.js'
 import { discoverAllSessions, providerDisplayName } from './providers/index.js'
 import { parseJsonlLine, shouldSkipLine } from './parser.js'
@@ -16,7 +17,7 @@ import { formatTokens } from './format.js'
 import { recommendModelDefault, type ModelDefaultRecommendation } from './act/model-defaults.js'
 import { appliedFixGlyph, formatAppliedFix, type AppliedFix } from './act/types.js'
 import { isUserStartedSession, userStartedProjects } from './session-population.js'
-import { sessionBillableOutputTokens } from './session-output.js'
+import { countSessions, inferSessionProvider, sessionBillableOutputTokens } from './session-output.js'
 import { aggregateFileChurn, buildCoachingNotes, scanUserCorrections, medianTimeToFirstEditMs, worstOneShotCategory, type ReworkedFile } from './workflow-insights.js'
 
 // ============================================================================
@@ -36,6 +37,9 @@ const RED = '#F55B5B'
 
 export const AVG_TOKENS_PER_READ = 600
 export const TOKENS_PER_MCP_TOOL = 400
+// A deferred MCP tool sits in the prompt as its name line only (measured
+// median 32 chars), not its schema.
+export const TOKENS_PER_DEFERRED_MCP_TOOL = 9
 export const TOOLS_PER_MCP_SERVER = 5
 export const TOKENS_PER_AGENT_DEF = 80
 export const TOKENS_PER_SKILL_DEF = 80
@@ -108,6 +112,10 @@ const CONTEXT_BLOAT_HIGH_MIN_CANDIDATES = 10
 const CONTEXT_BLOAT_GROWTH_RATIO = 2
 const CONTEXT_BLOAT_GROWTH_MAX_GAP_MS = 7 * 24 * 60 * 60 * 1000
 const CONTEXT_BLOAT_RATIO_DISPLAY_CAP = 1000
+const LOW_CACHE_HIT_TARGET_PERCENT = 80
+const LOW_CACHE_HIT_MIN_INPUT_TOKENS = CONTEXT_BLOAT_MIN_INPUT_TOKENS
+const LOW_CACHE_HIT_MIN_CALLS = 5
+const LOW_CACHE_HIT_PREVIEW = 5
 const WORTH_IT_MIN_COST_USD = 2
 const WORTH_IT_NO_EDIT_MIN_COST_USD = 3
 // A zero-edit session's full cost is an upper bound on recoverable waste, not
@@ -357,6 +365,7 @@ export type FindingId =
   | 'low-worth-sessions'
   | 'context-heavy-sessions'
   | 'cost-outliers'
+  | 'low-cache-hit-sessions'
   | 'claude-md-too-long'
   | 'bash-output-cap'
   | 'unused-agents'
@@ -395,6 +404,7 @@ export const FINDING_CLASS: Record<FindingId, FindingClass> = {
   'low-worth-sessions': 'nudge',
   'context-heavy-sessions': 'keep',  // context-heavy work is often load-bearing
   'cost-outliers': 'nudge',
+  'low-cache-hit-sessions': 'nudge',
   'claude-md-too-long': 'nudge',     // trimming is a judgement call, not a rule block
   'bash-output-cap': 'fix',
   'unused-agents': 'fix',
@@ -435,6 +445,7 @@ export const FINDING_BASIS: Record<FindingId, FindingBasis> = {
   'low-worth-sessions': 'estimated',       // real session tokens x recovery fraction
   'context-heavy-sessions': 'measured',    // counted input/cache tokens above the target ratio
   'cost-outliers': 'measured',             // counted session tokens above the peer average
+  'low-cache-hit-sessions': 'estimated',   // counted tokens below the target hit ratio x read discount
   'claude-md-too-long': 'estimated',       // lines x CLAUDEMD_TOKENS_PER_LINE
   'bash-output-cap': 'estimated',          // chars x BASH_TOKENS_PER_CHAR
   'unused-agents': 'estimated',            // count x TOKENS_PER_AGENT_DEF
@@ -1779,7 +1790,7 @@ function estimateMcpSchemaCostAttributed(
         const toolCount = typeof unused === 'number'
           ? Math.min(unused, inventoryCounts.get(server) ?? 0)
           : [...new Set(unused ?? [])].reduce((count, fqn) => count + (inventory.has(fqn) ? 1 : 0), 0)
-        if (toolCount > 0) loaded.push({ server, schemaTokens: toolCount * TOKENS_PER_MCP_TOOL })
+        if (toolCount > 0) loaded.push({ server, schemaTokens: toolCount * TOKENS_PER_DEFERRED_MCP_TOOL })
       }
       if (loaded.length === 0) continue
 
@@ -1789,8 +1800,10 @@ function estimateMcpSchemaCostAttributed(
           // call. Charge it once, then attribute the capped amount in
           // proportion to each server's unused schema. This conserves the
           // combined total and makes any local-only subset additive.
-          addBucket(loaded, call.usage.cacheCreationInputTokens, 'cacheWriteTokens')
-          addBucket(loaded, call.usage.cacheReadInputTokens, 'cacheReadTokens')
+          // The tool lines sit in the prefix: a call that read cache read
+          // them; only a call with no cache read wrote them.
+          if (call.usage.cacheReadInputTokens > 0) addBucket(loaded, call.usage.cacheReadInputTokens, 'cacheReadTokens')
+          else addBucket(loaded, call.usage.cacheCreationInputTokens, 'cacheWriteTokens')
         }
       }
     }
@@ -1945,7 +1958,7 @@ export function detectMcpToolCoverage(
     id: 'mcp-low-coverage',
     title: `${flagged.length} MCP server${flagged.length === 1 ? '' : 's'} with low tool coverage`,
     explanation:
-      `Schema for unused tools is loaded into the system prompt every session and ` +
+      `Each unused tool adds a deferred name line to every session's prompt, ` +
       `carried in the cached prefix on every turn. ` +
       `${lines.join('; ')}.${connectorGuidance}${ambiguousGuidance}`,
     impact,
@@ -2030,17 +2043,16 @@ function estimateMcpProfileColdSchemaCost(
       for (const [server, toolsAvailable] of serverToolCounts) {
         if (!coldProjectKeysByServer.get(server)?.has(projectKey)) continue
         if (!sessionLoadedMcpServer(session, server)) continue
-        schemaTokens += toolsAvailable * TOKENS_PER_MCP_TOOL
+        schemaTokens += toolsAvailable * TOKENS_PER_DEFERRED_MCP_TOOL
       }
       if (schemaTokens === 0) continue
 
       for (const turn of session.turns) {
         for (const call of turn.assistantCalls) {
-          if (call.usage.cacheCreationInputTokens > 0) {
-            cacheWriteTokens += Math.min(schemaTokens, call.usage.cacheCreationInputTokens)
-          }
           if (call.usage.cacheReadInputTokens > 0) {
             cacheReadTokens += Math.min(schemaTokens, call.usage.cacheReadInputTokens)
+          } else if (call.usage.cacheCreationInputTokens > 0) {
+            cacheWriteTokens += Math.min(schemaTokens, call.usage.cacheCreationInputTokens)
           }
         }
       }
@@ -2190,7 +2202,7 @@ export function detectMcpProfileAdvisor(
     title: `${candidates.length} MCP server${candidates.length === 1 ? '' : 's'} should be project-scoped`,
     explanation:
       `These MCP servers look useful in a small set of projects but are loaded into other projects where they are not invoked. ` +
-      `Project-scoping them keeps the hot-project workflow while avoiding schema overhead elsewhere. ${lines.join('; ')}${extra}.`,
+      `Project-scoping them keeps the hot-project workflow while avoiding their tool lines elsewhere. ${lines.join('; ')}${extra}.`,
     impact,
     tokensSaved,
     fix: {
@@ -2506,7 +2518,7 @@ export function detectUnusedMcp(
 
   if (unused.length === 0) return null
 
-  const totalSessions = projects.reduce((s, p) => s + p.sessions.length, 0)
+  const totalSessions = countSessions(projects)
   const schemaTokensPerSession = unused.length * TOOLS_PER_MCP_SERVER * TOKENS_PER_MCP_TOOL
   const tokensSaved = schemaTokensPerSession * Math.max(totalSessions, 1)
 
@@ -2859,7 +2871,7 @@ export function detectMcpAlwaysLoadHygiene(
   const versions = apiCalls.map(c => c.version).filter(v => v.length > 0)
   if (versions.length > 0 && versions.every(v => versionPredates(v, ALWAYSLOAD_MIN_VERSION))) return null
 
-  const totalSessions = projects.reduce((s, p) => s + p.sessions.length, 0)
+  const totalSessions = countSessions(projects)
   if (totalSessions === 0) return null
 
   const coverageByServer = new Map(mcpCoverage.map(c => [c.server, c]))
@@ -3448,15 +3460,26 @@ function formatContextRatio(ratio: number): string {
 
 // Use (\s|$|--) instead of \b after commit/push so `git commit-tree` and
 // `git commit-graph` are not treated as deliveries. The `--` clause keeps
-// `git commit --amend` matching as a real delivery command.
+// `git commit --amend` matching as a real delivery command. Git's global
+// options (`git -C dir commit`, `git -c user.name=x commit`) may sit between
+// `git` and the subcommand.
 const DELIVERY_COMMAND_PATTERNS = [
-  /(?:^|[;&|]\s*)git\s+(?:commit|push)(?=\s|$|--)(?![^;&|]*--dry-run)/,
-  /(?:^|[;&|]\s*)gh\s+pr\s+(?:create|merge)(?=\s|$|--)(?![^;&|]*--dry-run)/,
+  /(?:^|[;&|(\n]\s*|\b(?:do|then)\s+)git(?:\s+-[Cc]\s+\S+|\s+--[\w-]+(?:=\S+)?)*\s+(?:commit|push)(?=\s|$|--)(?![^;&|\n]*--dry-run)/,
+  /(?:^|[;&|(\n]\s*|\b(?:do|then)\s+)gh\s+pr\s+(?:create|merge)(?=\s|$|--)(?![^;&|\n]*--dry-run)/,
 ]
 
+// bashBreakdown keys are base command names (`git`), so delivery is read from
+// the full command text each call keeps in its tool sequence.
 function sessionDeliveryCommand(session: ProjectSummary['sessions'][number]): string | null {
-  const commands = Object.keys(session.bashBreakdown)
-  return commands.find(command => DELIVERY_COMMAND_PATTERNS.some(pattern => pattern.test(command))) ?? null
+  for (const turn of session.turns) {
+    for (const call of turn.assistantCalls) {
+      for (const tool of call.toolSequence?.flat() ?? []) {
+        const command = tool.command
+        if (command && DELIVERY_COMMAND_PATTERNS.some(pattern => pattern.test(command))) return command
+      }
+    }
+  }
+  return null
 }
 
 function hasCategoryBreakdownData(session: ProjectSummary['sessions'][number]): boolean {
@@ -3490,11 +3513,16 @@ function sessionRetryCount(session: ProjectSummary['sessions'][number]): number 
   return session.turns.reduce((sum, turn) => sum + turn.retries, 0)
 }
 
-function sessionTotalTurns(session: ProjectSummary['sessions'][number]): number {
-  if (hasCategoryBreakdownData(session)) {
-    return Object.values(session.categoryBreakdown).reduce((sum, c) => sum + c.turns, 0)
+// Counted the way the classifier counts retries: one per edit tool call.
+function sessionEditSteps(session: ProjectSummary['sessions'][number]): number {
+  let steps = 0
+  for (const turn of session.turns) {
+    for (const call of turn.assistantCalls) {
+      const tools = call.toolSequence?.length ? call.toolSequence.flat().map(t => t.tool) : call.tools
+      steps += tools.filter(tool => EDIT_TOOLS.has(tool)).length
+    }
   }
-  return session.turns.length
+  return steps
 }
 
 // Token-savings estimate for a low-worth candidate. Two regimes:
@@ -3504,8 +3532,8 @@ function sessionTotalTurns(session: ProjectSummary['sessions'][number]): number 
 //   - Sessions with edits but with retries / no one-shot: only the retry
 //     fraction is counted as recoverable. Edits may still have been useful;
 //     we credit the model with that and only flag the retry overhead.
-// Ratio is bounded to [0, 1] so retry-heavy sessions with weird turn counts
-// can't claim more than the full session token total.
+// A retry is a re-edit, so the fraction is retries over edit steps, not over
+// user prompts (an agent loop can make dozens of edits per prompt).
 function estimateLowWorthRecoverableTokens(
   session: ProjectSummary['sessions'][number],
   editTurns: number,
@@ -3513,9 +3541,9 @@ function estimateLowWorthRecoverableTokens(
 ): number {
   const tokens = sessionTokenTotal(session)
   if (editTurns === 0) return Math.round(tokens * WORTH_IT_NO_EDIT_RECOVERY_FRACTION)
-  const totalTurns = sessionTotalTurns(session)
-  if (totalTurns === 0) return 0
-  const fraction = Math.min(1, Math.max(0, retries / totalTurns))
+  const editSteps = sessionEditSteps(session)
+  if (editSteps === 0) return 0
+  const fraction = Math.min(1, Math.max(0, retries / editSteps))
   return Math.round(tokens * fraction)
 }
 
@@ -3822,6 +3850,60 @@ export function detectSessionOutliers(projects: ProjectSummary[], excludedSessio
   }
 }
 
+export function detectLowCacheHitSessions(projects: ProjectSummary[]): WasteFinding | null {
+  type Candidate = { project: string; sessionId: string; provider: string; hitPercent: number; totalInput: number; missedReads: number }
+  const candidates: Candidate[] = []
+
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      if (!isOptimizeSession(session)) continue
+      const reads = session.totalCacheReadTokens
+      const writes = session.totalCacheWriteTokens
+      // Parsers record unreported cache usage as 0, so a session with no cache
+      // tokens at all is unmeasured, not a 0% hit rate.
+      if (reads + writes === 0) continue
+      if (session.apiCalls < LOW_CACHE_HIT_MIN_CALLS) continue
+      const totalInput = session.totalInputTokens + reads + writes
+      if (totalInput < LOW_CACHE_HIT_MIN_INPUT_TOKENS) continue
+      // Same formula as the dashboard overview: reads over all input incl. writes.
+      const hitPercent = (reads / totalInput) * 100
+      if (hitPercent >= LOW_CACHE_HIT_TARGET_PERCENT) continue
+      candidates.push({
+        project: project.project,
+        sessionId: session.sessionId,
+        provider: inferSessionProvider(session),
+        hitPercent,
+        totalInput,
+        missedReads: totalInput * LOW_CACHE_HIT_TARGET_PERCENT / 100 - reads,
+      })
+    }
+  }
+
+  if (candidates.length === 0) return null
+
+  candidates.sort((a, b) => b.missedReads - a.missedReads || a.sessionId.localeCompare(b.sessionId))
+  const preview = candidates.slice(0, LOW_CACHE_HIT_PREVIEW)
+  const list = preview
+    .map(c => `${c.project}/${c.sessionId} (${providerDisplayName(c.provider)}): ${c.hitPercent.toFixed(1)}% of ${formatTokens(c.totalInput)} input`)
+    .join('; ')
+  const extra = candidates.length > preview.length ? `; +${candidates.length - preview.length} more` : ''
+  const tokensSaved = Math.round(candidates.reduce((sum, c) => sum + c.missedReads, 0) * (1 - CACHE_READ_DISCOUNT))
+
+  return {
+    id: 'low-cache-hit-sessions',
+    title: `${candidates.length} session${candidates.length === 1 ? '' : 's'} with a low cache hit rate`,
+    explanation: `These sessions read less than ${LOW_CACHE_HIT_TARGET_PERCENT}% of their input from the prompt cache: ${list}${extra}. Healthy agent sessions usually sit above ${LOW_CACHE_HIT_TARGET_PERCENT}%. Low rates come from switching models or tools mid-session, editing instruction files mid-session, or long pauses that let the cache expire, so the full prompt is paid again.`,
+    impact: candidates.length >= 3 || tokensSaved >= CONTEXT_BLOAT_HIGH_INPUT_TOKENS ? 'high' : 'medium',
+    tokensSaved,
+    fix: {
+      type: 'paste',
+      destination: 'manual',
+      label: 'Keep the prompt cache valid:',
+      text: 'Stay on one model per session, and start a new session after editing instruction files or MCP config instead of continuing the old one.',
+    },
+  }
+}
+
 function findYoungProjectFirstSessionIds(projects: ProjectSummary[]): Set<string> {
   const firstSessionIds = new Set<string>()
 
@@ -3945,14 +4027,14 @@ export function cacheKey(projects: ProjectSummary[], dateRange: DateRange | unde
   // stale findings when cost/tokens moved (e.g. a re-price) while call count
   // held - reachable in the long-lived menubar process within the 60s TTL.
   // Cost is scaled to whole micro-dollars so float jitter cannot thrash the key.
-  let calls = 0, cost = 0, savings = 0, proxied = 0, sessions = 0, sidechains = 0
+  let calls = 0, cost = 0, savings = 0, proxied = 0, sidechains = 0
+  const sessions = countSessions(projects)
   const sidechainIdentities: string[] = []
   for (const p of projects) {
     calls += p.totalApiCalls
     cost += p.totalCostUSD
     savings += p.totalSavingsUSD
     proxied += p.totalProxiedCostUSD
-    sessions += p.sessions.length
     for (const session of p.sessions) {
       if (session.isSidechain !== true) continue
       sidechains++
@@ -4023,6 +4105,7 @@ export async function scanAndDetect(
     () => detectLowWorthSessions(behavioralProjects, provider),
     () => detectContextBloat(behavioralProjects, lowWorthSessionIds, provider),
     () => detectSessionOutliers(behavioralProjects, outlierExclusions, provider),
+    () => detectLowCacheHitSessions(behavioralProjects),
     claudeOnly(() => detectBloatedClaudeMd(projectCwds)),
     claudeOnly(() => detectBashBloat()),
     claudeOnly(() => detectRecurringContext(openers)),

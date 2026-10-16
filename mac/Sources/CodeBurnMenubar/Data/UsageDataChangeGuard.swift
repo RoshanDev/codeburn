@@ -106,6 +106,8 @@ enum UsageDataChangeGuard {
         }
         let openClaudeRoot = expand(environment["CODEBURN_OPENCLAUDE_DIR"] ?? path(homeDirectory, ".openclaude"), homeDirectory: homeDirectory)
         add(path(openClaudeRoot, "projects"), scanFirstLevelDirectories: true)
+        let commandCodeRoot = expand(environment["CODEBURN_COMMANDCODE_DIR"] ?? path(homeDirectory, ".commandcode"), homeDirectory: homeDirectory)
+        add(path(commandCodeRoot, "projects"), scanFirstLevelDirectories: true)
         add(path(applicationSupport, "Open Design"), scanFirstLevelDirectories: false)
         add(path(homeDirectory, ".pi", "agent", "sessions"), scanFirstLevelDirectories: false)
         add(path(homeDirectory, ".omp", "agent", "sessions"), scanFirstLevelDirectories: false)
@@ -117,6 +119,13 @@ enum UsageDataChangeGuard {
         add(path(xdgData, "kilo"), scanFirstLevelDirectories: false)
         add(expand(environment["GOOSE_PATH_ROOT"] ?? path(xdgData, "goose"), homeDirectory: homeDirectory), scanFirstLevelDirectories: false)
         add(expand(environment["CRUSH_GLOBAL_DATA"] ?? path(xdgData, "crush"), homeDirectory: homeDirectory), scanFirstLevelDirectories: false)
+        let ampDataDirectories = (environment["AMP_DATA_DIR"] ?? "")
+            .split(separator: ",")
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        for ampDataDirectory in ampDataDirectories.isEmpty ? [path(homeDirectory, ".local", "share", "amp")] : ampDataDirectories {
+            add(ampDataDirectory)
+        }
         // Warp's default location is never watched. Its database lives in
         // ~/Library/Group Containers/2BBY89MBSN.dev.warp (src/providers/warp.ts),
         // and that tree is behind the "access data from other apps" consent: a

@@ -1873,9 +1873,47 @@ private struct GenericProviderSettingsTab: View {
         Form {
             GenericProviderConnectionSections(provider: provider)
                 .id(provider.id)
+            if provider.id == "cursor" {
+                CursorSyncSettingsSection()
+            }
         }
         .formStyle(.grouped)
         .padding()
+    }
+}
+
+/// The CLI's `cursorSync` config switch, with the sync's last outcome under it.
+private struct CursorSyncSettingsSection: View {
+    @Environment(AppStore.self) private var store
+    @State private var enabled = CLICursorSyncConfig.load()
+    @State private var saveError: String?
+
+    private var envOff: Bool { CursorSyncStatus.envOff(configEnabled: enabled, status: store.payload.cursorSync) }
+
+    var body: some View {
+        Section {
+            Toggle(L("Sync Cursor usage from cursor.com"), isOn: Binding(
+                get: { enabled && !envOff },
+                set: { next in
+                    do {
+                        try CLICursorSyncConfig.persist(enabled: next)
+                        enabled = next
+                        saveError = nil
+                    } catch {
+                        NSLog("CodeBurn: failed to persist cursorSync config: \(error)")
+                        saveError = L("Couldn't save the setting: config.json is invalid or locked")
+                    }
+                }
+            ))
+            .disabled(envOff)
+        } footer: {
+            Text(footer)
+                .font(.system(size: 11))
+        }
+    }
+
+    private var footer: String {
+        saveError ?? CursorSyncStatus.settingsFooter(configEnabled: enabled, status: store.payload.cursorSync)
     }
 }
 
@@ -1945,7 +1983,7 @@ private struct GenericProviderConnectionSections: View {
                         Button(L("Disconnect"), role: .destructive) {
                             Task {
                                 do {
-                                    try await store.disconnectCapacityDockProvider(provider)
+                                    try await store.disconnectCapacityDockProvider(provider, explicit: true)
                                     editor = .load(
                                         providerID: provider.id,
                                         stored: CapacityDockProviderCredential()
@@ -2057,6 +2095,9 @@ private struct GenericProviderConnectionSections: View {
         }
         .task(id: provider.id) {
             await reloadEditor()
+            if hasLiveAdapter, summary == nil, !requiresExplicitCredential {
+                await store.refreshCapacityDockProvider(provider, quiet: true)
+            }
         }
     }
 
@@ -2067,8 +2108,10 @@ private struct GenericProviderConnectionSections: View {
         switch summary.connection {
         case .connected: return L("Connected")
         case .loading: return L("Connecting…")
-        case .stale: return store.quotaRefreshIsInFlight(for: provider) ? L("Refreshing…") : L("Connected")
-        case .transientFailure: return L("Retrying")
+        case .stale:
+            if let title = store.capacityDockProviderStatusTitles[provider.id] { return title }
+            return store.quotaRefreshIsInFlight(for: provider) ? L("Refreshing…") : L("Connected")
+        case .transientFailure: return store.capacityDockProviderStatusTitles[provider.id] ?? L("Retrying")
         case .terminalFailure: return L("Reconnect required")
         case .disconnected: return L("Not connected")
         }
@@ -2079,6 +2122,9 @@ private struct GenericProviderConnectionSections: View {
             return L("%@ is catalogued, but CodeBurn cannot fetch its live quota yet.", provider.displayName)
         }
         if let error = store.capacityDockProviderErrors[provider.id], !error.isEmpty {
+            // A rate limit, outage or unrecognized response is not a sign-in
+            // problem; the sign-in guidance would send the user the wrong way.
+            if store.capacityDockProviderTransientFailures.contains(provider.id) { return error }
             return "\(error) \(ProviderConnectionGuidance.instruction(for: provider))"
         }
         guard let summary else {

@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events'
 import React, { Fragment, useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { render, Box, Text, measureElement, useInput, useApp, useWindowSize, type DOMElement, type Instance, type RenderOptions } from 'ink'
 import { CATEGORY_LABELS, type DateRange, type ProjectSummary, type TaskCategory } from './types.js'
-import { formatCost, formatTokens, markEstimated, carriedCostNote, excludedGatewayNote } from './format.js'
+import { formatCost, formatTokens, markEstimated, carriedCostNote, excludedGatewayNote, isEstimatedCost, ESTIMATED_COST_LEGEND } from './format.js'
 import { maxOf } from './math-utils.js'
 import { formatSessionCount } from './session-count-label.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
@@ -14,7 +14,7 @@ import { aggregateModelTotals } from './model-breakdown.js'
 import { buildDurableOverviewFromNormalizedIndex, buildDurablePeriod, hydrateDailyCacheFromNormalizedProjects, type ExcludedGatewayTotals } from './usage-aggregator.js'
 import { loadDailyCache, type DailyCache } from './daily-cache.js'
 import { exitAfterCacheCleanup } from './session-cache.js'
-import { getAllProviders } from './providers/index.js'
+import { getAllProviders, safeDiscoverSessions } from './providers/index.js'
 import { classHeaderLine, classTotals, findingBasis, findingClass, scanAndDetect, type FindingClass, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
 import { appliedFixGlyph, formatAppliedFix, type AppliedFix } from './act/types.js'
 import { aggregateFileChurn, buildCoachingNotes, computePricingCoverage, medianTimeToFirstEditMs, scanUserCorrections, worstOneShotCategory, type ReworkedFile } from './workflow-insights.js'
@@ -27,6 +27,8 @@ import { planDisplayName } from './plans.js'
 import { formatDayRangeLabel, getDateRange, parseDayFlag, PERIODS, PERIOD_LABELS, shiftDay, type Period } from './cli-date.js'
 import { BSU, patchStdoutForWindows } from './ink-win.js'
 import { startUserTimingGuard } from './user-timing-guard.js'
+import { folderNameOriginKey, isTemporaryProjectPath, linkedOriginKey, originRepoName, projectOriginKey, TEMPORARY_PROJECTS } from './git-origin.js'
+import { countSessions } from './session-output.js'
 
 type View = 'dashboard' | 'optimize' | 'compare'
 
@@ -604,7 +606,7 @@ function Overview({ projects, label, width, planUsages, durable }: { projects: P
   const totalCost = durable ? durable.cost : projects.reduce((s, p) => s + p.totalCostUSD, 0)
   const totalSavings = durable ? durable.savingsUSD : projects.reduce((s, p) => s + p.totalSavingsUSD, 0)
   const totalCalls = durable ? durable.calls : projects.reduce((s, p) => s + p.totalApiCalls, 0)
-  const totalSessions = durable ? durable.sessions : projects.reduce((s, p) => s + p.sessions.length, 0)
+  const totalSessions = durable ? durable.sessions : countSessions(projects)
   const allSessions = projects.flatMap(p => p.sessions)
   const totalInput = durable ? durable.inputTokens : allSessions.reduce((s, sess) => s + sess.totalInputTokens, 0)
   const totalOutput = durable ? durable.outputTokens : allSessions.reduce((s, sess) => s + sess.totalOutputTokens, 0)
@@ -778,7 +780,7 @@ export function getDashboardMaxWidth(projects: ProjectSummary[], budgets?: Map<s
     PANEL_CHROME + 10 + 1 + longest(labels) + metricCount * metricWidth
   const modelTotals = aggregateModelTotals(projects)
   const modelMetricWidth = maxOf(Object.values(modelTotals).map(model =>
-    markEstimated(formatCost(model.costUSD), model.estimatedCostUSD > 0).length
+    markEstimated(formatCost(model.costUSD), isEstimatedCost(model.costUSD, model.estimatedCostUSD)).length
   ), 7)
   const categoryLabels = sessions.flatMap(session => Object.keys(session.categoryBreakdown).map(category => CATEGORY_LABELS[category as TaskCategory] ?? category))
   const skillLabels = sessions.flatMap(session => Object.keys(session.skillBreakdown))
@@ -800,7 +802,29 @@ function getProjectBreakdownRowLimit(period: Period, dayMode = false): number {
   return dayMode ? 8 : period === 'all' || period === 'lifetime' || period === 'month' || period === '30days' ? 14 : 8
 }
 
-function ProjectBreakdown({ projects, pw, bw, budgets, rows = 14 }: { projects: ProjectSummary[]; pw: number; bw: number; budgets?: Map<string, ContextBudget>; rows?: number }) {
+/// One row per repository: clones and worktrees sharing an `origin` fold into
+/// the costliest of them, and every other temp-root folder into one row; any
+/// other checkout stays its own row.
+export function foldProjectsByRepository(projects: ProjectSummary[]): Array<ProjectSummary & { repo?: string }> {
+  const rows = new Map<string, ProjectSummary & { repo?: string }>()
+  projects.forEach((p, i) => {
+    const origin = linkedOriginKey(p.projectPath) ?? projectOriginKey(p.projectPath) ?? folderNameOriginKey(p.projectPath)
+    const temporary = !origin && isTemporaryProjectPath(p.projectPath)
+    const key = origin ?? (temporary ? TEMPORARY_PROJECTS : `\0${i}`)
+    const held = rows.get(key)
+    if (!held) {
+      rows.set(key, origin ? { ...p, repo: originRepoName(origin) } : temporary ? { ...p, repo: 'Temporary folders' } : p)
+      return
+    }
+    if (p.totalCostUSD > held.totalCostUSD) held.projectPath = p.projectPath
+    held.totalCostUSD += p.totalCostUSD
+    held.sessions = [...held.sessions, ...p.sessions]
+  })
+  return [...rows.values()].sort((a, b) => b.totalCostUSD - a.totalCostUSD)
+}
+
+function ProjectBreakdown({ projects: checkouts, pw, bw, budgets, rows = 14 }: { projects: ProjectSummary[]; pw: number; bw: number; budgets?: Map<string, ContextBudget>; rows?: number }) {
+  const projects = foldProjectsByRepository(checkouts)
   const maxCost = maxOf(projects.map(p => p.totalCostUSD), -Infinity)
   const hasBudgets = budgets && budgets.size > 0
   const headers = ['cost', 'avg/s', 'session', ...(hasBudgets ? ['overhead'] : [])]
@@ -828,7 +852,7 @@ function ProjectBreakdown({ projects, pw, bw, budgets, rows = 14 }: { projects: 
             key={`${project.project}-${i}`}
             panelWidth={pw}
             barWidth={projectBarWidth}
-            label={shortProject(project.projectPath, labelWidth)}
+            label={project.repo ? project.repo.slice(0, labelWidth) : shortProject(project.projectPath, labelWidth)}
             labelColor={DIM}
             bar={{ value: project.totalCostUSD, max: maxCost }}
             metrics={[
@@ -852,9 +876,9 @@ function ModelBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: 
   // the same model merge into one row (see aggregateModelTotals).
   const modelTotals = aggregateModelTotals(projects)
   const modelEfficiency = aggregateModelEfficiency(projects)
-  const anyEstimated = Object.values(modelTotals).some(d => d.estimatedCostUSD > 0)
+  const anyEstimated = Object.values(modelTotals).some(d => isEstimatedCost(d.costUSD, d.estimatedCostUSD))
   const sorted = Object.entries(modelTotals).sort(([, a], [, b]) => b.costUSD - a.costUSD)
-  const costLabels = sorted.map(([, data]) => markEstimated(formatCost(data.costUSD), data.estimatedCostUSD > 0))
+  const costLabels = sorted.map(([, data]) => markEstimated(formatCost(data.costUSD), isEstimatedCost(data.costUSD, data.estimatedCostUSD)))
   // #1088: this column has zero width slack left at the standard 3-column
   // breakpoint (verified: widening the header even one character clips
   // 'cache'/'1-shot' and drops the value column entirely), so the header stays
@@ -918,7 +942,7 @@ function ModelBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: 
         </Text>
       )}
       {anyEstimated && (
-        <Text dimColor wrap="truncate-end">~ estimated cost (priced from estimated tokens)</Text>
+        <Text dimColor wrap="truncate-end">{ESTIMATED_COST_LEGEND}</Text>
       )}
       <Text dimColor wrap="truncate-end">~ Effective Tok/s: generated tokens ÷ time the agent spent waiting on the model, tool execution excluded. Includes prefill, request assembly and reasoning. Not comparable to vendor decode-speed figures.</Text>
     </Panel>
@@ -1458,7 +1482,8 @@ function StatusBar({ width, showProvider, view, findingCount, optimizeAvailable,
         )}
         {showProvider && (<><Text dimColor>   </Text><Text color={ORANGE} bold>p</Text><Text dimColor> provider</Text></>)}
         <Text dimColor>   </Text><Text color={ORANGE} bold>↑</Text><Text dimColor>/</Text><Text color={ORANGE} bold>↓</Text><Text dimColor> scroll   </Text>
-        <Text color={ORANGE} bold>PgUp</Text><Text dimColor>/</Text><Text color={ORANGE} bold>PgDn</Text><Text dimColor> page</Text>
+        <Text color={ORANGE} bold>PgUp</Text><Text dimColor>/</Text><Text color={ORANGE} bold>PgDn</Text><Text dimColor> page   </Text>
+        <Text color={ORANGE} bold>m</Text><Text dimColor> mouse</Text>
       </Text>
     </Box>
   )
@@ -1515,7 +1540,7 @@ const WHEEL_LINES_PER_TICK = 3
 const MOUSE_TRACKING_ON = '\x1b[?1000h\x1b[?1006h'
 const MOUSE_TRACKING_OFF = '\x1b[?1006l\x1b[?1000l'
 
-function ScrollableViewport({ children, width, lineScroll = true }: { children: React.ReactNode; width: number; lineScroll?: boolean }) {
+function ScrollableViewport({ children, width, lineScroll = true, mouse = false }: { children: React.ReactNode; width: number; lineScroll?: boolean; mouse?: boolean }) {
   const { rows } = useWindowSize()
   const height = Math.max(1, rows - 1)
   const contentRef = useRef<DOMElement>(null)
@@ -1534,22 +1559,37 @@ function ScrollableViewport({ children, width, lineScroll = true }: { children: 
     setOffset(current => Math.min(current, nextMaxOffset))
   })
 
-  // Mouse-wheel scrolling via SGR mouse reporting. Known tradeoff: while
-  // tracking is on, click-drag text selection needs Shift held in most
-  // terminals. Tracking is disabled again on unmount (view switches, q).
+  // Unconditional teardown: whatever the toggle below did, and whichever exit
+  // path ran, the terminal goes back to reporting no mouse events so click-drag
+  // selection always survives the dashboard.
+  useEffect(() => () => { if (process.stdout.isTTY) process.stdout.write(MOUSE_TRACKING_OFF) }, [])
+
+  // Mouse-wheel scrolling via SGR mouse reporting, off until the user presses
+  // `m` (#951): while tracking is on, click-drag text selection needs Shift
+  // held in most terminals, and copying a number is the commoner need.
+  // Tracking is disabled again on unmount and on process exit.
   useEffect(() => {
-    if (!process.stdout.isTTY || !process.stdin.isTTY) return
+    if (!mouse || !process.stdout.isTTY || !process.stdin.isTTY) return
     process.stdout.write(MOUSE_TRACKING_ON)
     const onData = (data: Buffer) => {
       const delta = wheelDelta(data.toString('utf8'))
       if (delta !== 0) setOffset(current => Math.max(0, Math.min(current + delta, maxOffsetRef.current)))
     }
     process.stdin.on('data', onData)
+    // The raw Ctrl+C/qq guard and `exitAfterCacheCleanup` reach process.exit
+    // without unmounting React, and a SIGTERM would not run either, so both
+    // get a direct disable rather than relying on the cleanup below.
+    const disable = () => { process.stdout.write(MOUSE_TRACKING_OFF) }
+    const onSigterm = () => { disable(); process.kill(process.pid, 'SIGTERM') }
+    process.on('exit', disable)
+    process.once('SIGTERM', onSigterm)
     return () => {
       process.stdin.off('data', onData)
-      process.stdout.write(MOUSE_TRACKING_OFF)
+      process.off('exit', disable)
+      process.off('SIGTERM', onSigterm)
+      disable()
     }
-  }, [])
+  }, [mouse])
 
   useInput((_input, key) => {
     if (lineScroll && key.downArrow) setOffset(current => Math.min(current + 1, maxOffset))
@@ -1637,6 +1677,10 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
   // Auto-clears the moment the fill lands so a stale flag can never trap a
   // later q.
   const [quitArmed, setQuitArmed] = useState(false)
+  // #951: wheel scrolling costs click-drag text selection, so it is opt-in per
+  // run via `m`. Held here, above the viewport's remount key, so a period or
+  // provider switch does not silently drop the user's choice.
+  const [mouseTracking, setMouseTracking] = useState(false)
   const isDayMode = dayDate != null
   const isCustomRange = customRange != null && !isDayMode
   const scrollableDailyHistory = !isCustomRange && !isDayMode
@@ -1687,7 +1731,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
     let cancelled = false
     async function detect() {
       const found: string[] = []
-      for (const p of await getAllProviders()) { const s = await p.discoverSessions(); if (s.length > 0) found.push(p.name) }
+      for (const p of await getAllProviders()) { const s = await safeDiscoverSessions(p); if (s.length > 0) found.push(p.name) }
       if (!cancelled) setDetectedProviders(found)
     }
     detect()
@@ -2016,6 +2060,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
       quitNow(0)
       return
     }
+    if (input === 'm') { setMouseTracking(on => !on); return }
     if (input === 'o' && view === 'dashboard' && optimizeAvailable) { void loadOptimizeResult(); return }
     if ((input === 'b' || key.escape) && view === 'optimize') { setView('dashboard'); setFindingsCursor(0); return }
     if (view === 'optimize') {
@@ -2145,6 +2190,7 @@ export function InteractiveDashboard({ initialProjects, initialDailyHistoryProje
       key={`${view}:${period}:${activeProvider}:${dayDate ?? ''}:${customRangeLabel ?? ''}`}
       width={dashWidth}
       lineScroll={view !== 'compare'}
+      mouse={mouseTracking}
     >
       {content}
     </ScrollableViewport>
