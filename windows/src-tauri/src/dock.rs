@@ -1046,59 +1046,185 @@ fn fitted_origin(target: Rect, area: &Rect) -> (i32, i32) {
     )
 }
 
+/// Set while a `verify_linux_geometry` thread is watching the window.
+#[cfg(target_os = "linux")]
+static GEOMETRY_CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// The GTK window whose configure events already start a geometry check, by address. The dock
+/// window is rebuilt when it is switched off and on, and the new one needs its own handler.
+#[cfg(target_os = "linux")]
+static CONFIGURE_WATCHED: Mutex<Option<usize>> = Mutex::new(None);
+
+/// Corrections in a row that did not take, for the placement they were made for. GTK can
+/// refuse a size outright, and asking forever would fight it on every configure event.
+#[cfg(target_os = "linux")]
+static FAILED_CORRECTIONS: Mutex<Option<((i32, i32, i32, i32), u32)>> = Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+const MAX_FAILED_CORRECTIONS: u32 = 3;
+
+/// Hover and collapse do not always place the window again, so a check that ran only after
+/// placements never saw a window squeezed between them. Any configure that leaves the window
+/// at another size than the last placement starts a check.
+#[cfg(target_os = "linux")]
+fn watch_configure(window: &tauri::WebviewWindow, gtk_window: &gtk::ApplicationWindow) {
+    use gtk::glib::object::ObjectType;
+    use gtk::prelude::WidgetExt;
+    let address = gtk_window.as_ptr() as usize;
+    {
+        let mut watched = CONFIGURE_WATCHED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *watched == Some(address) {
+            return;
+        }
+        *watched = Some(address);
+    }
+    let hosted = window.clone();
+    gtk_window.connect_configure_event(move |_, event| {
+        let (w, h) = event.size();
+        let wanted = LAST_PLACE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .map(|(_, _, w, h)| (w, h));
+        if wanted.is_some_and(|wanted| wanted != (w as i32, h as i32)) {
+            verify_linux_geometry(&hosted);
+        }
+        false
+    });
+}
+
+/// Checks, shortly after every placement, that the X window really has the size and origin
+/// last asked for, and asks again when it does not.
+///
+/// A resize can be dropped, and a resize configure puts the old origin back. The check used to
+/// run only after a size change, stop as soon as any newer placement arrived (a move-only one
+/// included), and trust GTK's cached size, so a window the server had squeezed to 1 px wide
+/// passed. It now follows the latest placement, reads the server-side geometry, and resizes
+/// the GDK window directly, since `gtk_window_resize` does nothing when GTK already believes
+/// it has that size.
+#[cfg(target_os = "linux")]
+fn verify_linux_geometry(window: &tauri::WebviewWindow) {
+    // A running check reads the latest placement on every tick, so it covers this one too.
+    if GEOMETRY_CHECK_RUNNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let window = window.clone();
+    std::thread::spawn(move || {
+        const DELAYS_MS: [u64; 4] = [50, 150, 300, 1000];
+        let current = || *LAST_PLACE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut seen = current();
+        let mut checked_size = None;
+        let mut resized = true;
+        loop {
+            let mut step = 0;
+            while step < DELAYS_MS.len() {
+                std::thread::sleep(std::time::Duration::from_millis(DELAYS_MS[step]));
+                let now = current();
+                if now != seen {
+                    seen = now;
+                    step = 0;
+                } else {
+                    step += 1;
+                }
+                let Some(place) = now else { continue };
+                let size = Some((place.2, place.3));
+                if size != checked_size {
+                    checked_size = size;
+                    resized = true;
+                }
+                check_linux_geometry(&window, place, resized);
+            }
+            resized = false;
+            GEOMETRY_CHECK_RUNNING.store(false, Ordering::Release);
+            // A placement that landed after the last tick would otherwise go unchecked.
+            if current() == seen || GEOMETRY_CHECK_RUNNING.swap(true, Ordering::AcqRel) {
+                return;
+            }
+        }
+    });
+}
+
+/// One look at the real window on the main thread. `resized` re-applies the origin and the
+/// input shape even when the size is right, because the resize configure can move the window
+/// and clear the input region after both were set.
+#[cfg(target_os = "linux")]
+fn check_linux_geometry(window: &tauri::WebviewWindow, place: (i32, i32, i32, i32), resized: bool) {
+    let hosted = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        use gtk::prelude::GtkWindowExt;
+        // A newer placement owns the window now; its own tick checks it.
+        if *LAST_PLACE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) != Some(place) {
+            return;
+        }
+        let (x, y, w, h) = place;
+        let Ok(gtk_window) = hosted.gtk_window() else { return };
+        watch_configure(&hosted, &gtk_window);
+        let cached = gtk_window.size();
+        let actual = gtk::prelude::WidgetExt::window(&gtk_window)
+            .map(|gdk_window| {
+                let (_, _, aw, ah) = gdk_window.geometry();
+                (aw, ah)
+            })
+            .unwrap_or(cached);
+        let wrong = cached != (w, h) || actual != (w, h);
+        {
+            let mut failed = FAILED_CORRECTIONS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !wrong {
+                *failed = None;
+            } else {
+                let count = match *failed {
+                    Some((at, count)) if at == place => count + 1,
+                    _ => 1,
+                };
+                *failed = Some((place, count));
+                if count > MAX_FAILED_CORRECTIONS {
+                    return;
+                }
+            }
+        }
+        if wrong {
+            crate::log_line!(
+                "codeburn dock: window is {}x{} (GTK thinks {}x{}), wanted {w}x{h}; resizing again",
+                actual.0,
+                actual.1,
+                cached.0,
+                cached.1
+            );
+            gtk_window.resize(w, h);
+            if let Some(gdk_window) = gtk::prelude::WidgetExt::window(&gtk_window) {
+                gdk_window.resize(w, h);
+            }
+        }
+        if wrong || resized {
+            let _ = hosted.set_position(tauri::LogicalPosition::new(x as f64, y as f64));
+            if let Ok(mut last) = HIT_SHAPE.lock() {
+                *last = None;
+            }
+            sync_hit_shape(&hosted);
+        }
+    });
+}
+
 #[cfg(target_os = "linux")]
 fn place_linux(window: &tauri::WebviewWindow, target: Rect) {
     let (x, y) = fitted_origin(target, &lock().area);
+    // GTK will not go below MIN_WINDOW_EXTENT and `fitted_origin` already places the window
+    // as if it were that size. Asking for less let an XWayland configure land a 1 px wide
+    // window, and the dock sat in it, invisible, until the process restarted.
+    let (w, h) = (target.w.max(MIN_WINDOW_EXTENT), target.h.max(MIN_WINDOW_EXTENT));
     let size_changed = {
         let mut last = LAST_PLACE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let changed = last.map(|(_, _, w, h)| w != target.w || h != target.h).unwrap_or(true);
-        *last = Some((x, y, target.w, target.h));
+        let changed = last.map(|(_, _, lw, lh)| lw != w || lh != h).unwrap_or(true);
+        *last = Some((x, y, w, h));
         changed
     };
     if size_changed {
         // Without this, WebKit keeps ~200 logical px and the ball cannot reach the edge.
         let _ = window.set_min_size(Some(tauri::LogicalSize::new(1.0, 1.0)));
-        let _ = window.set_size(tauri::LogicalSize::new(target.w.max(1) as f64, target.h.max(1) as f64));
+        let _ = window.set_size(tauri::LogicalSize::new(w as f64, h as f64));
     }
     let _ = window.set_position(tauri::LogicalPosition::new(x as f64, y as f64));
-    if size_changed {
-        // A resize configure puts the old origin back. Move again once that has landed,
-        // or the ball stays where the wide window's left edge was.
-        // The resize itself can be dropped too: after a drag the window stayed at the
-        // rail's 200x570 while the page painted the top-docked ball 700 px to the
-        // right, outside it. Check what GTK actually has and ask again if it is short.
-        let again = window.clone();
-        let placed = (x, y, target.w, target.h);
-        let (w, h) = (target.w.max(1), target.h.max(1));
-        std::thread::spawn(move || {
-            for delay in [50, 150, 300] {
-                std::thread::sleep(std::time::Duration::from_millis(delay));
-                // A newer placement owns the window now.
-                if *LAST_PLACE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) != Some(placed) {
-                    return;
-                }
-                let hosted = again.clone();
-                let _ = again.run_on_main_thread(move || {
-                    use gtk::prelude::GtkWindowExt;
-                    if let Ok(gtk_window) = hosted.gtk_window() {
-                        let (aw, ah) = gtk_window.size();
-                        let (ww, wh) = (w.max(MIN_WINDOW_EXTENT), h.max(MIN_WINDOW_EXTENT));
-                        if (aw, ah) != (ww, wh) {
-                            crate::log_line!(
-                                "codeburn dock: window is {aw}x{ah}, wanted {ww}x{wh}; resizing again"
-                            );
-                            gtk_window.resize(w, h);
-                        }
-                    }
-                    let _ = hosted.set_position(tauri::LogicalPosition::new(x as f64, y as f64));
-                    if let Ok(mut last) = HIT_SHAPE.lock() {
-                        *last = None;
-                    }
-                    sync_hit_shape(&hosted);
-                });
-            }
-        });
-    }
+    verify_linux_geometry(window);
+
     // Drag runs on the pointer thread. GTK, including the layer-shell support
     // check, panics unless it is called on the main thread, which took the dock down.
     if !gtk::is_initialized_main_thread() {
