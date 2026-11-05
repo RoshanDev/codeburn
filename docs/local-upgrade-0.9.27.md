@@ -67,3 +67,21 @@
 - 应用自身 `getUpdateStatus()` 返回 `currentVersion=0.9.25`、`latestVersion=0.9.27`、`updateAvailable=true`；实际界面显示 `Update available: CodeBurn 0.9.27 · Download`。这是独立桌面版的有效更新提示。
 - 临时回环调试端口仅用于读取应用状态，核对后再次按无调试参数方式启动；未安装桌面更新、未隐藏更新提示。
 - 本机证据：`~/.cache/codeburn/restart-check-20261105/` 内的状态、日志和更新提示截图。
+
+
+### 独立桌面版升级（2026-11-05）
+
+用户随后明确要求升级独立桌面版，已使用相同的 `e644fef1` 源码构建并安装。
+
+- 构建与工件目录：`/run/media/roshan/TOSHIBA4T/work/codeburn-build/20261105-upstream-9c4eda25/desktop/`；入口 `build.sh`，日志 `build.log`，systemd 单元 `codeburn-desktop-build-20261105.service` 最终退出码 0。
+- Electron 主进程、渲染界面、内置 CLI 均构建成功；桌面相关测试 19 个文件、473 项全部通过。内置 CLI staging 也通过 Electron-as-Node 的普通命令和 resident serve 两条路径验证。
+- deb：`artifacts/CodeBurn-Desktop-0.9.27-main-9c4eda25-linux-amd64.deb`，109.72 MiB；包名 `codeburn-desktop`、版本 `0.9.27`、架构 amd64；SHA256 `b28b5f32cbdc86dda30e88951be6d60b50b8750b1bb693c9ab880b456430d4c1`。
+- `apt-get install --simulate --no-install-recommends` 确认仅升级 CodeBurn，无新增、无卸载，再执行安装成功。没有安装与 ayatana 冲突的 libappindicator3-1 推荐包。
+- `dpkg-query` 确认 `codeburn-desktop 0.9.27 install ok installed`；`/opt/CodeBurn/resources/app.asar` 的版本和内置 `resources/cli/package.json` 版本均为 0.9.27。
+- 已重新加载 `/etc/apparmor.d/codeburn`；内核 aa-status 确认 `codeburn` profile 为 unconfined，带既有 userns 许可。没有修改全局 userns 策略。
+- 启动命令 `/opt/CodeBurn/codeburn --ozone-platform=wayland`，补齐真实 HOME、DISPLAY、Wayland、XDG_RUNTIME_DIR、XAUTHORITY 与会话总线；保留代理环境，不继承悬浮球的 CODEBURN_BIN 覆盖值，让桌面使用自己的新内置 CLI。
+- 菜单入口仍为 `/usr/share/applications/codeburn.desktop` 与既有用户入口 `~/.local/share/applications/codeburn.desktop`，两者 desktop-file-validate 通过。
+- 运行中的新版应用实际返回 `currentVersion=0.9.27`、`latestVersion=0.9.27`、`updateAvailable=false`，界面 `.update-banner` 为空；内置 agy 读取返回 connected、Google AI Pro 和四个窗口。
+- 临时回环调试端口核对后关闭；已按无调试参数方式启动并观察正常存活。原用户配置、账号和定制悬浮球进程保留，未安装或替换此前的 Tauri 构建包。
+- 安装过程中发现旧 Electron 主进程会改写 argv，将命令行压成一个参数；只按 argv[0] 精确匹配会漏掉旧 GUI 主进程。以后退出 / 升级此应用时应按 `/proc/<pid>/exe` 身份核对，允许其显示 `(deleted)`，不要只停止 resident CLI。旧主进程已退出，单实例锁由新版接管。
+- 本机运行证据：`~/.cache/codeburn/desktop-upgrade-20261105/verification.json`、`state.json` 与启动日志。
