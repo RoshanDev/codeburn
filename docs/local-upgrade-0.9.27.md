@@ -55,3 +55,15 @@
 - 使用当前悬浮球的原环境执行新 CLI 的 `quota --format json`，退出码 0；Antigravity 返回 `available: true`、Google AI Pro 和四个额度窗口。
 - 本次交付为 Linux Tauri 悬浮球包与配套 CLI，不是 `/opt/CodeBurn` 独立 Electron 桌面应用包。deb / AppImage 不内嵌 CLI，需搭配同目录 CLI 运行包并沿用现有启动器的代理保护与 `CODEBURN_BIN` 方式。
 - 本轮没有安装这些包、没有替换当前运行程序，也没有进行新二进制的界面操作验收；旧安装与启动器保留。版本仍为 0.9.27，通过产物文件名、build-info 中的源码提交区分本地 main 构建与上游正式包。
+
+
+### 重启核对（2026-11-05）
+
+用户要求重启 CodeBurn 并检查 0.9.27 更新提示。本次只重启现有安装，未安装上面的新构建包。
+
+- 定制悬浮球继续使用 `~/.local/lib/codeburn-menubar/0.9.27-local-20261016/`；重启后存活。
+- 独立 Electron 桌面版 `/opt/CodeBurn/resources/app.asar` 的 package.json 实际为 **0.9.25**，此前没有随悬浮球升级。
+- 第一次重启桌面版因复用的进程环境缺少 DISPLAY / 图形会话参数而启动失败；随后补齐 HOME、DISPLAY、Wayland、XDG_RUNTIME_DIR 和会话总线，使用 `--ozone-platform=wayland` 恢复启动。不是新构建包崩溃。
+- 应用自身 `getUpdateStatus()` 返回 `currentVersion=0.9.25`、`latestVersion=0.9.27`、`updateAvailable=true`；实际界面显示 `Update available: CodeBurn 0.9.27 · Download`。这是独立桌面版的有效更新提示。
+- 临时回环调试端口仅用于读取应用状态，核对后再次按无调试参数方式启动；未安装桌面更新、未隐藏更新提示。
+- 本机证据：`~/.cache/codeburn/restart-check-20261105/` 内的状态、日志和更新提示截图。
