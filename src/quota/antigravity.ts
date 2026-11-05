@@ -10,7 +10,7 @@
 // - POST https://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/GetUserStatus
 //
 // Discovery lists processes to find candidates (app language
-// servers need their `--csrf_token`; the `agy` CLI needs none), then lists each
+// servers need their `--csrf_token`; newer `agy` CLIs expose theirs to tool subprocesses), then lists each
 // pid's listening TCP ports: `ps` and `lsof` on POSIX, Win32_Process and
 // `netstat` on Windows, which has neither. Local HTTPS uses a self-signed cert,
 // so TLS verification is relaxed ONLY for the 127.0.0.1 loopback probes.
@@ -19,6 +19,7 @@ import http from 'node:http'
 import https from 'node:https'
 import { promisify } from 'node:util'
 
+import { discoverCliAuth } from './antigravity-cli-auth.js'
 import { fraction, sanitizeError } from './security.js'
 import type { QuotaProvider, QuotaWindow } from './types.js'
 
@@ -82,7 +83,7 @@ function empty(connection: QuotaProvider['connection']): QuotaProvider {
 
 // Process kinds distinguish the app language server from standalone processes.
 // carries richer quota data than the IDE variant, so IDE matches are skipped;
-// a CLI (`agy`) match is accepted because its tokenless server exposes the
+// a CLI (`agy`) match is accepted because its embedded server exposes the
 // same summary payload.
 const LANGUAGE_SERVER = /language[_-]server(_macos)?(_arm)?/
 const IDE_MARKER = /antigravity[-_]ide/i
@@ -278,8 +279,10 @@ export async function fetchAntigravityQuota(deps: Partial<AntigravityDeps> = {})
     for (const candidate of candidates) {
       const ports = await listeningPorts(resolved, candidate.pid)
       if (candidate.extPort !== undefined && !ports.includes(candidate.extPort)) ports.push(candidate.extPort)
+      const cliAuth = candidate.cli && resolved.platform === 'linux'
+        ? await discoverCliAuth(candidate.pid, ports) : undefined
       for (const port of ports) {
-        const found = await probePort(resolved, port, candidate.csrf)
+        const found = await probePort(resolved, port, candidate.csrf ?? (cliAuth?.port === port ? cliAuth.csrf : undefined))
         if (found) {
           const windows = [...found.windows].sort((a, b) => b.percent - a.percent)
           return {
