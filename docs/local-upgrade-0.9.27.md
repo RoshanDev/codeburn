@@ -34,3 +34,24 @@
 
 新旧程序不能同时运行。需要回退时先退出新版，再把 `codeburn-dock.previous` 复制回 `~/.local/bin/codeburn-dock` 并重新启动。旧脚本使用原 0.9.25 release 程序和保留的仓库 `dist/cli.js`。本次没有改写这些旧运行文件。
 
+
+
+## 2026-11-05：同步上游 main
+
+用户要求保留自己的定制，保存并同步上游变动后重新编译出包。
+
+- 上游正式发布仍为 `v0.9.27`；本次采用 `origin/main` 的 `9c4eda25`，比该标签多 89 个提交，不标称新的正式发布版。
+- 此前本地 `5c159802`（悬浮球避免持续挤成 1 像素）未推送；新增 agy 本地认证修复已提交为 `594925aa`。
+- 合并提交 `e644fef1` 已推送到 `fork/linux-capacity-dock`。保留既有 Linux 托盘、缩放、贴边、拖动、悬停、Today / 周期统计及 agy 认证修改。
+- 唯一文本冲突是 `windows/src-tauri/Cargo.lock`：采用上游锁文件并由 Cargo 补入当前 Linux 配置需要的 gtk-layer-shell 依赖；未删除本地平台依赖。
+- 构建主机仍为 Ubuntu 26.04.1 amd64。东芝挂载 UUID 核对为 `69b29b18-69f8-4d32-9e37-d491c08d181d`，构建根目录为 `/run/media/roshan/TOSHIBA4T/work/codeburn-build/20261105-upstream-9c4eda25/`。
+- 构建单元 `codeburn-build-20261105.service`；复现脚本 `build.sh`、固定源码副本 `source/`、日志 `build.log`、源码身份 `build-info.json` 均在该构建目录。
+- 目标交付：Linux deb、AppImage、menubar 原始程序、配套 CLI 运行包与 SHA256 校验和；本地产物不生成上游签名的自动更新文件。
+- 初次测试临时目录也放在东芝盘时，Antigravity SQLite 样例的同步写等待机械盘日志提交，测试进程长期阻塞。终止该轮测试后，从测试步骤续跑，Node 测试的 `TMPDIR` 改为 `/run/user/1000/codeburn-build-tests-20261105`；源码、编译缓存和安装包仍在东芝盘，已成功的 CLI / 前端构建复用。
+- 续跑入口 `resume.sh`、日志 `resume.log`，复用同名 systemd 单元。相关测试 26 个文件、349 项全部通过（7.67 秒）；Rust release 测试 174 项全部通过（串行执行，14.00 秒）。
+- 构建单元最终 `Result=success`、`ExecMainStatus=0`。CLI、统计网页、悬浮球前端和原生 release 程序构建均通过。
+- 最终产物在构建目录的 `artifacts/`：`CodeBurn-Menubar-0.9.27-main-9c4eda25-linux-amd64.deb`（9.19 MiB）、同名 `.AppImage`（90.28 MiB）、`codeburn-cli-0.9.27-main-9c4eda25-linux-x64.tar.gz`（9.75 MiB）、原始程序、agy hook 脚本、README、build-info 与 SHA256SUMS。
+- deb 元数据确认包名 `code-burn-menubar`、版本 `0.9.27`、架构 `amd64`；CLI 运行包通过 gzip 完整性检查，启动后 `--version` 为 `0.9.27`，7 个交付文件的 SHA256 校验通过。
+- 使用当前悬浮球的原环境执行新 CLI 的 `quota --format json`，退出码 0；Antigravity 返回 `available: true`、Google AI Pro 和四个额度窗口。
+- 本次交付为 Linux Tauri 悬浮球包与配套 CLI，不是 `/opt/CodeBurn` 独立 Electron 桌面应用包。deb / AppImage 不内嵌 CLI，需搭配同目录 CLI 运行包并沿用现有启动器的代理保护与 `CODEBURN_BIN` 方式。
+- 本轮没有安装这些包、没有替换当前运行程序，也没有进行新二进制的界面操作验收；旧安装与启动器保留。版本仍为 0.9.27，通过产物文件名、build-info 中的源码提交区分本地 main 构建与上游正式包。
