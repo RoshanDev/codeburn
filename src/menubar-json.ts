@@ -18,6 +18,7 @@ export type PeriodData = {
   /// Display/metadata only; never summed into `cost`. Optional so PeriodData
   /// producers predating the field keep compiling.
   estimatedCostUSD?: number
+  costBasis?: CostBasisShares
   calls: number
   sessions: number
   /// How `sessions` was derived. `identity` is exact unique source ids with no
@@ -82,6 +83,9 @@ export type PeriodData = {
   /// Rows are by-reference (a session that switched branches counts toward each),
   /// so never sum them. Absent when no branch data was observed.
   byBranch?: BranchRow[]
+  /// Claude spend per account (see claude-identity.ts). Absent unless the
+  /// period holds two or more identities.
+  identities?: IdentitySplitRow[]
 }
 
 export type PullRequestsPayload = {
@@ -138,16 +142,18 @@ export type ProviderCost = {
   /** Portion of `cost` priced from estimates (live parse only). Absent when zero. */
   estimatedCostUSD?: number
 }
-import type { OptimizeResult } from './optimize.js'
+import { findingUSD, type OptimizeResult } from './optimize.js'
 import { getCurrency } from './currency.js'
 import type { GranularHistory } from './granular-history.js'
 import { getShortModelName, modelRowKey } from './models.js'
 import type { ReworkedFile } from './workflow-insights.js'
-import type { PrRow, BranchRow } from './sessions-report.js'
+import type { CostBasisShares } from './session-output.js'
+import { sessionCacheHitPercent, type PrRow, type BranchRow } from './sessions-report.js'
 import type { LiveSessionsBlock } from './live-sessions.js'
 import type { CursorSyncStatus } from './cursor-sync.js'
 import { buildTelemetrySnapshot, type TelemetrySnapshot, type TelemetrySnapshotInput } from './telemetry-snapshot.js'
 import type { SessionCountBasis } from './session-count-label.js'
+import type { IdentitySplitRow } from './claude-identity.js'
 
 const TOP_ACTIVITIES_LIMIT = 20
 const TOP_FINDINGS_LIMIT = 10
@@ -326,6 +332,7 @@ export type MenubarPayload = {
     /// display/metadata only, never summed into `cost`. Optional for compatibility
     /// with payloads produced before the field existed.
     estimatedCostUSD?: number
+    costBasis?: CostBasisShares
     topActivities: Array<{
       name: string
       cost: number
@@ -516,6 +523,7 @@ export type MenubarPayload = {
     /// branch-bearing session. By-reference like the PR rows. Absent when no
     /// branch data was observed, and on payloads produced before the field.
     byBranch?: BranchRow[]
+    identities?: IdentitySplitRow[]
   }
   optimize: {
     findingCount: number
@@ -564,12 +572,6 @@ function aggregateOneShotRate(categories: PeriodData['categories']): number | nu
   }
   if (edits === 0) return null
   return oneShots / edits
-}
-
-function cacheHitPercent(inputTokens: number, cacheReadTokens: number): number {
-  const denom = inputTokens + cacheReadTokens
-  if (denom === 0) return 0
-  return (cacheReadTokens / denom) * 100
 }
 
 function buildTopActivities(categories: PeriodData['categories']): MenubarPayload['current']['topActivities'] {
@@ -667,11 +669,11 @@ function buildOptimize(optimize: OptimizeResult | null): MenubarPayload['optimiz
     return { findingCount: 0, savingsUSD: 0, topFindings: [] }
   }
   const { findings, costRate } = optimize
-  const totalSavingsUSD = findings.reduce((s, f) => s + f.tokensSaved * costRate, 0)
+  const totalSavingsUSD = findings.reduce((s, f) => s + findingUSD(f, costRate), 0)
   const topFindings = findings.slice(0, TOP_FINDINGS_LIMIT).map(f => ({
     title: f.title,
     impact: f.impact,
-    savingsUSD: f.tokensSaved * costRate,
+    savingsUSD: findingUSD(f, costRate),
   }))
   return {
     findingCount: findings.length,
@@ -831,9 +833,10 @@ export function buildMenubarPayload(
       outputTokens: current.outputTokens,
       cacheReadTokens: current.cacheReadTokens,
       cacheWriteTokens: current.cacheWriteTokens,
-      cacheHitPercent: cacheHitPercent(current.inputTokens, current.cacheReadTokens),
+      cacheHitPercent: sessionCacheHitPercent(current.inputTokens, current.cacheReadTokens, current.cacheWriteTokens) ?? 0,
       codexCredits: current.codexCredits ?? 0,
       estimatedCostUSD: current.estimatedCostUSD ?? 0,
+      ...(current.costBasis ? { costBasis: current.costBasis } : {}),
       topActivities: buildTopActivities(current.categories),
       topModels: buildTopModels(current.models),
       unpricedModels: current.unpricedModels ?? [],
@@ -857,6 +860,7 @@ export function buildMenubarPayload(
       // predate the fields.
       ...(current.pullRequests ? { pullRequests: current.pullRequests } : {}),
       ...(current.byBranch ? { byBranch: current.byBranch } : {}),
+      ...(current.identities ? { identities: current.identities } : {}),
     },
     optimize: buildOptimize(optimize),
     history: buildHistory(dailyHistory, granularHistory),

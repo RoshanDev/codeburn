@@ -235,10 +235,12 @@ describe('exportCsv', () => {
   it('keeps supplementary accounting rows in records.csv and marks them', async () => {
     const project = makeProject('app')
     const turn = project.sessions[0]!.turns[0]!
+    turn.assistantCalls[0]!.costBasis = 'calculated'
     turn.assistantCalls.push({
       ...turn.assistantCalls[0]!,
       supplementaryAccounting: true,
       costUSD: 0.5,
+      costBasis: 'recorded',
       deduplicationKey: 'dedup-supp',
     })
     const periods: PeriodExport[] = [{ label: '30 Days', projects: [project] }]
@@ -248,9 +250,9 @@ describe('exportCsv', () => {
 
     // The column exists on every row (undefined on normal ones), so rowsToCsv —
     // which reads headers off the first row — always emits it.
-    expect(lines[0]!.endsWith(',supplementary,estimated,unpriced')).toBe(true)
-    expect(lines[1]!.endsWith(',1.23,0,,,')).toBe(true)
-    expect(lines[2]!.endsWith(',0.5,0,true,,')).toBe(true)
+    expect(lines[0]!.endsWith(',costBasis,supplementary,estimated,unpriced,retained')).toBe(true)
+    expect(lines[1]!.endsWith(',1.23,0,calculated,,,,')).toBe(true)
+    expect(lines[2]!.endsWith(',0.5,0,recorded,true,,,')).toBe(true)
     expect(lines).toHaveLength(3)
   })
 
@@ -263,8 +265,8 @@ describe('exportCsv', () => {
     const folder = await exportCsv([{ label: '30 Days', projects: [project] }], join(tmpDir, 'records.csv'))
     const lines = (await readFile(join(folder, 'records.csv'), 'utf-8')).trimEnd().split('\n')
 
-    expect(lines[1]!.endsWith(',0.3,0,,,')).toBe(true)
-    expect(lines[2]!.endsWith(',0.0000001,0,,,')).toBe(true)
+    expect(lines[1]!.endsWith(',0.3,0,,,,,')).toBe(true)
+    expect(lines[2]!.endsWith(',0.0000001,0,,,,,')).toBe(true)
   })
 
   it('counts only behavioral turns in the sessions.csv Turns column', async () => {
@@ -288,13 +290,36 @@ describe('exportCsv', () => {
     expect(turns).toBe('1')
   })
 
+  it('keeps every CSV header line byte-identical to v2', async () => {
+    const project = makeProject('app', 'planner')
+    project.sessions[0]!.mcpBreakdown = { github: { calls: 1 } }
+    const folder = await exportCsv([{ label: '30 Days', projects: [project] }], join(tmpDir, 'headers'))
+    const headers: Record<string, string> = {}
+    for (const f of (await readdir(folder)).filter(f => f.endsWith('.csv')).sort()) {
+      headers[f] = (await readFile(join(folder, f), 'utf-8')).split('\n')[0]!
+    }
+
+    expect(headers).toEqual({
+      'activity.csv': 'Period,Activity,Cost (USD),Share (%),Turns',
+      'daily.csv': 'Period,Date,Cost (USD),Saved (USD),API Calls,Sessions,Input Tokens,Output Tokens,Cache Read Tokens,Cache Write Tokens',
+      'mcp.csv': 'Server,Calls,Share (%)',
+      'models.csv': 'Period,Model,Cost (USD),Saved (USD),Share (%),API Calls,Edit Turns,One-shot Rate (%),Retries/Edit,Cost/Edit (USD),Input Tokens,Output Tokens,Cache Read Tokens,Cache Write Tokens',
+      'projects.csv': 'Project,Cost (USD),Saved (USD),Avg/Session (USD),Share (%),API Calls,Sessions',
+      'records.csv': 'project,sessionId,timestamp,category,provider,subagentType,model,inputTokens,outputTokens,reasoningTokens,cacheWriteTokens,cacheReadTokens,cost,savings,costBasis,supplementary,estimated,unpriced,retained',
+      'sessions.csv': 'Project,Session ID,Started At,Cost (USD),Saved (USD),API Calls,Turns,subagentType,model,retained',
+      'shell-commands.csv': 'Command,Calls,Share (%)',
+      'summary.csv': 'Period,Cost (USD),Saved (USD),API Calls,Sessions,Projects',
+      'tools.csv': 'Tool,Calls,Share (%)',
+    })
+  })
+
   it('adds optional subagentType and unambiguous model fields to sessions.csv', async () => {
     const periods: PeriodExport[] = [{ label: '30 Days', projects: [makeProject('app', 'planner')] }]
 
     const folder = await exportCsv(periods, join(tmpDir, 'sessions.csv'))
     const sessions = await readFile(join(folder, 'sessions.csv'), 'utf-8')
 
-    expect(sessions.split('\n')[0]).toBe('Project,Session ID,Started At,Cost (USD),Saved (USD),API Calls,Turns,subagentType,model')
+    expect(sessions.split('\n')[0]).toBe('Project,Session ID,Started At,Cost (USD),Saved (USD),API Calls,Turns,subagentType,model,retained')
     expect(sessions.split('\n')[1]).toContain('planner')
     expect(sessions.split('\n')[1]).toContain("'+danger-model")
   })
@@ -325,11 +350,11 @@ describe('exportJson', () => {
     const data = JSON.parse(await readFile(saved, 'utf-8'))
 
     const daily = data.periods[0].daily as Array<Record<string, number | string>>
-    expect(daily.map(d => [d.Date, d['Cost (USD)']])).toEqual([['2026-04-14', 1.23], ['2026-04-15', 2.01]])
-    const dailySum = daily.reduce((s, d) => s + (d['Cost (USD)'] as number), 0)
+    expect(daily.map(d => [d.date, d.cost])).toEqual([['2026-04-14', 1.23], ['2026-04-15', 2.01]])
+    const dailySum = daily.reduce((s, d) => s + (d.cost as number), 0)
     const recordSum = (data.records as Array<{ cost: number }>).reduce((s, r) => s + r.cost, 0)
-    expect(dailySum).toBeCloseTo(data.summary[0]['Cost (USD)'], 10)
-    expect(recordSum).toBeCloseTo(data.summary[0]['Cost (USD)'], 10)
+    expect(dailySum).toBeCloseTo(data.summary[0].cost, 10)
+    expect(recordSum).toBeCloseTo(data.summary[0].cost, 10)
     expect(data.records[1].cost).toBe(0.004)
   })
 
@@ -375,10 +400,10 @@ describe('exportJson', () => {
 
     expect(data.periods[0].daily).toHaveLength(1)
     expect(data.periods[0].daily[0]).toMatchObject({
-      'API Calls': 1,
-      'Input Tokens': 140,
-      'Cache Read Tokens': 900,
-      'Cost (USD)': 1.73,
+      apiCalls: 1,
+      inputTokens: 140,
+      cacheReadTokens: 900,
+      cost: 1.73,
     })
   })
 
@@ -401,6 +426,50 @@ describe('exportJson', () => {
     expect(data.records[1]).toMatchObject({ supplementary: true, cost: 0.5 })
   })
 
+  it('adds a last retained column to records and sessions', async () => {
+    const project = makeProject('app')
+    project.sessions[0]!.retained = { since: '2026-09-25' }
+    const periods: PeriodExport[] = [{ label: '30 Days', projects: [project, makeProject('live')] }]
+
+    const data = JSON.parse(await readFile(await exportJson(periods, join(tmpDir, 'retained.json')), 'utf-8'))
+    expect(Object.keys(data.records[0]).at(-1)).toBe('retained')
+    expect(data.records[0].retained).toBe(true)
+    expect(data.records[1]).not.toHaveProperty('retained')
+    const session = (project: string) => data.sessions.find((s: { project: string }) => s.project === project)
+    expect(Object.keys(session('app')).at(-1)).toBe('retained')
+    expect(session('live')).not.toHaveProperty('retained')
+
+    const folder = await exportCsv(periods, join(tmpDir, 'retained-csv'))
+    for (const file of ['records.csv', 'sessions.csv']) {
+      const [header, ...rows] = (await readFile(join(folder, file), 'utf-8')).trimEnd().split('\n')
+      expect(header!.endsWith(',retained')).toBe(true)
+      expect(rows.map(row => row.split(',').at(-1)).sort()).toEqual(['', 'true'])
+    }
+  })
+
+  it('says where each dollar comes from per record, session and day', async () => {
+    const project = makeProject('app')
+    const turn = project.sessions[0]!.turns[0]!
+    const base = turn.assistantCalls[0]!
+    turn.assistantCalls = [
+      { ...base, costUSD: 3, costBasis: 'calculated' },
+      { ...base, costUSD: 1, costBasis: 'recorded', deduplicationKey: 'rec' },
+      { ...base, costUSD: 0, costBasis: 'unpriced', deduplicationKey: 'unp' },
+    ]
+    project.sessions[0]!.totalCostUSD = 4
+
+    const saved = await exportJson([{ label: '30 Days', projects: [project] }], join(tmpDir, 'basis.json'))
+    const data = JSON.parse(await readFile(saved, 'utf-8'))
+
+    expect(data.records.map((r: { costBasis: string }) => r.costBasis)).toEqual(['calculated', 'recorded', 'unpriced'])
+    expect(data.sessions[0].costBasis).toEqual({ calculated: 0.75, recorded: 0.25 })
+    expect(data.periods[0].daily[0].costBasis).toEqual({ calculated: 0.75, recorded: 0.25 })
+
+    const folder = await exportCsv([{ label: '30 Days', projects: [project] }], join(tmpDir, 'basis-csv'))
+    expect(await readFile(join(folder, 'sessions.csv'), 'utf-8')).not.toContain('costBasis')
+    expect(await readFile(join(folder, 'daily.csv'), 'utf-8')).not.toContain('costBasis')
+  })
+
   it('writes a dated file inside the folder when the destination is an existing folder', async () => {
     // The desktop app passes the folder the user picked; `${dir}.json` wrote a sibling of it.
     await writeFile(join(tmpDir, 'unrelated.txt'), 'keep me', 'utf-8')
@@ -410,7 +479,7 @@ describe('exportJson', () => {
 
     expect(saved.startsWith(join(tmpDir, 'codeburn-export-'))).toBe(true)
     expect(saved.endsWith('.json')).toBe(true)
-    expect(JSON.parse(await readFile(saved, 'utf-8')).schema).toBe('codeburn.export.v2')
+    expect(JSON.parse(await readFile(saved, 'utf-8')).schema).toBe('codeburn.export.v3')
     expect(await readFile(join(tmpDir, 'unrelated.txt'), 'utf-8')).toBe('keep me')
   })
 
@@ -421,7 +490,7 @@ describe('exportJson', () => {
     const saved = await exportJson(periods, `${folder}/`)
 
     expect(saved.startsWith(join(folder, 'codeburn-export-'))).toBe(true)
-    expect(JSON.parse(await readFile(saved, 'utf-8')).schema).toBe('codeburn.export.v2')
+    expect(JSON.parse(await readFile(saved, 'utf-8')).schema).toBe('codeburn.export.v3')
   })
 
   it('still appends .json to a destination that is not a folder', async () => {
@@ -448,8 +517,26 @@ describe('exportJson', () => {
 
     expect(Array.isArray(data.mcp)).toBe(true)
     expect(data.mcp).toEqual([
-      { Server: 'node_repl', Calls: 3, 'Share (%)': 75 },
-      { Server: 'github', Calls: 1, 'Share (%)': 25 },
+      { server: 'node_repl', calls: 3, share: 75 },
+      { server: 'github', calls: 1, share: 25 },
     ])
+  })
+
+  it('uses camelCase keys with no spaces or parentheses anywhere in the document', async () => {
+    const project = makeProject('app', 'planner')
+    project.sessions[0]!.mcpBreakdown = { github: { calls: 1 } }
+    const saved = await exportJson([{ label: '30 Days', projects: [project] }], join(tmpDir, 'keys.json'))
+    const data = JSON.parse(await readFile(saved, 'utf-8'))
+
+    expect(data.currency.code).toBe('USD')
+    expect(data.periods[0].daily[0]).toMatchObject({ period: '30 Days', date: '2026-04-14', cost: 1.23, saved: 0, apiCalls: 1, sessions: 1 })
+    const keys: string[] = []
+    const walk = (v: unknown): void => {
+      if (Array.isArray(v)) v.forEach(walk)
+      else if (v && typeof v === 'object') for (const [k, c] of Object.entries(v)) { keys.push(k); walk(c) }
+    }
+    walk(data)
+    expect(keys.length).toBeGreaterThan(50)
+    expect(keys.filter(k => /[\s()]/.test(k))).toEqual([])
   })
 })

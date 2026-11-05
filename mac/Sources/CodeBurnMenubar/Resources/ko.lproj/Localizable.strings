@@ -225,8 +225,9 @@
 "Change accent color" = "강조 색상 변경";
 "Copy update command to clipboard" = "업데이트 명령어를 클립보드에 복사";
 "Enjoying CodeBurn?" = "CodeBurn이 마음에 드시나요?";
-"Star us on GitHub" = "GitHub에서 스타를 눌러주세요";
-"Hide this banner" = "이 배너 숨기기";
+"If it has been helping you, a star on GitHub would mean a lot. It keeps the project free and open." = "도움이 되셨다면 GitHub에 스타를 남겨 주시면 큰 힘이 됩니다. 프로젝트가 무료로, 오픈 소스로 유지되는 데 도움이 됩니다.";
+"Not now" = "나중에";
+"Star on GitHub" = "GitHub에서 스타 누르기";
 "CSV (folder)" = "CSV (폴더)";
 "JSON" = "JSON";
 "Export" = "내보내기";
@@ -424,6 +425,7 @@
 "%@%% in deficit" = "%@%% 초과";
 "%@%% in reserve" = "%@%% 여유";
 "%1$@ · hits 100%% %2$@" = "%1$@ · %2$@에 100%% 도달";
+"%@ · lasts until reset" = "%@ · 초기화까지 유지";
 "%1$@ · %2$@ at reset" = "%1$@ · 초기화 시점 %2$@";
 "On pace: %1$@ at reset · hits 100%% %2$@" = "예상 순항: 초기화 시점 %1$@ · %2$@에 100%% 도달";
 "Based on last cycle: %@" = "지난 주기 기준: %@";
@@ -644,6 +646,7 @@
 "%@ today" = "오늘 %@";
 "%@ tok today" = "오늘 %@ tok";
 "%lld%% left" = "%lld%% 남음";
+"out %@" = "%@ 소진";
 
 /* MARK: Codex credit limit */
 "Monthly" = "월간";
@@ -717,9 +720,12 @@
 "Input tokens reused from this provider's prompt cache today — not fresh input (arrow.down), not cache writes, and already priced at the cache-read rate inside the burned figure." = "오늘 이 제공업체의 프롬프트 캐시에서 재사용된 입력 토큰입니다 — 새 입력(arrow.down)도 캐시 쓰기도 아니며, 소진 금액에 이미 캐시 읽기 요율로 계산되어 있습니다.";
 
 /* MARK: Quota crossing notifications */
-"%1$@ · %2$@ at 80%%" = "%1$@ · %2$@ 80%% 도달";
+"%1$@ · %2$@ at %3$lld%%" = "%1$@ · %2$@ %3$lld%% 도달";
 "%1$@ · %2$@ limit reached" = "%1$@ · %2$@ 한도 도달";
+"%1$@ %2$@ runs out at %3$@" = "%1$@ %2$@ %3$@에 소진";
+"At this pace. Resets %@." = "이 속도 기준. 초기화 %@.";
 "Quota crossings (%1$lld%% and %2$lld%%)" = "할당량 임계값 알림 (%1$lld%% 및 %2$lld%%)";
+"Warn at" = "알림 기준";
 
 /* MARK: Privacy */
 "Privacy" = "개인정보";
@@ -731,6 +737,7 @@
 "Synced from cursor.com %@" = "cursor.com에서 동기화됨 (%@)";
 "Not synced from cursor.com yet" = "아직 cursor.com에서 동기화되지 않음";
 "Cursor login expired, open Cursor to sign in again" = "Cursor 로그인이 만료되었습니다. Cursor를 열어 다시 로그인하세요";
+"Cursor encrypted its app session. Run codeburn import cursor --sync in Terminal, then allow the Cursor Safe Storage keychain prompt." = "Cursor가 세션을 암호화했습니다. 터미널에서 codeburn import cursor --sync를 실행한 뒤 Cursor Safe Storage 키체인 요청을 허용하세요.";
 "Couldn't reach cursor.com, will retry" = "cursor.com에 연결할 수 없습니다. 다시 시도합니다";
 "Couldn't read the usage export from cursor.com, will retry" = "cursor.com의 사용량 내보내기를 읽을 수 없습니다. 다시 시도합니다";
 "Sync Cursor usage from cursor.com" = "cursor.com에서 Cursor 사용량 동기화";

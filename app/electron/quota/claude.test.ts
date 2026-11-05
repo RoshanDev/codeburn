@@ -1,6 +1,16 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { decodeClaudeUsage, fetchClaudeQuota, planLabel } from './claude'
+import { claudeConfigDir, claudeKeychainService, decodeClaudeUsage, fetchClaudeQuota, planLabel } from './claude'
+import { readKeychainPassword } from './security'
+
+// Every Keychain lookup is answered here; no test reaches /usr/bin/security.
+vi.mock('./security', async importOriginal => ({
+  ...await importOriginal<typeof import('./security')>(),
+  readKeychainPassword: vi.fn(),
+}))
 
 const credential = JSON.stringify({
   claudeAiOauth: {
@@ -27,7 +37,7 @@ describe('Claude quota', () => {
     }, { accessToken: 'hidden', rateLimitTier: 'max_20x' })
 
     expect(quota.connection).toBe('connected')
-    expect(quota.planLabel).toBe('Max 20x')
+    expect(quota.planLabel).toBe('Ultra')
     expect(quota.primary?.label).toBe('Weekly')
     expect(quota.details.map(row => row.label)).toEqual(['5-hour', 'Weekly', 'Weekly · Opus', 'Weekly · Sonnet', 'Weekly · Haiku'])
     expect(quota.details.map(row => row.percent)).toEqual([0.25, 0.5, 0.75, 0.9, 0.1])
@@ -50,14 +60,19 @@ describe('Claude quota', () => {
 
   it('prefers subscriptionType over rateLimitTier for the plan label', () => {
     const cases: Array<[string | undefined, string | undefined, string]> = [
-      ['max', 'default_claude_max_20x', 'Max 20x'],
+      ['max', 'default_claude_max_20x', 'Ultra'],
       ['team', 'default_claude_max_5x', 'Team Premium'],
       ['team', undefined, 'Team'],
       ['enterprise', 'default_claude_max_5x', 'Enterprise Premium'],
       ['pro', 'default_claude_pro', 'Pro'],
       [undefined, 'max_5x', 'Max 5x'],
-      [undefined, 'max_20x', 'Max 20x'],
+      [undefined, 'max_20x', 'Ultra'],
       [undefined, 'team', 'Team'],
+      [undefined, 'default_claude_max_10x', 'Max 10x'],
+      [undefined, 'default_claude_ultra', 'Ultra'],
+      [undefined, 'default_claude_foo_bar', 'Foo bar'],
+      ['max', '', 'Max'],
+      [undefined, 'default_claude_max', 'Max'],
       [undefined, undefined, 'Subscription'],
     ]
     for (const [subscriptionType, rateLimitTier, label] of cases) {
@@ -114,7 +129,7 @@ describe('Claude keychain fallback', () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ seven_day: { utilization: 4, resets_at: '2026-07-19T00:00:00Z' } }), { status: 200 }))
     const result = await fetchClaudeQuota({ fetch: fetchMock, readFile: vi.fn(async () => null), allowKeychain: true, keychain: vi.fn(async () => ({ status: 'found' as const, value: credential })) })
     expect(result.quota.connection).toBe('connected')
-    expect(result.quota.planLabel).toBe('Max 20x')
+    expect(result.quota.planLabel).toBe('Ultra')
   })
 
   it('surfaces accessDenied when macOS blocks the keychain read', async () => {
@@ -216,5 +231,97 @@ describe('Claude credential recovery', () => {
     expect(result.quota.connection).toBe('connected')
     expect(readFile).toHaveBeenCalledTimes(2)
     expect(keychain).not.toHaveBeenCalled()
+  })
+})
+
+describe('Claude login of a non-default config dir', () => {
+  const keychain = vi.mocked(readKeychainPassword)
+  const originalPlatform = process.platform
+  const originalUser = process.env.USER
+  beforeAll(() => Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true }))
+  afterAll(() => {
+    Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true })
+    if (originalUser === undefined) delete process.env.USER
+    else process.env.USER = originalUser
+  })
+  beforeEach(() => {
+    keychain.mockReset()
+    process.env.USER = 'alice'
+  })
+
+  const WORK = '/home/alice/.claude-work'
+  const now = () => 1_760_000_000_000
+  const HOUR = 3_600_000
+  const stored = (accessToken: string, expiresAt: number) =>
+    JSON.stringify({ claudeAiOauth: { accessToken, expiresAt, rateLimitTier: 'max_20x' } })
+
+  function run(file: string | null, allowKeychain = true) {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ seven_day: { utilization: 40 } }), { status: 200 }))
+    const readFile = vi.fn(async (_path: string) => file)
+    const done = fetchClaudeQuota({ configDir: WORK, allowKeychain, fetch: fetchMock, readFile, now })
+    const bearers = () => (fetchMock.mock.calls as unknown as Array<[string, RequestInit]>)
+      .map(([, init]) => (init.headers as Record<string, string>).Authorization)
+    return { done, bearers, readFile }
+  }
+
+  it('names the Keychain item the way Claude Code 2.1.314 does', () => {
+    expect(claudeKeychainService(path.join(os.homedir(), '.claude'))).toBe('Claude Code-credentials')
+    expect(claudeKeychainService(WORK)).toBe('Claude Code-credentials-f0fc2950')
+    // The NFD spelling of /Users/rené/.claude-2 hashes as its NFC form.
+    expect(claudeKeychainService('/Users/rene\u0301/.claude-2')).toBe('Claude Code-credentials-45281352')
+  })
+
+  it("reads that dir's own file and Keychain item, $USER account first", async () => {
+    keychain.mockResolvedValue({ status: 'found', value: stored('live', now() + HOUR) })
+    const { done, readFile } = run(null)
+    expect((await done).quota).toMatchObject({ connection: 'connected', planLabel: 'Ultra' })
+    expect(readFile.mock.calls.map(call => call[0])).toEqual([path.join(WORK, '.credentials.json')])
+    expect(keychain.mock.calls).toEqual([['Claude Code-credentials-f0fc2950', ['alice', null]]])
+  })
+
+  it('prefers a live Keychain login over an expired credential file', async () => {
+    keychain.mockResolvedValue({ status: 'found', value: stored('live', now() + HOUR) })
+    const { done, bearers } = run(stored('stale', now() - 1))
+    expect((await done).quota.connection).toBe('connected')
+    expect(bearers()).toEqual(['Bearer live'])
+  })
+
+  it('reports the expired file when the Keychain holds no login', async () => {
+    keychain.mockResolvedValue({ status: 'notFound' })
+    const { done, bearers } = run(stored('stale', now() - 1))
+    expect((await done).quota).toMatchObject({ connection: 'terminalFailure', footerLines: [expect.stringMatching(/expired/i)] })
+    expect(bearers()).toEqual([])
+  })
+
+  it('reports a denied Keychain instead of the expired file', async () => {
+    keychain.mockResolvedValue({ status: 'accessDenied' })
+    const { done, bearers } = run(stored('stale', now() - 1))
+    expect((await done).quota.connection).toBe('accessDenied')
+    expect(bearers()).toEqual([])
+  })
+
+  it('leaves an expired file unchecked on a background poll, and never reads past a live file', async () => {
+    expect((await run(stored('stale', now() - 1), false).done).quota.connection).toBe('keychainUnchecked')
+    const live = run(stored('fresh', now() + HOUR))
+    expect((await live.done).quota.connection).toBe('connected')
+    expect(live.bearers()).toEqual(['Bearer fresh'])
+    expect(keychain).not.toHaveBeenCalled()
+  })
+})
+
+describe('the Claude config dir the quota reads', () => {
+  let home: string
+  beforeEach(() => { home = mkdtempSync(path.join(os.tmpdir(), 'claude-config-dir-')) })
+  afterEach(() => { rmSync(home, { recursive: true, force: true }) })
+
+  it('is the first dir in the CLI order: CLAUDE_CONFIG_DIRS, CLAUDE_CONFIG_DIR, claudeConfigDirs, ~/.claude', () => {
+    expect(claudeConfigDir({}, home)).toBe(path.join(home, '.claude'))
+    mkdirSync(path.join(home, '.config', 'codeburn'), { recursive: true })
+    writeFileSync(path.join(home, '.config', 'codeburn', 'config.json'), JSON.stringify({ claudeConfigDirs: [' ', 7, ' ~/.claude-work ', '/b'] }))
+    expect(claudeConfigDir({}, home)).toBe(path.join(home, '.claude-work'))
+    expect(claudeConfigDir({ CLAUDE_CONFIG_DIR: '/single' }, home)).toBe(path.resolve('/single'))
+    // A list of nothing but separators counts as unset.
+    expect(claudeConfigDir({ CLAUDE_CONFIG_DIRS: ` ${path.delimiter} `, CLAUDE_CONFIG_DIR: '/single' }, home)).toBe(path.resolve('/single'))
+    expect(claudeConfigDir({ CLAUDE_CONFIG_DIRS: ` ${path.delimiter} /first ${path.delimiter}/second`, CLAUDE_CONFIG_DIR: '/single' }, home)).toBe(path.resolve('/first'))
   })
 })

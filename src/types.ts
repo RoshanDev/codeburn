@@ -32,11 +32,12 @@ export type ApiUsage = {
     ephemeral_1h_input_tokens?: number
   }
   cache_read_input_tokens?: number
+  output_tokens_details?: { thinking_tokens?: number }
   server_tool_use?: {
     web_search_requests?: number
     web_fetch_requests?: number
   }
-  speed?: 'standard' | 'fast' | 'flex'
+  speed?: 'standard' | 'fast' | 'flex' | 'ultrafast'
   // Claude Code advisor tool (/advisor): per-turn sub-usage records. A record
   // with type 'advisor_message' carries the advisor model's own tokens and is
   // NOT included in the top-level totals above; type 'message' records mirror
@@ -59,7 +60,7 @@ export type ApiUsageIteration = {
     web_search_requests?: number
     web_fetch_requests?: number
   }
-  speed?: 'standard' | 'fast' | 'flex'
+  speed?: 'standard' | 'fast' | 'flex' | 'ultrafast'
 }
 
 export type AssistantMessageContent = {
@@ -70,6 +71,7 @@ export type AssistantMessageContent = {
   content: ContentBlock[]
   usage: ApiUsage
   stop_reason?: string
+  estimatedOutputChars?: number
 }
 
 export type JournalEntry = {
@@ -108,6 +110,8 @@ export type ParsedTurn = {
   spawnToolUseIds?: string[]
 }
 
+export type CostBasis = 'recorded' | 'calculated' | 'estimated' | 'included' | 'unpriced'
+
 export type ParsedApiCall = {
   provider: string
   model: string
@@ -119,7 +123,7 @@ export type ParsedApiCall = {
   subagentTypes: string[]
   hasAgentSpawn: boolean
   hasPlanMode: boolean
-  speed: 'standard' | 'fast' | 'flex'
+  speed: 'standard' | 'fast' | 'flex' | 'ultrafast'
   timestamp: string
   bashCommands: string[]
   deduplicationKey: string
@@ -145,6 +149,8 @@ export type ParsedApiCall = {
   /// across the parser/cache boundary. Aggregates roll the estimated portion up
   /// as `estimatedCostUSD`; it is display/metadata only and never changes totals.
   isEstimated?: boolean
+  costBasis?: CostBasis
+  listCostUSD?: number
   /// Lines added/removed by this call's edits, counted from tool-result diffs
   /// (Claude: `toolUseResult.structuredPatch`). Numbers only, never patch text;
   /// omitted when zero. Rich-session-capture (capture-only; no report yet).
@@ -368,6 +374,10 @@ export type SessionSummary = {
   /// the source of truth for by-PR subagent folding and are kept populated
   /// independently of this field.
   lineage?: SessionLineage
+  retained?: { since: string }
+  /// Claude only, set when sessions are read and the identity log holds two
+  /// or more accounts: the account active when the session started.
+  identity?: { hash: string; label: string }
 }
 
 export type ProjectSummary = {

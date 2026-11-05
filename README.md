@@ -29,7 +29,7 @@
 
 <p align="center"><code>npx codeburn</code></p>
 
-<p align="center"><sub>To keep it: <code>npm install -g codeburn</code> or <code>brew install codeburn</code>. Needs Node.js 22.13+.</sub></p>
+<p align="center"><sub>To keep it: <code>npm install -g codeburn</code> or <code>brew install codeburn</code>. Needs Node.js 22.15+.</sub></p>
 
 <p align="center">
   <a href="https://codeburn.app/download/mac-arm64"><img src="https://img.shields.io/badge/macOS-Apple_Silicon-F97316?logo=apple&logoColor=white" alt="Download CodeBurn for macOS (Apple Silicon)" /></a>
@@ -126,7 +126,7 @@ Tell CodeBurn which subscription you pay for and it stops showing only what you 
 
 `codeburn quota` reads the live limits out of the tools you are already signed in to. That is where the five-hour and weekly windows come from. Check it before a long run.
 
-Guard is opt-in and local. `codeburn guard install` adds Claude Code hooks that warn a session once it passes $5 and stop it at $15. Both numbers are yours to change, `codeburn guard status` shows where the hooks live, and `codeburn guard uninstall` takes them out again.
+Guard is opt-in and local. `codeburn guard install` adds Claude Code hooks that warn a session once it passes $5 and stop it at $15, and do the same for a tool call stuck in a loop or a failing command retried over and over. All the limits are yours to change, `codeburn guard status` shows where the hooks live, and `codeburn guard uninstall` takes them out again.
 
 ## Always in view
 
@@ -147,6 +147,14 @@ The desktop app runs on Windows. Install it from the [Microsoft Store](https://a
 Setup for all three platforms, including WSL, is in [Menu bar and tray](docs/menubar.md).
 
 ## Inside your agent
+
+In Claude Code, install the plugin. It sets up the MCP server below and adds `/codeburn:cost`, which summarizes today's spend:
+
+```
+/plugin install codeburn --marketplace getagentseal/codeburn
+```
+
+Or register only the MCP server:
 
 ```bash
 claude mcp add codeburn -- npx -y codeburn mcp
@@ -223,6 +231,8 @@ CodeBurn reads files that are already on your disk. There is no account, no API 
 Your prompts, your code and your project names stay on your computer. CodeBurn does not sit between you and your agent, so if it stopped working tomorrow your tools would not notice.
 
 Prices come from [LiteLLM](https://github.com/BerriAI/litellm) and refresh once a day.
+
+Everything that does leave your machine is listed in [Privacy](https://codeburn.app/docs/privacy).
 
 ## Built in the open
 
@@ -417,12 +427,14 @@ From the tools the session used and the words in your own messages, with no mode
 
 The tokens are measured for most tools. Claude Code, Codex, Gemini, Zed, OpenCode and others write real per-call input, output and cache counts into their own session files, and CodeBurn reads those rather than guessing. The price applied to them is published API pricing, so the dollar figure is arithmetic on measured tokens, not a guess about your bill. A few tools record no counts at all, so Cursor, Kiro and some Copilot sessions are estimated from content length, and those are marked estimated in the tables. Claude Code also bills some calls it does not write to its transcripts: some advisor calls, and subagent replies that keep only part of their usage. For those, CodeBurn can show less than Claude Code's own cost counter. `codeburn audit` prints a row per provider and model saying where every number came from.
 
+The JSON outputs say it per call. `export -f json` gives every record a `costBasis` of `recorded` (the tool's own figure), `calculated` (measured tokens at published prices), `estimated` (guessed tokens), `included` (covered by a subscription, $0) or `unpriced` (no known price, $0), and sessions, days, `sessions --format json` and MCP `get_usage` carry the share of cost from each of the first three. Since `codeburn.export.v3` the JSON uses fixed camelCase keys (`cost`, `apiCalls`, `inputTokens`, ...) with the currency stated once in `currency.code`; CSV headers are unchanged. New keys like this can still appear under v3.
+
 </details>
 
 <details>
 <summary><strong>Where do the prices come from, and what if a vendor changes them?</strong></summary>
 
-From [LiteLLM](https://github.com/BerriAI/litellm), fetched and cached for 24 hours under `~/.cache/codeburn/`, so a change reaches you within a day of LiteLLM picking it up. The common Claude and GPT models also carry bundled fallback prices, so a lookup miss falls back to a known rate for those. Anything else shows as unpriced rather than guessed. If a model shows $0 its name matched no price row. `codeburn models --unpriced` lists those ids, `codeburn model-alias` points a proxy-rewritten name at the real model, and `codeburn price-override` sets exact rates yourself. A session is priced with today's rates when it is read, not with the rates of the day it ran. See [Configuration](docs/configuration.md).
+From [LiteLLM](https://github.com/BerriAI/litellm), fetched and cached for 24 hours under `~/.cache/codeburn/`, so a change reaches you within a day of LiteLLM picking it up. The common Claude and GPT models also carry bundled fallback prices, so a lookup miss falls back to a known rate for those. Anything else shows as unpriced rather than guessed. If a model shows $0 its name matched no price row. `codeburn models --unpriced` lists those ids, `codeburn model-alias` points a proxy-rewritten name at the real model, and `codeburn price-override` sets exact rates yourself. On an enterprise agreement, `codeburn price-discount set <provider|model|model:kind> <percent>` takes your contracted percentage off calculated costs, while recorded costs stay as the tool billed them. A session is priced with today's rates when it is read, not with the rates of the day it ran. See [Configuration](docs/configuration.md).
 
 </details>
 
@@ -470,12 +482,12 @@ CodeBurn is MIT licensed and all of it is in this repository: the CLI, the deskt
 
 The **CLI sends nothing.** No wrapper, no proxy, no phoning home.
 
-The **desktop app and the Windows tray** can send an anonymous usage report, and only after you
-decide on the first-launch consent screen. The toggle defaults to **off** in the EU, EEA, UK and
-Switzerland, and anywhere the region is unknown; **on** elsewhere. Either way it is your call, and
-you can change it any time in **Settings > Privacy & data > Anonymous telemetry**. Turning it off
-stops all sending, clears anything queued, and mints a fresh install id so past and future reports
-cannot be linked.
+The **desktop app, the macOS menu bar and the Windows tray** can send an anonymous usage report.
+Telemetry is **on** by default in every region. The Windows tray asks once, with Accept and Decline.
+The desktop app and the macOS menu bar start with it on, and Settings turns it off at any time (on
+desktop: **Settings > Privacy & data > Anonymous telemetry**). A choice you already made is kept.
+Turning it off stops all sending, clears anything queued, and mints a fresh install id so past and
+future reports cannot be linked. What is sent is listed below.
 
 The only identifier is a random id generated on your machine. Events carry the calendar day, never
 a clock time. Alongside each batch go the app version, platform, architecture and country.
@@ -519,8 +531,8 @@ The names of the models, tools, skills and MCP servers you use are collected, as
 sets out, and a whitelist sanitizer drops anything that is not a short string, a finite number or a
 boolean before it leaves the machine.
 
-**To turn it off:** decline on the consent screen, or open **Settings > Privacy & data** and switch
-**Anonymous telemetry** off.
+**To turn it off:** press Decline on the Windows tray's notice, or open **Settings > Privacy & data**
+and switch **Anonymous telemetry** off.
 
 </details>
 

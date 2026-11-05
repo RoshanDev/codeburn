@@ -6,8 +6,8 @@ import { ErrorBoundary } from './components/ErrorBoundary'
 import { Hint } from './components/Hint'
 import { Panel } from './components/Panel'
 import { Sidebar, type Section } from './components/Sidebar'
-import { Splash } from './components/Splash'
 import { ToastHost } from './components/ToastHost'
+import { SplashThenNudge } from './components/StarNudge'
 import { UpdateBanner } from './components/UpdateBanner'
 import { rangeLabel, TopBar } from './components/TopBar'
 import { Window } from './components/Window'
@@ -528,8 +528,8 @@ function AppMain({ transientProject, onTransientProject }: { transientProject: T
   }, [overview.data, overview.error, overviewCold])
 
   // Telemetry onboarding page is hidden for now (component kept for later). On
-  // first launch, silently complete onboarding with the region-aware default
-  // (on outside EU/EEA/UK/CH, off inside); users change it in Settings. Bridge
+  // first launch, silently complete onboarding with the default (on); users
+  // change it in Settings. Bridge
   // calls stay typeof-guarded so an older preload degrades to no tracking.
   useEffect(() => {
     if (typeof codeburn.telemetryStatus !== 'function') return
@@ -986,7 +986,7 @@ function AppMain({ transientProject, onTransientProject }: { transientProject: T
     <Window>
       <Sidebar active={section} onNavigate={navigate} status={<StatusLine polled={overview} snapshot={headlineSnapshot} />} />
       <ToastHost />
-      <Splash hasData={overview.data != null || headlineSnapshot != null} hasError={overview.error != null && !overviewCold} />
+      <SplashThenNudge hasData={overview.data != null || headlineSnapshot != null} hasError={overview.error != null && !overviewCold} />
       <div className="ct" aria-busy={refreshing}>
         <div className={refreshing ? 'switch-line on' : 'switch-line'} aria-hidden="true" />
         <UpdateBanner />

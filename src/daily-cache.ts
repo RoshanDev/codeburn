@@ -357,7 +357,28 @@ import type { DateRange, ProjectSummary } from './types.js'
 // instead of dropped, Gemini 3.8 Flash placeholders get their own ids and
 // Gemini 3 Flash -a/-d rows are priced. Calls and cost only rise, so no
 // PENDING_REDERIVE_PROVIDER_VERSIONS entry is needed.
-export const DAILY_CACHE_VERSION = 74
+// v75: Copilot chat-session requests count every agent round and bill from
+// copilotCredits, and a chat session that also ran on the agent host is left
+// to it. That twin drops calls, so copilot joins
+// PENDING_REDERIVE_PROVIDER_VERSIONS at 75.
+// v76: Codex reads the Zstandard-compressed rollouts (`rollout-*.jsonl.zst`)
+// Codex moves cold sessions into, which were skipped, so days settled after
+// that move miss their Codex usage. Calls and cost only rise, so no
+// PENDING_REDERIVE_PROVIDER_VERSIONS entry is needed.
+// v77: Warp conversations that carry only total_billed_cost_in_cents are
+// priced from it instead of the credits estimate. Calls are unchanged, so no
+// PENDING_REDERIVE_PROVIDER_VERSIONS entry is needed. 77 is the generation
+// both 0.9.27 upgrade paths converge on; no-zstd Nodes can no longer run since
+// the 22.15 floor.
+// v78: subagent messages from Claude Code before 2.1.307 never got a final
+// usage row, and their output is now estimated from content. Days settled on
+// the placeholder counts re-derive so they carry it. Calls are unchanged and
+// output and cost only rise, so no PENDING_REDERIVE_PROVIDER_VERSIONS entry is
+// needed. The re-derive also moves the Claude activity split (exploration,
+// coding and delegation turns and their cost share, edit turns, one-shot
+// counts) of days whose transcripts survive onto the streamed-tool-blocks
+// parse (October 2026), which left settled days on the old split.
+export const DAILY_CACHE_VERSION = 78
 const MIN_SUPPORTED_VERSION = 28
 
 /// Providers whose per-day CALL COUNT means something different at
@@ -382,8 +403,9 @@ const MIN_SUPPORTED_VERSION = 28
 /// untouched, in both directions, and every other provider keeps the guard.
 const PENDING_REDERIVE_PROVIDER_VERSIONS: Readonly<Record<string, number>> = {
   // 56: a store row now pairs with its tokenless per-turn twin, which can
-  // move one call across midnight.
-  copilot: 56,
+  // move one call across midnight. 75: chat sessions that also ran on the
+  // agent host are no longer counted from the journal.
+  copilot: 75,
   // Codex response records replace stale/zero token_count twins and can
   // legitimately reduce counts as well as recover missing usage.
   codex: 43,
@@ -668,6 +690,7 @@ const DATE_KEY_RE = /^\d{4}-\d{2}-\d{2}$/
 export const CARRIED_MODEL_NAME = 'Unknown (carried)'
 
 const REMAINDER_KEYS = ['calls', 'cost', 'savingsUSD', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens'] as const
+const TOKEN_KEYS = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens'] as const
 
 /// Money is compared at the cent every surface reports it in. Summing a day's
 /// model rows in a different order than its total was accumulated leaves a
@@ -697,6 +720,32 @@ function creditCarriedRemainder(
   const acc = Object.hasOwn(models, CARRIED_MODEL_NAME) ? models[CARRIED_MODEL_NAME]! : emptyModelStats()
   for (const key of REMAINDER_KEYS) acc[key] += rest[key]
   setOwn(models, CARRIED_MODEL_NAME, acc)
+}
+
+/// A token-only slice used to read as a placeholder, so every merge over it
+/// added its tokens to the day again while the slice itself stayed whole. A day
+/// whose slices all carry token figures never holds more than their sum; one
+/// holding a pre-v14 slice without them keeps its own totals.
+function healTokenTotals(day: DailyEntry): void {
+  const slices = Object.values(day.providers)
+  if (slices.length === 0 || slices.some(s => TOKEN_KEYS.every(k => s[k] === undefined))) return
+  // A day whose calls or cost also disagree with its slices has a different
+  // problem, and capping its tokens alone would hide it.
+  if (slices.reduce((sum, s) => sum + s.calls, 0) !== day.calls || Math.abs(slices.reduce((sum, s) => sum + s.cost, 0) - day.cost) >= CENT) return
+  const sums = TOKEN_KEYS.map(k => slices.reduce((sum, s) => sum + (s[k] ?? 0), 0))
+  if (TOKEN_KEYS.every((k, i) => day[k] <= sums[i]!)) return
+  TOKEN_KEYS.forEach((k, i) => { day[k] = Math.min(day[k], sums[i]!) })
+  const rows: Record<string, ModelDayStats> = {}
+  for (const s of slices) {
+    for (const [name, m] of Object.entries(s.models ?? {})) {
+      const acc = Object.hasOwn(rows, name) ? rows[name]! : emptyModelStats()
+      for (const k of TOKEN_KEYS) acc[k] += m[k]
+      setOwn(rows, name, acc)
+    }
+  }
+  for (const [name, r] of Object.entries(rows)) {
+    if (Object.hasOwn(day.models, name)) for (const k of TOKEN_KEYS) day.models[name]![k] = Math.min(day.models[name]![k], r[k])
+  }
 }
 
 function migrateDays(days: Record<string, unknown>[]): DailyEntry[] {
@@ -733,6 +782,7 @@ function migrateDays(days: Record<string, unknown>[]): DailyEntry[] {
     // split while one of its slices was written before slices carried one (or
     // the reverse), and a provider-scoped view reads the slice's map alone.
     .map(day => {
+      healTokenTotals(day)
       for (const slice of Object.values(day.providers)) creditCarriedRemainder(slice, slice.models ??= {})
       creditCarriedRemainder(day, day.models)
       return day
@@ -978,8 +1028,11 @@ function applyRetention(days: DailyEntry[], newestDate: string): DailyEntry[] {
   return days.filter(d => d.date >= cutoff)
 }
 
+/// Tokens count: a slice with usage but no call or cost (a Hermes session
+/// total) is already in the day's totals, so merging over it as a placeholder
+/// counts it twice.
 function hasSliceData(slice: ProviderDaySlice): boolean {
-  return slice.cost > 0 || slice.calls > 0 || (slice.savingsUSD ?? 0) > 0
+  return slice.cost > 0 || slice.calls > 0 || (slice.savingsUSD ?? 0) > 0 || TOKEN_KEYS.some(k => (slice[k] ?? 0) > 0)
 }
 
 /// A day from a pre-v5-era cache: day-level totals exist but the providers map
@@ -1175,7 +1228,9 @@ function subtractSlice(base: ProviderDaySlice, sub: ProviderDaySlice): ProviderD
     ...(categories ? { categories } : {}),
     ...(projects ? { projects } : {}),
   }
-  return hasSliceData(out) || (out.sessions ?? 0) > 0 ? out : null
+  // Tokens alone do not keep a remainder: it can be drift between two scans or
+  // usage whose source is gone, and nothing here tells which.
+  return calls > 0 || cost > 0 || savingsUSD > 0 || sessions > 0 ? out : null
 }
 
 /// Entries are subtracted key by key, so content the fresh parse files under a

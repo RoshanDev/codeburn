@@ -164,6 +164,28 @@ describe('Sessions', () => {
     expect(container.querySelectorAll('.session-row')).toHaveLength(6)
   })
 
+  it('filters by Claude account only when the rows carry two or more', async () => {
+    const user = userEvent.setup()
+    getSessions.mockResolvedValue(rows.map((row, index) => row.provider === 'claude'
+      ? { ...row, identity: index === 0 ? { hash: 'a1b2c3d4e5f6', label: 'Acme' } : { hash: 'unattributed', label: 'unattributed' } }
+      : row))
+    const { container } = render(<Sessions period="30days" provider="all" />)
+    const group = await screen.findByRole('group', { name: 'Filter sessions by Claude account' })
+
+    await user.click(within(group).getByRole('button', { name: 'Acme' }))
+    expect(container.querySelectorAll('.session-row')).toHaveLength(1)
+    expect(screen.getByText('projects/codeburn')).toBeInTheDocument()
+    await user.click(within(group).getByRole('button', { name: 'All' }))
+    expect(container.querySelectorAll('.session-row')).toHaveLength(6)
+  })
+
+  it('shows no account filter without identities', async () => {
+    getSessions.mockResolvedValue(rows)
+    render(<Sessions period="30days" provider="all" />)
+    await screen.findByRole('textbox', { name: 'Search sessions' })
+    expect(screen.queryByRole('group', { name: 'Filter sessions by Claude account' })).not.toBeInTheDocument()
+  })
+
   it('reorders rows when the sort changes', async () => {
     const user = userEvent.setup()
     getSessions.mockResolvedValue(rows)
@@ -173,6 +195,27 @@ describe('Sessions', () => {
     expect(container.querySelector('.session-row .session-title')).toHaveTextContent('zeta/search')
     await user.click(screen.getByRole('tab', { name: 'Turns' }))
     expect(container.querySelector('.session-row .session-title')).toHaveTextContent('alpha/worker')
+  })
+
+  it('shows each session cache hit rate, sorts unmeasured sessions last, and hides the drawer hit line for them', async () => {
+    const user = userEvent.setup()
+    getSessions.mockResolvedValue([
+      session({ sessionId: 'low', project: 'low-cache', provider: 'claude', cost: 3, cacheReadTokens: 40_000, cacheWriteTokens: 4_000, cacheHitPercent: 24.4 }),
+      session({ sessionId: 'none', project: 'no-cache', provider: 'claude', cost: 2, cacheHitPercent: null }),
+      session({ sessionId: 'high', project: 'high-cache', provider: 'claude', cost: 1, cacheHitPercent: 91.6 }),
+    ])
+    const { container } = render(<Sessions period="30days" provider="all" />)
+    await waitFor(() => expect(container.querySelectorAll('.session-row')).toHaveLength(3))
+    const hitCells = () => [...container.querySelectorAll('.session-row')].map(row => row.lastElementChild?.textContent)
+
+    expect(hitCells()).toEqual(['24%', '—', '92%'])
+    await user.click(screen.getByRole('tab', { name: 'Cache hit rate' }))
+    expect(hitCells()).toEqual(['92%', '24%', '—'])
+
+    await user.click(screen.getByRole('button', { name: /no\/cache/ }))
+    const drawer = screen.getByRole('dialog', { name: /session details/i })
+    expect(within(drawer).queryByText(/% hit/)).not.toBeInTheDocument()
+    expect(within(drawer).getByText(/written to cache$/)).toBeInTheDocument()
   })
 
   it('turns provider grouping off and back on', async () => {
@@ -594,6 +637,24 @@ describe('Sessions', () => {
     // Untitled row: unchanged behavior, the project (via shortenProjectPath) stays the headline.
     expect(titles[1]).toHaveTextContent('docs/site')
     expect(ids[1]).toHaveTextContent('claude-untitled')
+  })
+
+  it('notes a session kept from the cache after its transcript went missing, in the row and the drawer', async () => {
+    const user = userEvent.setup()
+    getSessions.mockResolvedValue([
+      session({ sessionId: 'codex-kept', project: 'codeburn', provider: 'codex', cost: 5, retained: { since: '2026-09-25' } }),
+      session({ sessionId: 'codex-live', project: 'docs-site', provider: 'codex', cost: 3 }),
+    ])
+    const { container } = render(<Sessions period="30days" provider="all" />)
+    await screen.findByText('2 sessions · $8.00 · 2K tokens')
+
+    const note = `Kept from the cache; the tool's transcript has been missing since ${formatDayLong('2026-09-25T00:00')}`
+    const ids = [...container.querySelectorAll('.session-row .session-project')]
+    expect(ids[0]).toHaveTextContent(note)
+    expect(ids[1]).not.toHaveTextContent('Kept from the cache')
+
+    await user.click(container.querySelectorAll<HTMLButtonElement>('.session-row')[0]!)
+    expect(within(screen.getByRole('dialog')).getByText(note)).toHaveClass('drawer-note')
   })
 
   it('matches sessions by their captured title', async () => {

@@ -1,13 +1,14 @@
 import { writeFile, mkdir, readdir, open, stat, rm } from 'fs/promises'
 import { dirname, join, resolve } from 'path'
 
-import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
+import { CATEGORY_LABELS, type ParsedApiCall, type ProjectSummary, type TaskCategory } from './types.js'
 import { getCurrency, convertCost, roundForActiveCurrency } from './currency.js'
 import { dateKey } from './day-aggregator.js'
 import { behavioralCallWeight, behavioralTurnCount } from './behavioral-weight.js'
+import { multipleIdentities } from './claude-identity.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
-import { callBillableOutputTokens, countSessions, sessionModelBillableOutputTokens } from './session-output.js'
-import { findUnpricedModels } from './models.js'
+import { callBillableOutputTokens, costBasisShares, countSessions, sessionModelBillableOutputTokens, type CostBasisShares } from './session-output.js'
+import { findUnpricedModels, hasPriceDiscounts } from './models.js'
 
 function escCsv(s: string): string {
   const sanitized = /^[\t\r=+\-@]/.test(s) ? `'${s}` : s
@@ -17,14 +18,46 @@ function escCsv(s: string): string {
   return sanitized
 }
 
-type Row = Record<string, string | number | boolean | undefined>
+type Row = Record<string, string | number | boolean | undefined | CostBasisShares>
 
-function rowsToCsv(rows: Row[]): string {
+function csvHeaders(): Record<string, string> {
+  const { code } = getCurrency()
+  return {
+    period: 'Period',
+    date: 'Date',
+    cost: `Cost (${code})`,
+    saved: `Saved (${code})`,
+    apiCalls: 'API Calls',
+    sessions: 'Sessions',
+    inputTokens: 'Input Tokens',
+    outputTokens: 'Output Tokens',
+    cacheReadTokens: 'Cache Read Tokens',
+    cacheWriteTokens: 'Cache Write Tokens',
+    activity: 'Activity',
+    share: 'Share (%)',
+    turns: 'Turns',
+    editTurns: 'Edit Turns',
+    oneShotRate: 'One-shot Rate (%)',
+    retriesPerEdit: 'Retries/Edit',
+    costPerEdit: `Cost/Edit (${code})`,
+    avgPerSession: `Avg/Session (${code})`,
+    project: 'Project',
+    projects: 'Projects',
+    sessionId: 'Session ID',
+    startedAt: 'Started At',
+    tool: 'Tool',
+    server: 'Server',
+    command: 'Command',
+    calls: 'Calls',
+  }
+}
+
+function rowsToCsv(rows: Row[], names: Record<string, string> = csvHeaders()): string {
   if (rows.length === 0) return ''
-  const headers = Object.keys(rows[0])
-  const lines = [headers.map(escCsv).join(',')]
+  const keys = Object.keys(rows[0])
+  const lines = [keys.map(k => escCsv(names[k] ?? k)).join(',')]
   for (const row of rows) {
-    lines.push(headers.map(h => escCsv(csvCell(row[h]))).join(','))
+    lines.push(keys.map(k => escCsv(csvCell(row[k]))).join(','))
   }
   return lines.join('\n') + '\n'
 }
@@ -52,9 +85,10 @@ type DailyAgg = {
   cacheRead: number
   cacheWrite: number
   sessions: Set<string>
+  served: ParsedApiCall[]
 }
 
-function buildDailyRows(projects: ProjectSummary[], period: string): Row[] {
+function buildDailyRows(projects: ProjectSummary[], period: string, withCostBasis = false): Row[] {
   const daily: Record<string, DailyAgg> = {}
   for (const project of projects) {
     for (const session of project.sessions) {
@@ -65,7 +99,7 @@ function buildDailyRows(projects: ProjectSummary[], period: string): Row[] {
           // rows sum to the summary and land on the days the history shows.
           const day = dateKey(Number.isNaN(new Date(call.timestamp).getTime()) ? turnTs : call.timestamp)
           if (!daily[day]) {
-            daily[day] = { cost: 0, savings: 0, calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, sessions: new Set() }
+            daily[day] = { cost: 0, savings: 0, calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, sessions: new Set(), served: [] }
           }
           daily[day].sessions.add(session.sessionId)
           daily[day].cost += call.costUSD
@@ -78,26 +112,27 @@ function buildDailyRows(projects: ProjectSummary[], period: string): Row[] {
           daily[day].output += callBillableOutputTokens(call)
           daily[day].cacheRead += call.usage.cacheReadInputTokens
           daily[day].cacheWrite += call.usage.cacheCreationInputTokens
+          daily[day].served.push(call)
         }
       }
     }
   }
-  const { code } = getCurrency()
   return Object.entries(daily).sort().map(([date, d]) => ({
-    Period: period,
-    Date: date,
-    [`Cost (${code})`]: roundForActiveCurrency(convertCost(d.cost)),
-    [`Saved (${code})`]: roundForActiveCurrency(convertCost(d.savings)),
-    'API Calls': d.calls,
-    Sessions: d.sessions.size,
-    'Input Tokens': d.input,
-    'Output Tokens': d.output,
-    'Cache Read Tokens': d.cacheRead,
-    'Cache Write Tokens': d.cacheWrite,
+    period,
+    date,
+    cost: roundForActiveCurrency(convertCost(d.cost)),
+    saved: roundForActiveCurrency(convertCost(d.savings)),
+    apiCalls: d.calls,
+    sessions: d.sessions.size,
+    inputTokens: d.input,
+    outputTokens: d.output,
+    cacheReadTokens: d.cacheRead,
+    cacheWriteTokens: d.cacheWrite,
+    ...(withCostBasis ? { costBasis: costBasisShares(d.served) } : {}),
   }))
 }
 
-function buildRecordRows(projects: ProjectSummary[]): Row[] {
+function buildRecordRows(projects: ProjectSummary[], split = false): Row[] {
   const rows: Row[] = []
   const unpricedModels = new Map<string, boolean>()
   const isUnpriced = (model: string, cost: number): boolean => {
@@ -128,6 +163,7 @@ function buildRecordRows(projects: ProjectSummary[]): Row[] {
             cacheReadTokens: Math.max(call.usage.cacheReadInputTokens, call.usage.cachedInputTokens),
             cost: convertCost(call.costUSD),
             savings: convertCost(call.savingsUSD ?? 0),
+            costBasis: call.costBasis,
             // Records are the raw serve ledger and keep every supplementary
             // accounting row; the marker is how a "one row per API call"
             // consumer tells them apart. Key present on every row (undefined
@@ -136,6 +172,9 @@ function buildRecordRows(projects: ProjectSummary[]): Row[] {
             supplementary: call.supplementaryAccounting ? true : undefined,
             estimated: call.isEstimated ? true : undefined,
             unpriced: isUnpriced(call.model, call.costUSD) ? true : undefined,
+            retained: session.retained ? true : undefined,
+            ...(hasPriceDiscounts() ? { listCost: call.listCostUSD !== undefined ? convertCost(call.listCostUSD) : undefined } : {}),
+            ...(split ? { identity: session.identity?.label } : {}),
           })
         }
       }
@@ -156,15 +195,14 @@ function buildActivityRows(projects: ProjectSummary[], period: string): Row[] {
     }
   }
   const totalCost = Object.values(catTotals).reduce((s, d) => s + d.cost, 0)
-  const { code } = getCurrency()
   return Object.entries(catTotals)
     .sort(([, a], [, b]) => b.cost - a.cost)
     .map(([cat, d]) => ({
-      Period: period,
-      Activity: CATEGORY_LABELS[cat as TaskCategory] ?? cat,
-      [`Cost (${code})`]: roundForActiveCurrency(convertCost(d.cost)),
-      'Share (%)': pct(d.cost, totalCost),
-      Turns: d.turns,
+      period,
+      activity: CATEGORY_LABELS[cat as TaskCategory] ?? cat,
+      cost: roundForActiveCurrency(convertCost(d.cost)),
+      share: pct(d.cost, totalCost),
+      turns: d.turns,
     }))
 }
 
@@ -194,29 +232,28 @@ function buildModelRows(projects: ProjectSummary[], period: string): Row[] {
     }
   }
   const totalCost = Object.values(modelTotals).reduce((s, d) => s + d.cost, 0)
-  const { code } = getCurrency()
   return Object.entries(modelTotals)
     .filter(([name]) => name !== '<synthetic>')
     .sort(([, a], [, b]) => (b.cost + b.savings) - (a.cost + a.savings))
     .map(([model, d]) => {
       const efficiency = modelEfficiency.get(model)
       return {
-        Period: period,
-        Model: model,
-        [`Cost (${code})`]: roundForActiveCurrency(convertCost(d.cost)),
-        [`Saved (${code})`]: roundForActiveCurrency(convertCost(d.savings)),
-        'Share (%)': pct(d.cost, totalCost),
-        'API Calls': d.calls,
-        'Edit Turns': efficiency?.editTurns ?? 0,
-        'One-shot Rate (%)': efficiency?.oneShotRate ?? '',
-        'Retries/Edit': efficiency?.retriesPerEdit ?? '',
-        [`Cost/Edit (${code})`]: efficiency?.costPerEditUSD !== null && efficiency?.costPerEditUSD !== undefined
+        period,
+        model,
+        cost: roundForActiveCurrency(convertCost(d.cost)),
+        saved: roundForActiveCurrency(convertCost(d.savings)),
+        share: pct(d.cost, totalCost),
+        apiCalls: d.calls,
+        editTurns: efficiency?.editTurns ?? 0,
+        oneShotRate: efficiency?.oneShotRate ?? '',
+        retriesPerEdit: efficiency?.retriesPerEdit ?? '',
+        costPerEdit: efficiency?.costPerEditUSD !== null && efficiency?.costPerEditUSD !== undefined
           ? roundForActiveCurrency(convertCost(efficiency.costPerEditUSD))
           : '',
-        'Input Tokens': d.input,
-        'Output Tokens': d.output,
-        'Cache Read Tokens': d.cacheRead,
-        'Cache Write Tokens': d.cacheWrite,
+        inputTokens: d.input,
+        outputTokens: d.output,
+        cacheReadTokens: d.cacheRead,
+        cacheWriteTokens: d.cacheWrite,
       }
     })
 }
@@ -234,9 +271,9 @@ function buildToolRows(projects: ProjectSummary[]): Row[] {
   return Object.entries(toolTotals)
     .sort(([, a], [, b]) => b - a)
     .map(([tool, calls]) => ({
-      Tool: tool,
-      Calls: calls,
-      'Share (%)': pct(calls, total),
+      tool,
+      calls,
+      share: pct(calls, total),
     }))
 }
 
@@ -253,9 +290,9 @@ function buildMcpRows(projects: ProjectSummary[]): Row[] {
   return Object.entries(mcpTotals)
     .sort(([, a], [, b]) => b - a)
     .map(([server, calls]) => ({
-      Server: server,
-      Calls: calls,
-      'Share (%)': pct(calls, total),
+      server,
+      calls,
+      share: pct(calls, total),
     }))
 }
 
@@ -272,31 +309,29 @@ function buildBashRows(projects: ProjectSummary[]): Row[] {
   return Object.entries(bashTotals)
     .sort(([, a], [, b]) => b - a)
     .map(([cmd, calls]) => ({
-      Command: cmd,
-      Calls: calls,
-      'Share (%)': pct(calls, total),
+      command: cmd,
+      calls,
+      share: pct(calls, total),
     }))
 }
 
 function buildProjectRows(projects: ProjectSummary[]): Row[] {
-  const { code } = getCurrency()
   const total = projects.reduce((s, p) => s + p.totalCostUSD, 0)
   return projects
     .slice()
     .sort((a, b) => (b.totalCostUSD + b.totalSavingsUSD) - (a.totalCostUSD + a.totalSavingsUSD))
     .map(p => ({
-      Project: p.projectPath,
-      [`Cost (${code})`]: roundForActiveCurrency(convertCost(p.totalCostUSD)),
-      [`Saved (${code})`]: roundForActiveCurrency(convertCost(p.totalSavingsUSD)),
-      [`Avg/Session (${code})`]: p.sessions.length > 0 ? roundForActiveCurrency(convertCost(p.totalCostUSD / p.sessions.length)) : '',
-      'Share (%)': pct(p.totalCostUSD, total),
-      'API Calls': p.totalApiCalls,
-      Sessions: p.sessions.length,
+      project: p.projectPath,
+      cost: roundForActiveCurrency(convertCost(p.totalCostUSD)),
+      saved: roundForActiveCurrency(convertCost(p.totalSavingsUSD)),
+      avgPerSession: p.sessions.length > 0 ? roundForActiveCurrency(convertCost(p.totalCostUSD / p.sessions.length)) : '',
+      share: pct(p.totalCostUSD, total),
+      apiCalls: p.totalApiCalls,
+      sessions: p.sessions.length,
     }))
 }
 
-function buildSessionRows(projects: ProjectSummary[]): Row[] {
-  const { code } = getCurrency()
+function buildSessionRows(projects: ProjectSummary[], withCostBasis = false, split = false): Row[] {
   const rows: Row[] = []
   for (const p of projects) {
     for (const s of p.sessions) {
@@ -304,19 +339,22 @@ function buildSessionRows(projects: ProjectSummary[]): Row[] {
         s.turns.flatMap(turn => turn.assistantCalls.map(call => call.model).filter(Boolean)),
       )
       rows.push({
-        Project: p.projectPath,
-        'Session ID': s.sessionId,
-        'Started At': s.firstTimestamp ?? '',
-        [`Cost (${code})`]: roundForActiveCurrency(convertCost(s.totalCostUSD)),
-        [`Saved (${code})`]: roundForActiveCurrency(convertCost(s.totalSavingsUSD)),
-        'API Calls': s.apiCalls,
-        Turns: behavioralTurnCount(s.turns),
+        project: p.projectPath,
+        sessionId: s.sessionId,
+        startedAt: s.firstTimestamp ?? '',
+        cost: roundForActiveCurrency(convertCost(s.totalCostUSD)),
+        saved: roundForActiveCurrency(convertCost(s.totalSavingsUSD)),
+        apiCalls: s.apiCalls,
+        turns: behavioralTurnCount(s.turns),
         subagentType: s.agentType?.trim() || undefined,
         model: models.size === 1 ? [...models][0] : undefined,
+        ...(withCostBasis ? { costBasis: costBasisShares(s.turns.flatMap(turn => turn.assistantCalls)) } : {}),
+        retained: s.retained ? true : undefined,
+        ...(split ? { identity: s.identity?.label } : {}),
       })
     }
   }
-  return rows.sort((a, b) => ((b[`Cost (${code})`] as number) + (b[`Saved (${code})`] as number)) - ((a[`Cost (${code})`] as number) + (a[`Saved (${code})`] as number)))
+  return rows.sort((a, b) => ((b.cost as number) + (b.saved as number)) - ((a.cost as number) + (a.saved as number)))
 }
 
 export type PeriodExport = {
@@ -325,7 +363,6 @@ export type PeriodExport = {
 }
 
 function buildSummaryRows(periods: PeriodExport[]): Row[] {
-  const { code } = getCurrency()
   return periods.map(p => {
     const cost = p.projects.reduce((s, proj) => s + proj.totalCostUSD, 0)
     const savings = p.projects.reduce((s, proj) => s + proj.totalSavingsUSD, 0)
@@ -333,12 +370,12 @@ function buildSummaryRows(periods: PeriodExport[]): Row[] {
     const sessions = countSessions(p.projects)
     const projectCount = p.projects.filter(proj => proj.totalCostUSD > 0 || proj.totalSavingsUSD > 0).length
     return {
-      Period: p.label,
-      [`Cost (${code})`]: roundForActiveCurrency(convertCost(cost)),
-      [`Saved (${code})`]: roundForActiveCurrency(convertCost(savings)),
-      'API Calls': calls,
-      Sessions: sessions,
-      Projects: projectCount,
+      period: p.label,
+      cost: roundForActiveCurrency(convertCost(cost)),
+      saved: roundForActiveCurrency(convertCost(savings)),
+      apiCalls: calls,
+      sessions,
+      projects: projectCount,
     }
   })
 }
@@ -364,7 +401,15 @@ function buildReadme(periods: PeriodExport[]): string {
     '                        supplementary marks accounting-only rows: recovered tokens/cost that',
     '                        are not distinct requests. estimated marks costs priced from',
     '                        estimated or missing token counts; unpriced marks $0 rows whose',
-    '                        model has no known price. cost is unrounded.',
+    '                        model has no known price. cost is unrounded. costBasis says where the',
+    '                        cost came from: recorded (the tool\'s own figure), calculated (measured',
+    '                        tokens at published prices), estimated (guessed tokens), included',
+    '                        (covered by a subscription, $0) or unpriced (no known price, $0).',
+    '                        retained marks a session kept from the cache after its tool removed the transcript;',
+    '                        sessions.csv carries the same column.',
+    '                        listCost (only with price-discount set) is the list-price cost of a discounted call.',
+    '                        identity (only once codeburn has seen two or more Claude identities) is the organization',
+    '                        (or account) active when the session started; sessions.csv carries it too.',
     '  projects.csv          Spend per project folder for the selected detail period.',
     '  sessions.csv          One row per session for the selected detail period.',
     '  tools.csv             Tool invocations and share for the selected detail period.',
@@ -375,6 +420,10 @@ function buildReadme(periods: PeriodExport[]): string {
     '-----',
     '  Every cost column is already converted to the active currency. Tokens are raw integer',
     '  counts from provider telemetry. Share (%) is relative to the period/table total.',
+    '  CSV headers are unchanged. New columns can be added; read them by header.',
+    '  The JSON export (codeburn.export.v3) uses fixed camelCase keys (cost, saved, apiCalls,',
+    '  inputTokens, ...) and states the currency once in currency.code. v2 consumers must rename',
+    '  keys. New keys can still appear under v3; read them by name.',
     '',
   ]
   return lines.join('\n')
@@ -403,6 +452,7 @@ async function clearCodeburnExportFolder(path: string): Promise<void> {
 export async function exportCsv(periods: PeriodExport[], outputPath: string): Promise<string> {
   const thirtyDays = periods.find(p => p.label === '30 Days')
   const thirtyDayProjects = thirtyDays?.projects ?? periods[periods.length - 1]?.projects ?? []
+  const split = await multipleIdentities()
 
   let folder = resolve(outputPath)
   if (folder.toLowerCase().endsWith('.csv')) {
@@ -442,10 +492,10 @@ export async function exportCsv(periods: PeriodExport[], outputPath: string): Pr
   await writeFile(join(folder, 'summary.csv'), rowsToCsv(buildSummaryRows(periods)), 'utf-8')
   await writeFile(join(folder, 'daily.csv'), rowsToCsv(dailyRows), 'utf-8')
   await writeFile(join(folder, 'activity.csv'), rowsToCsv(activityRows), 'utf-8')
-  await writeFile(join(folder, 'models.csv'), rowsToCsv(modelRows), 'utf-8')
-  await writeFile(join(folder, 'records.csv'), rowsToCsv(buildRecordRows(thirtyDayProjects)), 'utf-8')
+  await writeFile(join(folder, 'models.csv'), rowsToCsv(modelRows, { ...csvHeaders(), model: 'Model' }), 'utf-8')
+  await writeFile(join(folder, 'records.csv'), rowsToCsv(buildRecordRows(thirtyDayProjects, split), {}), 'utf-8')
   await writeFile(join(folder, 'projects.csv'), rowsToCsv(buildProjectRows(thirtyDayProjects)), 'utf-8')
-  await writeFile(join(folder, 'sessions.csv'), rowsToCsv(buildSessionRows(thirtyDayProjects)), 'utf-8')
+  await writeFile(join(folder, 'sessions.csv'), rowsToCsv(buildSessionRows(thirtyDayProjects, false, split)), 'utf-8')
   await writeFile(join(folder, 'tools.csv'), rowsToCsv(buildToolRows(thirtyDayProjects)), 'utf-8')
   await writeFile(join(folder, 'mcp.csv'), rowsToCsv(buildMcpRows(thirtyDayProjects)), 'utf-8')
   await writeFile(join(folder, 'shell-commands.csv'), rowsToCsv(buildBashRows(thirtyDayProjects)), 'utf-8')
@@ -456,22 +506,23 @@ export async function exportCsv(periods: PeriodExport[], outputPath: string): Pr
 export async function exportJson(periods: PeriodExport[], outputPath: string): Promise<string> {
   const thirtyDays = periods.find(p => p.label === '30 Days')
   const thirtyDayProjects = thirtyDays?.projects ?? periods[periods.length - 1]?.projects ?? []
+  const split = await multipleIdentities()
   const { code, rate, symbol } = getCurrency()
 
   const data = {
-    schema: 'codeburn.export.v2',
+    schema: 'codeburn.export.v3',
     generated: new Date().toISOString(),
     currency: { code, rate, symbol },
     summary: buildSummaryRows(periods),
     periods: periods.map(p => ({
       label: p.label,
-      daily: buildDailyRows(p.projects, p.label),
+      daily: buildDailyRows(p.projects, p.label, true),
       activity: buildActivityRows(p.projects, p.label),
       models: buildModelRows(p.projects, p.label),
     })),
     projects: buildProjectRows(thirtyDayProjects),
-    sessions: buildSessionRows(thirtyDayProjects),
-    records: buildRecordRows(thirtyDayProjects),
+    sessions: buildSessionRows(thirtyDayProjects, true, split),
+    records: buildRecordRows(thirtyDayProjects, split),
     tools: buildToolRows(thirtyDayProjects),
     mcp: buildMcpRows(thirtyDayProjects),
     shellCommands: buildBashRows(thirtyDayProjects),

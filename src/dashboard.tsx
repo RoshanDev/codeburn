@@ -12,10 +12,11 @@ import { parseAllSessions, excludeAggregateOnlyProjects, filterProjectsByDateRan
 import { findUnpricedModels, isExpectedFreeModel, loadPricing } from './models.js'
 import { aggregateModelTotals } from './model-breakdown.js'
 import { buildDurableOverviewFromNormalizedIndex, buildDurablePeriod, hydrateDailyCacheFromNormalizedProjects, type ExcludedGatewayTotals } from './usage-aggregator.js'
+import { identitySplit } from './claude-identity.js'
 import { loadDailyCache, type DailyCache } from './daily-cache.js'
 import { exitAfterCacheCleanup } from './session-cache.js'
 import { getAllProviders, safeDiscoverSessions } from './providers/index.js'
-import { classHeaderLine, classTotals, findingBasis, findingClass, scanAndDetect, type FindingClass, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
+import { classHeaderLine, classTotals, findingBasis, findingClass, findingUSD, scanAndDetect, type FindingClass, type WasteFinding, type WasteAction, type OptimizeResult } from './optimize.js'
 import { appliedFixGlyph, formatAppliedFix, type AppliedFix } from './act/types.js'
 import { aggregateFileChurn, buildCoachingNotes, computePricingCoverage, medianTimeToFirstEditMs, scanUserCorrections, worstOneShotCategory, type ReworkedFile } from './workflow-insights.js'
 import { estimateContextBudget, type ContextBudget } from './context-budget.js'
@@ -29,6 +30,7 @@ import { BSU, patchStdoutForWindows } from './ink-win.js'
 import { startUserTimingGuard } from './user-timing-guard.js'
 import { folderNameOriginKey, isTemporaryProjectPath, linkedOriginKey, originRepoName, projectOriginKey, TEMPORARY_PROJECTS } from './git-origin.js'
 import { countSessions } from './session-output.js'
+import { sessionCacheHitPercent } from './sessions-report.js'
 
 type View = 'dashboard' | 'optimize' | 'compare'
 
@@ -612,9 +614,7 @@ function Overview({ projects, label, width, planUsages, durable }: { projects: P
   const totalOutput = durable ? durable.outputTokens : allSessions.reduce((s, sess) => s + sess.totalOutputTokens, 0)
   const totalCacheRead = durable ? durable.cacheReadTokens : allSessions.reduce((s, sess) => s + sess.totalCacheReadTokens, 0)
   const totalCacheWrite = durable ? durable.cacheWriteTokens : allSessions.reduce((s, sess) => s + sess.totalCacheWriteTokens, 0)
-  const allInputTokens = totalInput + totalCacheRead + totalCacheWrite
-  const cacheHit = allInputTokens > 0
-    ? (totalCacheRead / allInputTokens) * 100 : 0
+  const cacheHit = sessionCacheHitPercent(totalInput, totalCacheRead, totalCacheWrite) ?? 0
   const activePlanUsages = planUsages ?? []
 
   return (
@@ -1143,6 +1143,21 @@ function ClaudeAgentTypes({ projects, pw, bw }: { projects: ProjectSummary[]; pw
   )
 }
 
+function IdentityBreakdown({ projects, pw, bw }: { projects: ProjectSummary[]; pw: number; bw: number }) {
+  const rows = identitySplit(projects)
+  if (!rows) return null
+  const headers = ['sessions', 'cost']
+  const metricWidths = getMetricWidths(headers, rows.map(row => [String(row.sessions), formatCost(row.cost)]))
+  return (
+    <Panel title="By Claude Account" color={PANEL_COLORS.project} width={pw}>
+      <DataRow panelWidth={pw} barWidth={bw} label="" metrics={headers.map(text => ({ text, dimColor: true }))} metricWidths={metricWidths} />
+      {rows.map(row => (
+        <DataRow key={row.hash} panelWidth={pw} barWidth={bw} label={row.label} bar={{ value: row.cost, max: rows[0]!.cost }} metrics={[{ text: String(row.sessions) }, { text: formatCost(row.cost), color: GOLD }]} metricWidths={metricWidths} />
+      ))}
+    </Panel>
+  )
+}
+
 /// Workflow-intelligence figures for the compact Workflow panel. Derived from
 /// the already-parsed projects the other panels render (no re-parse), mirroring
 /// the same helpers `optimize` and the report use so the numbers agree.
@@ -1352,8 +1367,8 @@ function FindingAction({ action }: { action: WasteAction }) {
   )
 }
 
-function FindingPanel({ index, finding, costRate, width }: { index: number; finding: WasteFinding; costRate: number; width: number }) {
-  const costSaved = finding.tokensSaved * costRate
+export function FindingPanel({ index, finding, costRate, width }: { index: number; finding: WasteFinding; costRate: number; width: number }) {
+  const costSaved = findingUSD(finding, costRate)
   const color = IMPACT_PANEL_COLORS[finding.impact] ?? DIM
   const label = finding.impact.charAt(0).toUpperCase() + finding.impact.slice(1)
   const trendBadge = finding.trend === 'improving' ? ' improving \u2193' : ''
@@ -1366,7 +1381,7 @@ function FindingPanel({ index, finding, costRate, width }: { index: number; find
         {trendBadge && <Text color="#5BF5A0">{trendBadge}</Text>}
       </Text>
       <Text dimColor wrap="wrap">{finding.explanation}</Text>
-      <Text color={GOLD}>Savings: ~{formatTokens(finding.tokensSaved)} tokens (~{formatCost(costSaved)})<Text dimColor>  {findingBasis(finding)}</Text></Text>
+      {(finding.tokensSaved > 0 || costSaved > 0) && <Text color={GOLD}>Savings: ~{formatTokens(finding.tokensSaved)} tokens (~{formatCost(costSaved)})<Text dimColor>  {findingBasis(finding)}</Text></Text>}
       <Text> </Text>
       <FindingAction action={finding.fix} />
     </Box>
@@ -1391,7 +1406,7 @@ const APPLIED_FIX_COLORS: Record<AppliedFix['verdict'], string> = {
 function OptimizeView({ findings, costRate, projects, label, width, healthScore, healthGrade, cursor, appliedFixes = [] }: { findings: WasteFinding[]; costRate: number; projects: ProjectSummary[]; label: string; width: number; healthScore: number; healthGrade: string; cursor: number; appliedFixes?: AppliedFix[] }) {
   const periodCost = projects.reduce((s, p) => s + p.totalCostUSD, 0)
   const totalTokens = findings.reduce((s, f) => s + f.tokensSaved, 0)
-  const totalCost = totalTokens * costRate
+  const totalCost = findings.reduce((s, f) => s + findingUSD(f, costRate), 0)
   const pctRaw = periodCost > 0 ? (totalCost / periodCost) * 100 : 0
   const pct = pctRaw >= 1 ? pctRaw.toFixed(0) : pctRaw.toFixed(1)
   const gradeColor = GRADE_COLORS[healthGrade] ?? DIM
@@ -1507,6 +1522,7 @@ function DashboardContent({ projects, period, columns, maxContentWidth, activePr
       <Box flexWrap="wrap" width={dashWidth}>
         <DailyActivity projects={scrollableDailyHistory ? (dailyHistoryProjects ?? []) : projects} days={days} pw={panelWidth} bw={barWidth} scrollable={scrollableDailyHistory} cursor={dailyHistoryCursor} loading={dailyHistoryLoading} />
         <ProjectBreakdown projects={projects} pw={panelWidth} bw={barWidth} budgets={budgets} rows={getProjectBreakdownRowLimit(period, dayMode)} />
+        <IdentityBreakdown projects={projects} pw={panelWidth} bw={barWidth} />
         <ActivityBreakdown projects={projects} pw={panelWidth} bw={barWidth} />
         <ModelBreakdown projects={projects} pw={panelWidth} bw={barWidth} />
         {isCursor

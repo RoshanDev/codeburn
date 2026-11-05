@@ -175,7 +175,7 @@ export type CursorSyncStatus = {
   enabled: boolean
   state: 'ok' | 'syncing-never' | 'error' | 'off' | 'no-login'
   lastSuccessAt: string | null
-  errorCode?: 'login' | 'network' | 'export'
+  errorCode?: 'login' | 'network' | 'export' | 'locked'
   error?: string
 }
 
@@ -384,6 +384,9 @@ export type MenubarPayload = {
       attributedCost?: number
       unattributedCost?: number
     }
+    // Claude spend per account (src/claude-identity.ts). Present only when the
+    // period holds two or more identities.
+    identities?: Array<{ hash: string; label: string; cost: number; calls: number; sessions: number }>
   }
   optimize: OptimizeBlock
   history: {
@@ -716,12 +719,17 @@ export type SessionRow = {
   outputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
+  cacheHitPercent?: number | null
   startedAt: string
   endedAt: string
   durationMs: number
   // Subagent sessions folded into this parent row; their spend is already in
   // the row's totals. Absent when none (and from older CLIs).
   subagents?: SessionRow[]
+  retained?: { since: string }
+  // The Claude account active when the session started; only when the period
+  // holds two or more.
+  identity?: { hash: string; label: string }
 }
 
 // ————— src/session-contributions.ts (drill-through, `sessions --contributions`) —————

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.2
+
+- Bundles CodeBurn CLI 0.9.27.
+
 ## 1.0.1
 
 - Bundles CodeBurn CLI 0.9.26: more accurate numbers across tools, Amp and Command Code, and the pull request details.

@@ -224,9 +224,10 @@
 "resets in %@" = "%@後にリセット";
 "Change accent color" = "アクセントカラーを変更";
 "Copy update command to clipboard" = "更新コマンドをクリップボードにコピー";
-"Enjoying CodeBurn?" = "CodeBurnを楽しんでいますか？";
-"Star us on GitHub" = "GitHubでスターをつける";
-"Hide this banner" = "このバナーを非表示";
+"Enjoying CodeBurn?" = "CodeBurn を気に入っていただけましたか？";
+"If it has been helping you, a star on GitHub would mean a lot. It keeps the project free and open." = "お役に立っているなら、GitHub でスターを付けていただけるととても励みになります。プロジェクトを無料でオープンに保つ力になります。";
+"Not now" = "今はしない";
+"Star on GitHub" = "GitHub でスターを付ける";
 "CSV (folder)" = "CSV（フォルダ）";
 "JSON" = "JSON";
 "Export" = "書き出す";
@@ -424,6 +425,7 @@
 "%@%% in deficit" = "%@%%超過";
 "%@%% in reserve" = "%@%%の余裕";
 "%1$@ · hits 100%% %2$@" = "%1$@ · %2$@に100%%到達";
+"%@ · lasts until reset" = "%@ · リセットまで持つ";
 "%1$@ · %2$@ at reset" = "%1$@ · リセット時点で%2$@";
 "On pace: %1$@ at reset · hits 100%% %2$@" = "順調なペース：リセット時点で%1$@ · %2$@に100%%到達";
 "Based on last cycle: %@" = "前回のサイクルに基づく：%@";
@@ -644,6 +646,7 @@
 "%@ today" = "今日 %@";
 "%@ tok today" = "今日 %@ tok";
 "%lld%% left" = "残り%lld%%";
+"out %@" = "%@に枯渇";
 
 /* MARK: Codex credit limit */
 "Monthly" = "月間";
@@ -717,9 +720,12 @@
 "Input tokens reused from this provider's prompt cache today — not fresh input (arrow.down), not cache writes, and already priced at the cache-read rate inside the burned figure." = "今日このプロバイダーのプロンプトキャッシュから再利用された入力トークンです。新規入力（arrow.down）でもキャッシュ書き込みでもなく、消費額の数値の中ですでにキャッシュ読取レートで計上済みです。";
 
 /* MARK: Quota crossing notifications */
-"%1$@ · %2$@ at 80%%" = "%1$@ · %2$@が80%%到達";
+"%1$@ · %2$@ at %3$lld%%" = "%1$@ · %2$@が%3$lld%%到達";
 "%1$@ · %2$@ limit reached" = "%1$@ · %2$@が上限到達";
+"%1$@ %2$@ runs out at %3$@" = "%1$@ %2$@は%3$@に枯渇";
+"At this pace. Resets %@." = "このペースの場合。リセットは%@。";
 "Quota crossings (%1$lld%% and %2$lld%%)" = "クォータ通知しきい値（%1$lld%%と%2$lld%%）";
+"Warn at" = "通知するしきい値";
 
 /* MARK: Privacy */
 "Privacy" = "プライバシー";
@@ -731,6 +737,7 @@
 "Synced from cursor.com %@" = "cursor.comから同期しました（%@）";
 "Not synced from cursor.com yet" = "cursor.comからはまだ同期していません";
 "Cursor login expired, open Cursor to sign in again" = "Cursorのサインインの有効期限が切れました。Cursorを開いてもう一度サインインしてください";
+"Cursor encrypted its app session. Run codeburn import cursor --sync in Terminal, then allow the Cursor Safe Storage keychain prompt." = "Cursorがセッションを暗号化しました。ターミナルで codeburn import cursor --sync を実行し、Cursor Safe Storageのキーチェーンの確認を許可してください。";
 "Couldn't reach cursor.com, will retry" = "cursor.comに接続できませんでした。再試行します";
 "Couldn't read the usage export from cursor.com, will retry" = "cursor.comの使用量エクスポートを読み取れませんでした。再試行します";
 "Sync Cursor usage from cursor.com" = "Cursorの使用量をcursor.comから同期";

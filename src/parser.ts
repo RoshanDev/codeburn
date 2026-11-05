@@ -5,10 +5,12 @@ import { createHash } from 'crypto'
 import { performance } from 'node:perf_hooks'
 import { basename, dirname, join, resolve, sep } from 'path'
 import { FS_SCAN_CONCURRENCY, mapWithConcurrency, readSessionLines } from './fs-utils.js'
-import { billableOutputTokens, calculateCost, calculateLocalModelSavings, getShortModelName, modelRowKey, pricingModelAt, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash, recordedCostFallback, getModelRoute, isStandInPricedAt } from './models.js'
+import { billableOutputTokens, calculateCost, calculateLocalModelSavings, getShortModelName, modelRowKey, pricingModelAt, isProxiedPath, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash, recordedCostFallback, getModelRoute, isStandInPricedAt, findUnpricedModels, hasPriceDiscounts } from './models.js'
 import { resolveSubagentAttribution, sessionIdentity } from './sessions-report.js'
 import { applyCodexSessionNames } from './codex-session-index.js'
+import { applyClaudeIdentities, identityLogPath, observeClaudeIdentities } from './claude-identity.js'
 import { normalizeContentBlocks, flatSlice, flatString } from './content-utils.js'
+import { estimateTokensFromChars } from './token-estimate.js'
 import { discoverAllSessions, discoverAllSessionsWithFailures, getProvider } from './providers/index.js'
 import { evictCachedCodexResults, flushCodexCache, readCachedCodexResults, withCodexCacheDirectory, writeCachedCodexResults } from './codex-cache.js'
 import { antigravityCascadeIdFromPath, flushAntigravityCache, preloadAntigravityCache, shouldReparseAntigravitySource } from './providers/antigravity.js'
@@ -672,8 +674,52 @@ function extractObjectFields(
   return captured
 }
 
-const LARGE_ROOT_FIELDS = ['type', 'timestamp', 'sessionId', 'cwd', 'gitBranch', 'attachment', 'message', 'isSidechain', 'promptSource'] as const
-const LARGE_ASSISTANT_MESSAGE_FIELDS = ['model', 'usage', 'id', 'content'] as const
+const LARGE_ROOT_FIELDS = ['type', 'timestamp', 'sessionId', 'cwd', 'gitBranch', 'attachment', 'message', 'isSidechain', 'promptSource', 'version'] as const
+const LARGE_ASSISTANT_MESSAGE_FIELDS = ['model', 'usage', 'id', 'content', 'stop_reason'] as const
+
+// Claude Code before 2.1.307 never wrote the final usage of a subagent message:
+// every row of the id keeps the first streamed chunk's output_tokens and a null
+// stop_reason, so the real output is lost and has to be estimated from content.
+function hasPlaceholderUsage(isSidechain: boolean | undefined, version: unknown, stopReason: unknown): boolean {
+  if (isSidechain !== true || stopReason || typeof version !== 'string') return false
+  const [major, minor, patch] = version.split('.').map(Number)
+  if (major !== 2) return major! < 2
+  if (minor !== 1) return minor! < 1
+  return patch! < 307
+}
+
+function contentOutputChars(content: ContentBlock[]): number {
+  let chars = 0
+  for (const b of content) {
+    if (b?.type === 'text' && typeof b.text === 'string') chars += b.text.length
+    else if (b?.type === 'tool_use' || b?.type === 'server_tool_use') chars += JSON.stringify((b as ToolUseBlock).input ?? {}).length
+  }
+  return chars
+}
+
+function largeContentOutputChars(source: JsonSource, contentBounds: JsonValueBounds | null): number {
+  if (!contentBounds || contentBounds.kind !== 'array') return 0
+  let chars = 0
+  let i = contentBounds.start + 1
+  while (i < contentBounds.end - 1) {
+    i = skipJsonWhitespace(source, i, contentBounds.end)
+    if (jsonCharCodeAt(source, i) !== 0x7b) {
+      i++
+      continue
+    }
+    const objectEnd = findJsonContainerEnd(source, i, 0x7b, 0x7d, contentBounds.end)
+    if (objectEnd === -1) break
+    const blockType = readJsonString(source, findObjectFieldValue(source, i, objectEnd + 1, 'type'))
+    if (blockType === 'text') {
+      chars += readJsonString(source, findObjectFieldValue(source, i, objectEnd + 1, 'text'))?.length ?? 0
+    } else if (blockType === 'tool_use' || blockType === 'server_tool_use') {
+      const input = findObjectFieldValue(source, i, objectEnd + 1, 'input')
+      if (input) chars += input.end - input.start
+    }
+    i = objectEnd + 1
+  }
+  return chars
+}
 
 function parseLargeJsonl(line: string | Buffer): JournalEntry | null {
   const source = createJsonSource(line)
@@ -722,6 +768,7 @@ function parseLargeJsonl(line: string | Buffer): JournalEntry | null {
   if (!model || usageBounds?.kind !== 'object') return entry
   const id = readJsonString(source, messageFields['id'])
   const contentBounds = messageFields['content']
+  const placeholder = hasPlaceholderUsage(entry.isSidechain, readJsonString(source, root['version']), readJsonString(source, messageFields['stop_reason']))
 
   entry.message = {
     type: 'message',
@@ -730,6 +777,7 @@ function parseLargeJsonl(line: string | Buffer): JournalEntry | null {
     ...(id !== undefined ? { id } : {}),
     content: extractLargeToolBlocks(source, contentBounds),
     usage: parseLargeUsage(source, usageBounds),
+    ...(placeholder ? { estimatedOutputChars: largeContentOutputChars(source, contentBounds) } : {}),
   }
 
   return entry
@@ -1174,6 +1222,7 @@ export function compactEntry(raw: JournalEntry): JournalEntry {
     }
   }
   if (u.cache_read_input_tokens) compactUsage.cache_read_input_tokens = u.cache_read_input_tokens
+  if (u.output_tokens_details?.thinking_tokens) compactUsage.output_tokens_details = { thinking_tokens: u.output_tokens_details.thinking_tokens }
   if (u.server_tool_use) {
     compactUsage.server_tool_use = {
       ...(u.server_tool_use.web_search_requests ? { web_search_requests: u.server_tool_use.web_search_requests } : {}),
@@ -1209,6 +1258,8 @@ export function compactEntry(raw: JournalEntry): JournalEntry {
     if (advisorIterations.length > 0) compactUsage.iterations = advisorIterations
   }
 
+  const estimatedOutputChars = msg.estimatedOutputChars
+    ?? (hasPlaceholderUsage(raw.isSidechain, raw.version, msg.stop_reason) ? contentOutputChars(contentArr) : undefined)
   entry.message = {
     type: 'message',
     role: 'assistant',
@@ -1216,6 +1267,7 @@ export function compactEntry(raw: JournalEntry): JournalEntry {
     usage: compactUsage,
     content: compactContent,
     ...(msg.id ? { id: msg.id } : {}),
+    ...(estimatedOutputChars !== undefined ? { estimatedOutputChars } : {}),
   }
 
   return entry
@@ -1498,7 +1550,7 @@ export function parseApiCall(entry: JournalEntry, toolResultMeta?: Map<string, T
     cacheCreationInputTokens: cacheCreation.totalTokens,
     cacheReadInputTokens: usage.cache_read_input_tokens ?? 0,
     cachedInputTokens: 0,
-    reasoningTokens: 0,
+    reasoningTokens: usage.output_tokens_details?.thinking_tokens ?? 0,
     webSearchRequests: usage.server_tool_use?.web_search_requests ?? 0,
   }
 
@@ -1509,6 +1561,9 @@ export function parseApiCall(entry: JournalEntry, toolResultMeta?: Map<string, T
   const tools = extractToolNames(contentBlocks)
   const skills = extractSkillNames(contentBlocks)
   const subagentTypes = extractSubagentTypes(contentBlocks)
+  const estimatedOutput = msg.estimatedOutputChars === undefined ? 0 : estimateTokensFromChars(msg.estimatedOutputChars)
+  const outputIsEstimated = estimatedOutput > tokens.outputTokens
+  if (outputIsEstimated) tokens.outputTokens = estimatedOutput
   const costUSD = calculateCost(
     msg.model,
     tokens.inputTokens,
@@ -1584,6 +1639,7 @@ export function parseApiCall(entry: JournalEntry, toolResultMeta?: Map<string, T
     ...(interrupted ? { interrupted: true } : {}),
     ...(userModified ? { userModified: true } : {}),
     ...(toolErrors ? { toolErrors } : {}),
+    ...(outputIsEstimated ? { isEstimated: true } : {}),
   })
 }
 
@@ -1658,11 +1714,15 @@ export function parseAdvisorCalls(entry: JournalEntry): ParsedApiCall[] {
 export function dedupeStreamingMessageIds(entries: JournalEntry[]): JournalEntry[] {
   const firstIdxById = new Map<string, number>()
   const lastIdxById = new Map<string, number>()
+  const idxsById = new Map<string, number[]>()
   for (let i = 0; i < entries.length; i++) {
     const id = getMessageId(entries[i]!)
     if (!id) continue
     if (!firstIdxById.has(id)) firstIdxById.set(id, i)
     lastIdxById.set(id, i)
+    const idxs = idxsById.get(id)
+    if (idxs) idxs.push(i)
+    else idxsById.set(id, [i])
   }
   if (lastIdxById.size === 0) return entries
   const result: JournalEntry[] = []
@@ -1670,13 +1730,52 @@ export function dedupeStreamingMessageIds(entries: JournalEntry[]): JournalEntry
     const id = getMessageId(entries[i]!)
     if (id && lastIdxById.get(id) !== i) continue
     if (id && firstIdxById.get(id) !== i) {
-      const firstTs = entries[firstIdxById.get(id)!]!.timestamp
-      result.push({ ...entries[i]!, timestamp: firstTs ?? entries[i]!.timestamp })
+      const firstIdx = firstIdxById.get(id)!
+      const firstTs = entries[firstIdx]!.timestamp
+      const idxs = idxsById.get(id)!
+      let message = withEarlierToolUses(entries, idxs)
+      // A placeholder message is spread one content block per row, so its
+      // output estimate is the sum over every row of the id.
+      const last = entries[i]!.message as AssistantMessageContent
+      if (last.estimatedOutputChars !== undefined) {
+        let chars = 0
+        for (const j of idxs) chars += (entries[j]!.message as AssistantMessageContent).estimatedOutputChars ?? 0
+        message = { ...(message ?? last), estimatedOutputChars: chars }
+      }
+      result.push({ ...entries[i]!, timestamp: firstTs ?? entries[i]!.timestamp, ...(message ? { message } : {}) })
       continue
     }
     result.push(entries[i]!)
   }
   return result
+}
+
+// Claude Code writes one line per content block, so the parallel tool calls of
+// one message sit on separate lines and the last line holds only the last of
+// them. Keeping the last line alone keeps the authoritative usage but drops the
+// earlier tool_use blocks, and with them their tool, MCP and Bash counts. This
+// returns the last line's message with those earlier blocks put back in order,
+// matched by block id so a stream that restates every block in its final write
+// (#110) is not counted twice. Null when nothing was missing.
+function withEarlierToolUses(entries: JournalEntry[], idxs: number[]): AssistantMessageContent | null {
+  const last = entries[idxs[idxs.length - 1]!]!.message as AssistantMessageContent
+  const lastContent = Array.isArray(last.content) ? last.content : []
+  const present = new Set<string>()
+  for (const block of lastContent) {
+    if (block.type === 'tool_use' && typeof block.id === 'string') present.add(block.id)
+  }
+  const missing: ContentBlock[] = []
+  for (const j of idxs.slice(0, -1)) {
+    const content = (entries[j]!.message as AssistantMessageContent).content
+    if (!Array.isArray(content)) continue
+    for (const block of content) {
+      if (block.type !== 'tool_use' || typeof block.id !== 'string' || present.has(block.id)) continue
+      present.add(block.id)
+      missing.push(block)
+    }
+  }
+  if (missing.length === 0) return null
+  return { ...last, content: [...missing, ...lastContent] }
 }
 
 export function groupIntoTurns(entries: JournalEntry[], seenMsgIds: Set<string>, toolResultMeta?: Map<string, ToolResultMeta>): ParsedTurn[] {
@@ -2242,6 +2341,10 @@ async function scanProjectDirs(
     // under a live root and must not keep serving stale usage. PR-bearing
     // orphans remain the existing intentional legacy exception.
     if (!readOnly && !cached.prLinks?.length && wslStatus !== 'offline' && wslStatus !== 'disabled') continue
+    if (!readOnly && !cached.retainedSince && !['offline', 'disabled'].includes(wslStatus)) {
+      cached.retainedSince = dateKey(new Date().toISOString())
+      markCacheDirty(diskCache, 'claude', filePath)
+    }
     const dirName = cached.canonicalProjectName
       ?? cached.turns[0]?.calls[0]?.project
       ?? basename(dirname(filePath))
@@ -2640,6 +2743,7 @@ async function scanProjectDirs(
       }
       if (prRefsAtRangeStart?.length) session.prRefsAtRangeStart = prRefsAtRangeStart
       if (cachedFile.title) session.title = cachedFile.title
+      if (cachedFile.retainedSince && !allDiscoveredFiles.has(filePath)) session.retained = { since: cachedFile.retainedSince }
       // Sidechain linkage: carry the parent id (the transcript's internal
       // `sessionId`, authoritative even when it disagrees with the owning directory
       // on a resumed session) and derive the agent id from the `agent-<agentId>`
@@ -2974,19 +3078,22 @@ function providerCallsToCachedTurns(calls: ParsedProviderCall[]): CachedTurn[] {
   return turns
 }
 
-function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
+export function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
   const u = call.usage
   // Cache-rehydration twin of the fresh-parse pricing in
   // src/providers/codex.ts (and every other provider's parser): both go
   // through billableOutputTokens so a cached read and a cold parse can never
   // disagree about whether reasoning is already inside output (#1075).
   const outputForCost = billableOutputTokens(call.provider, u.outputTokens, u.reasoningTokens)
-  const costUSD = calculateCost(
+  const priceAt = (applyDiscount: boolean) => calculateCost(
     pricingModelAt(call.model, call.timestamp), u.inputTokens, outputForCost,
     u.cacheCreationInputTokens, u.cacheReadInputTokens,
-    u.webSearchRequests, call.speed, u.cacheCreationOneHourTokens, call.provider,
+    u.webSearchRequests, call.speed, u.cacheCreationOneHourTokens, call.provider, applyDiscount,
   )
-  return applyLocalModelSavings({
+  const listCostUSD = priceAt(false)
+  const fallbackCostUSD = call.costUSD === undefined ? recordedCostFallback(call.model, listCostUSD, call.fallbackCostUSD) : undefined
+  const costUSD = call.costUSD === undefined && fallbackCostUSD === undefined && hasPriceDiscounts() ? priceAt(true) : listCostUSD
+  const apiCall = applyLocalModelSavings({
     provider: call.provider,
     model: call.model,
     usage: {
@@ -2998,7 +3105,7 @@ function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
       reasoningTokens: u.reasoningTokens,
       webSearchRequests: u.webSearchRequests,
     },
-    costUSD: call.costUSD ?? recordedCostFallback(call.model, costUSD, call.fallbackCostUSD) ?? costUSD,
+    costUSD: call.costUSD ?? fallbackCostUSD ?? costUSD,
     isEstimated: call.isEstimated || (call.costUSD === undefined && isStandInPricedAt(call.model, call.timestamp)) || undefined,
     tools: call.tools,
     mcpTools: extractMcpTools(call.tools),
@@ -3023,6 +3130,13 @@ function cachedCallToApiCall(call: CachedCall): ParsedApiCall {
       ? { supplementaryAccounting: true }
       : {}),
   })
+  apiCall.costBasis = call.billing === 'subscription' && call.costUSD === 0 ? 'included'
+    : apiCall.isEstimated ? 'estimated'
+    : call.costUSD !== undefined || fallbackCostUSD !== undefined ? 'recorded'
+    : apiCall.costUSD === 0 && findUnpricedModels([{ model: call.model, calls: 1, cost: 0 }]).length > 0 ? 'unpriced'
+    : 'calculated'
+  if (costUSD < listCostUSD && !apiCall.isLocalSavings) apiCall.listCostUSD = listCostUSD
+  return apiCall
 }
 
 // NOT memoizable as it stands, though it looks pure and is the obvious next
@@ -3811,7 +3925,9 @@ export async function parseProviderSources(
       if (await readCachedCodexResults(source.path)) continue
       workerJobs.push({ kind: 'codex', source })
       workerPaths.add(source.path)
-      pendingBytes += fp.sizeBytes
+      // The worker memory budget scales with decoded size; real compressed
+      // rollouts decode to about 4x their size on disk (1.4-13x per file).
+      pendingBytes += source.path.endsWith('.zst') ? fp.sizeBytes * 4 : fp.sizeBytes
     }
   }
   const decision = workerJobs.length > 0
@@ -4113,6 +4229,9 @@ export async function parseProviderSources(
       if (!allDiscoveredFiles.has(cachedPath) && newestTs > 0 && newestTs < cutoffMs) {
         delete section.files[cachedPath]
         markCacheDirty(diskCache, providerName, cachedPath)
+      } else if (!allDiscoveredFiles.has(cachedPath) && !cachedFile.retainedSince && !['offline', 'disabled'].includes(classifyWslCachePath(cachedPath, wslHomesForOrphans))) {
+        cachedFile.retainedSince = dateKey(new Date().toISOString())
+        markCacheDirty(diskCache, providerName, cachedPath)
       }
     }
   }
@@ -4163,6 +4282,7 @@ export async function parseProviderSources(
     storeProject: Map<string, string>
     nanRollupFallbackTs: Map<string, string>
     sessionEarliestValidTs: Map<string, string>
+    agentHostUsageSessions: Set<string>
   } | null = null
   if (providerName === 'copilot') {
     // DEPENDS on the durable full-load exemption in session-cache.ts
@@ -4189,6 +4309,11 @@ export async function parseProviderSources(
     // sealed days.
     const nanRollupFallbackTs = new Map<string, string>()
     const sessionEarliestValidTs = new Map<string, string>()
+    // Sessions the agent host bills (session-state rollups or turns, store
+    // rows). A VS Code chat-session journal of the same session is a second
+    // record of the same requests, so it is left out at serve time. A
+    // session-state file with no usage yet keeps the journal.
+    const agentHostUsageSessions = new Set<string>()
     // Session-state per-turn calls carry no per-call project (the serve loop
     // takes it from source.project), so resolve it the same way here — every
     // call of the session must serve under the SAME label, whichever of the
@@ -4203,6 +4328,10 @@ export async function parseProviderSources(
           seenAggKeys.add(c.deduplicationKey)
           const ts = new Date(c.timestamp).getTime()
           const isStore = c.deduplicationKey.startsWith('copilot-store:')
+          if ((isStore || basename(cachedPath) === 'events.jsonl') && (c.nanoAiu != null ||
+            c.usage.inputTokens + c.usage.outputTokens + c.usage.cacheReadInputTokens + c.usage.cacheCreationInputTokens > 0)) {
+            agentHostUsageSessions.add(turn.sessionId)
+          }
           const isRollup = c.deduplicationKey.startsWith(shutdownPrefix)
           const aggKey = `${turn.sessionId}\n${c.model}`
           if (!Number.isNaN(ts)) {
@@ -4306,7 +4435,7 @@ export async function parseProviderSources(
         }
       }
     }
-    copilotRecon = { storeKeys, storeCalls, rollupLegs, supplementaryStoreKeys, turnOwnedOutputKeys, sessionProject, storeProject, nanRollupFallbackTs, sessionEarliestValidTs }
+    copilotRecon = { storeKeys, storeCalls, rollupLegs, supplementaryStoreKeys, turnOwnedOutputKeys, sessionProject, storeProject, nanRollupFallbackTs, sessionEarliestValidTs, agentHostUsageSessions }
   }
   const copilotServeProject = (sessionId: string): string | undefined =>
     copilotRecon
@@ -4318,6 +4447,10 @@ export async function parseProviderSources(
     let changed = false
     const kept: CachedCall[] = []
     for (const c of turn.calls) {
+      if (c.deduplicationKey.startsWith('copilot-chatsession:') && copilotRecon.agentHostUsageSessions.has(turn.sessionId)) {
+        changed = true
+        continue
+      }
       if (c.deduplicationKey.startsWith(shutdownPrefix)) {
         const tsValid = !Number.isNaN(new Date(c.timestamp).getTime())
         if (tsValid && copilotRecon.storeKeys.has(`${turn.sessionId}\n${c.model}`)) {
@@ -4386,7 +4519,7 @@ export async function parseProviderSources(
 
   // Query-time: derive SessionSummary from all cached turns.
   // Uses seenKeys (shared across providers) for cross-provider dedup.
-  const sessionMap = new Map<string, { project: string; projectPath?: string; workingDirectory?: string; turns: ClassifiedTurn[]; prLinks?: Set<string>; title?: string; lineage?: SessionLineage; agentName?: string; agentStartedAt?: string; source?: SessionSourceMetadata }>()
+  const sessionMap = new Map<string, { project: string; projectPath?: string; workingDirectory?: string; turns: ClassifiedTurn[]; prLinks?: Set<string>; title?: string; lineage?: SessionLineage; agentName?: string; agentStartedAt?: string; source?: SessionSourceMetadata; retainedSince?: string }>()
 
   for (const source of servedSources) {
     const cachedFile = section.files[source.path]
@@ -4539,8 +4672,9 @@ export async function parseProviderSources(
           if (!existingEntry.projectPath && slicedTurn.calls[0]?.projectPath) {
             existingEntry.projectPath = slicedTurn.calls[0]!.projectPath
           }
+          existingEntry.retainedSince ??= cachedFile.retainedSince
         } else {
-          sessionMap.set(key, { project, projectPath: slicedTurn.calls[0]?.projectPath, workingDirectory: trustedWorkingDirectory, turns: [classified] })
+          sessionMap.set(key, { project, projectPath: slicedTurn.calls[0]?.projectPath, workingDirectory: trustedWorkingDirectory, turns: [classified], retainedSince: cachedFile.retainedSince })
         }
       }
     }
@@ -4631,11 +4765,14 @@ export async function parseProviderSources(
           if (Number.isNaN(ts.getTime()) || ts < dateRange.start || ts > dateRange.end) continue
         }
         const calls = residualsBySession.get(sessionId) ?? []
+        const listCostUSD = calculateCost(model, input, output, cacheWrite, cacheRead, 0)
+        const costUSD = calculateCost(model, input, output, cacheWrite, cacheRead, 0, 'standard', 0, 'copilot', true)
         calls.push({
           provider: 'copilot',
           model,
           usage: { inputTokens: input, outputTokens: output, cacheCreationInputTokens: cacheWrite, cacheReadInputTokens: cacheRead, cachedInputTokens: 0, reasoningTokens: reasoning, webSearchRequests: 0 },
-          costUSD: calculateCost(model, input, output, cacheWrite, cacheRead, 0),
+          costUSD,
+          ...(costUSD < listCostUSD ? { listCostUSD } : {}),
           tools: [], mcpTools: [], skills: [], subagentTypes: [],
           hasAgentSpawn: false, hasPlanMode: false,
           speed: 'standard', timestamp: leg.rawTs, bashCommands: [],
@@ -4648,6 +4785,7 @@ export async function parseProviderSources(
           // per leg after the equal-timestamp coalescing above.
           deduplicationKey: `copilot:${sessionId}:shutdown-residual:${model}:${leg.ts}`,
           supplementaryAccounting: true,
+          costBasis: 'calculated',
         })
         residualsBySession.set(sessionId, calls)
       }
@@ -4687,7 +4825,7 @@ export async function parseProviderSources(
   // (first projectPath wins) before mergeProjectsByCrossProviderKey could see
   // distinct abs identities.
   const projectMap = new Map<string, { project: string; projectPath?: string; sessions: SessionSummary[] }>()
-  for (const [key, { project, projectPath, workingDirectory, turns, prLinks, title, lineage, agentName, agentStartedAt, source }] of sessionMap) {
+  for (const [key, { project, projectPath, workingDirectory, turns, prLinks, title, lineage, agentName, agentStartedAt, source, retainedSince }] of sessionMap) {
     const sessionId = key.split(':')[1] ?? key
     const assembledTurns = providerName === 'copilot'
       ? foldCopilotSupplementaryTurns(sessionId, turns, copilotRecon?.supplementaryStoreKeys)
@@ -4704,6 +4842,7 @@ export async function parseProviderSources(
     if (lineage) session.lineage = lineage
     if (agentName) session.agentName = agentName
     if (agentStartedAt) session.agentStartedAt = agentStartedAt
+    if (retainedSince) session.retained = { since: retainedSince }
     // Supplementary-only sessions (e.g. a rollup with no per-turn calls) have
     // apiCalls 0 by design but their tokens/cost are real and must serve.
     if (session.apiCalls > 0 || session.totalCostUSD > 0 || session.totalInputTokens + session.totalOutputTokens + session.totalCacheReadTokens + session.totalCacheWriteTokens + session.totalReasoningTokens > 0) {
@@ -5162,6 +5301,7 @@ function carryLinkageFields(rebuilt: SessionSummary, original: SessionSummary): 
   if (original.agentName) rebuilt.agentName = original.agentName
   if (original.agentStartedAt) rebuilt.agentStartedAt = original.agentStartedAt
   if (original.lineage) rebuilt.lineage = original.lineage
+  if (original.retained) rebuilt.retained = original.retained
   if (original.projectSplit) rebuilt.projectSplit = original.projectSplit
 }
 
@@ -5661,6 +5801,17 @@ export function correlateCrossProviderPrSessions(projects: ProjectSummary[]): vo
   }
 }
 
+export function filterProjectsByIdentity(projects: ProjectSummary[], hash: string): ProjectSummary[] {
+  const filtered: ProjectSummary[] = []
+  for (const project of projects) {
+    const sessions = project.sessions.filter(session => session.identity?.hash === hash)
+    const anchors = (project.subagentAnchors ?? []).filter(anchor => anchor.identity?.hash === hash)
+    if (sessions.length === 0 && anchors.length === 0) continue
+    filtered.push(summarizeProject(project.project, project.projectPath, sessions, anchors))
+  }
+  return filtered.sort((a, b) => b.totalCostUSD - a.totalCostUSD)
+}
+
 export function filterProjectsByClaudeConfigSource(projects: ProjectSummary[], sourceId: string): ProjectSummary[] {
   const filtered: ProjectSummary[] = []
   for (const project of projects) {
@@ -5958,6 +6109,11 @@ export async function computeCorpusFingerprint(providerFilter?: string): Promise
   const resolveProvider = async (name: string): Promise<Provider | undefined> => {
     if (!providerByName.has(name)) providerByName.set(name, await getProvider(name))
     return providerByName.get(name)
+  }
+  if (!providerFilter || providerFilter === 'all' || providerFilter === 'claude') {
+    await observeClaudeIdentities().catch(() => {})
+    const log = await fingerprintFile(identityLogPath())
+    entries.push(`identity-log:${log ? `${log.mtimeMs}|${log.sizeBytes}` : '-'}`)
   }
   // Non-discovery provider env vars (e.g. CODEBURN_CURSOR_MAX_BUBBLES,
   // KIMI_MODEL_NAME — src/doctor.ts's NON_DISCOVERY_ENV_VARS) and a
@@ -6287,7 +6443,7 @@ export function parseAllSessions(
   providerFilter?: string,
   opts?: { includeAggregateOnly?: boolean },
 ): Promise<ProjectSummary[]> {
-  const parsed = parseAllSessionsUnfiltered(dateRange, providerFilter).then(applyCodexSessionNames)
+  const parsed = parseAllSessionsUnfiltered(dateRange, providerFilter).then(applyCodexSessionNames).then(projects => applyClaudeIdentities(projects))
   if (opts?.includeAggregateOnly === true) return parsed
   return parsed.then(projects => excludeAggregateOnlyProjects(projects, providerFilter))
 }

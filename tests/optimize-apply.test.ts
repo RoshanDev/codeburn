@@ -957,12 +957,16 @@ describe('finding class', () => {
       'context-heavy-sessions': makeFinding('context-heavy-sessions', OPENER_FIX),
       'cost-outliers': makeFinding('cost-outliers', OPENER_FIX),
       'low-cache-hit-sessions': makeFinding('low-cache-hit-sessions', OPENER_FIX),
+      'one-hour-cache-unused': makeFinding('one-hour-cache-unused', PROMPT_FIX),
       'claude-md-too-long': makeFinding('claude-md-too-long', PROMPT_FIX),
       'bash-output-cap': makeFinding('bash-output-cap', SHELL_FIX),
       'unused-agents': makeFinding('unused-agents', CMD_FIX, { kind: 'archive', names: ['ghost'] }),
       'unused-skills': makeFinding('unused-skills', CMD_FIX, { kind: 'archive', names: ['ghost'] }),
       'unused-commands': makeFinding('unused-commands', CMD_FIX, { kind: 'archive', names: ['ghost'] }),
       'recurring-context': makeFinding('recurring-context', PROMPT_FIX),
+      'fast-mode-background': makeFinding('fast-mode-background', PROMPT_FIX),
+      'long-context-premium': makeFinding('long-context-premium', PROMPT_FIX),
+      'idle-compaction-blocked': makeFinding('idle-compaction-blocked', PROMPT_FIX),
     }
 
     const planCtx: PlanContext = { homeDir: fx.home, cwd: fx.project, shell: '/bin/zsh', claudeVersion: () => '2.1.130' }

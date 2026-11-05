@@ -601,7 +601,11 @@ function streakDays(daily: DailyHistoryEntry[], now: Date): number {
 function CountUp({ value, tokens, animateKey, animate = true, estimated = false }: { value: number; tokens?: ReturnType<typeof tokensOf>; animateKey: string; animate?: boolean; estimated?: boolean }) {
   const pop = useUsdPop<HTMLDivElement>(tokens, false, estimated)
   const mark = estimated ? '~' : ''
-  const ref = pop.ref
+  const formattedValue = formatUsd(value)
+  // React owns the marker and wrapper; GSAP owns only the empty number span.
+  // Replacing React's text children made React insert the estimate marker
+  // before a detached node (#1760).
+  const ref = useRef<HTMLSpanElement>(null)
   const keyRef = useRef<string | null>(null)
 
   useEffect(() => {
@@ -610,7 +614,7 @@ function CountUp({ value, tokens, animateKey, animate = true, estimated = false 
     const keyChanged = keyRef.current !== animateKey
     keyRef.current = animateKey
     if (!animate || !keyChanged || !motionEnabled()) {
-      element.textContent = mark + formatUsd(value)
+      element.textContent = formattedValue
       return
     }
     const counter = { n: 0 }
@@ -618,14 +622,14 @@ function CountUp({ value, tokens, animateKey, animate = true, estimated = false 
       n: value,
       duration: 0.7,
       ease: 'power2.out',
-      onUpdate: () => { element.textContent = mark + formatUsd(counter.n) },
+      onUpdate: () => { element.textContent = formatUsd(counter.n) },
     })
     return () => { tween.kill() }
-  }, [value, animateKey, animate, mark])
+  }, [value, animateKey, animate, formattedValue])
 
   return (
     <>
-      <div ref={ref} className="ov-hero-num" data-countup={value} data-countup-animation={animate ? 'enabled' : 'suppressed'} {...pop.props}>{mark}{formatUsd(value)}</div>
+      <div ref={pop.ref} className="ov-hero-num" data-countup={value} data-countup-animation={animate ? 'enabled' : 'suppressed'} {...pop.props}>{mark}<span ref={ref} /></div>
       {pop.pop}
     </>
   )
@@ -949,6 +953,29 @@ function TopActivities({ activities, onSelectCategory }: { activities: MenubarPa
           </div>
         )
       })}
+    </div>
+  )
+}
+
+function IdentitySplit({ identities }: { identities: NonNullable<MenubarPayload['current']['identities']> }) {
+  const maxCost = identities[0]?.cost ?? 0
+  return (
+    <div className="ov-activities">
+      {identities.map(identity => (
+        <div className="ov-activity" key={identity.hash}>
+          <div className="ov-activity-bar" aria-hidden="true">
+            <span style={{ width: `${maxCost > 0 ? identity.cost / maxCost * 100 : 0}%` }} />
+          </div>
+          <div className="ov-activity-main">
+            <span className="ov-activity-name">{identity.label}</span>
+            <strong>{formatUsd(identity.cost)}</strong>
+          </div>
+          <div className="ov-activity-meta">
+            <span>{formatCount(identity.sessions, 'session')}</span>
+            <span>{formatCount(identity.calls, 'call')}</span>
+          </div>
+        </div>
+      ))}
     </div>
   )
 }
@@ -1328,6 +1355,12 @@ export function OverviewContent({
             <div className="ov-panel-head"><Icon name="list" /><h3>{t('overview.activities.title')}</h3><span className="r">{t('overview.common.sortedByCost')}</span></div>
             <div className="ov-panel-body"><TopActivities activities={data.current.topActivities} onSelectCategory={onInvestigate ? raw => onInvestigate({ filters: categoryFilters(raw) }) : undefined} /></div>
           </div>
+          {data.current.identities && data.current.identities.length > 1 && (
+            <div className="ov-card ov-panel ov-activities-widget">
+              <div className="ov-panel-head"><Icon name="coins" /><h3>{t('overview.identities.title')}</h3><span className="r">{t('overview.common.sortedByCost')}</span></div>
+              <div className="ov-panel-body"><IdentitySplit identities={data.current.identities} /></div>
+            </div>
+          )}
         </div>
       </div>
     </div>

@@ -108,7 +108,7 @@ Each finding also carries a `basis`, printed next to its savings and summarised 
 `N measured · M estimated`:
 
 - **measured** — the token number is summed from provider-counted usage on your own calls. Today
-  that is `context-heavy-sessions` and `cost-outliers`.
+  that is `context-heavy-sessions`, `cost-outliers` and `one-hour-cache-unused`.
 - **estimated** — the token number comes from a model: a per-tool schema size, a per-line `CLAUDE.md`
   cost, an average read size, a recovery fraction applied to real turn tokens. A detector that mixes
   counted tokens with a model counts as estimated.
@@ -161,6 +161,7 @@ configuration-overhead finding keep counting them.
 ## More waste patterns
 
 - Wasted bash output (uncapped `BASH_MAX_OUTPUT_LENGTH`, trailing noise)
+- An `autoCompactWindow` at or below the idle compaction threshold (`CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS`, default 200K), which stops idle compaction from ever running (`idle-compaction-blocked`)
 - Cache creation overhead and junk directory reads
 - Context-heavy sessions where effective input/cache tokens swamp output
 - Possibly low-worth expensive sessions with no edit turns or repeated retries

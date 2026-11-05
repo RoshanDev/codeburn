@@ -5,9 +5,9 @@ import { ESTIMATED_COST_LEGEND, isEstimatedCost, markEstimated } from './format.
 import { modelRowKey } from './models.js'
 import { maxOf } from './math-utils.js'
 import { callCommands, createHead, ghPrCommands, isCommit, namedPr, namedPrNumber, prNumbersIn, pushes, readPrNumbers, readsCode, reviewVerdict, roundStarts, type NamedPr } from './pr-signals.js'
-import { inferSessionProvider, sessionBillableOutputTokens } from './session-output.js'
+import { costBasisShares, inferSessionProvider, sessionBillableOutputTokens, type CostBasisShares } from './session-output.js'
 import { CATEGORY_LABELS } from './types.js'
-import type { ProjectSummary, SessionSummary, TaskCategory } from './types.js'
+import type { CostBasis, ProjectSummary, SessionSummary, TaskCategory } from './types.js'
 import { resolveWorkUnits, workUnitSessionKey } from './work-units.js'
 import type { WorkUnit, WorkUnitResolution } from './work-units.js'
 
@@ -23,6 +23,7 @@ export type SessionRow = {
   /// `isEstimatedCost(cost, estimatedCost)`, the marker rule every view shares.
   estimatedCost: number
   isEstimated: boolean
+  costBasis?: CostBasisShares
   savingsUSD: number
   calls: number
   turns: number
@@ -30,16 +31,27 @@ export type SessionRow = {
   outputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
+  cacheHitPercent: number | null
   startedAt: string
   endedAt: string
   durationMs: number
   /// Subagent sessions folded into this parent row (already included in its
   /// cost, calls, turns and tokens). Absent on rows with none.
   subagents?: SessionRow[]
+  retained?: { since: string }
+  identity?: { hash: string; label: string }
 }
 
 function sessionCostLabel(cost: number): string {
   return `$${cost.toFixed(2)}`
+}
+
+export function sessionCacheHitPercent(input: number, reads: number, writes: number): number | null {
+  return reads + writes === 0 ? null : reads / (input + reads + writes) * 100
+}
+
+export function cacheHitLabel(percent: number | null): string {
+  return percent === null ? '\u2014' : `${Math.round(percent)}%`
 }
 
 function durationMs(startedAt: string, endedAt: string): number {
@@ -62,11 +74,15 @@ export function aggregateSessions(projects: ProjectSummary[]): SessionRow[] {
     outputTokens: sessionBillableOutputTokens(session),
     cacheReadTokens: session.totalCacheReadTokens,
     cacheWriteTokens: session.totalCacheWriteTokens,
+    cacheHitPercent: sessionCacheHitPercent(session.totalInputTokens, session.totalCacheReadTokens, session.totalCacheWriteTokens),
     startedAt: session.firstTimestamp,
     endedAt: session.lastTimestamp,
     durationMs: durationMs(session.firstTimestamp, session.lastTimestamp),
     estimatedCost: session.totalEstimatedCostUSD ?? 0,
     isEstimated: isEstimatedCost(session.totalCostUSD, session.totalEstimatedCostUSD, sessionCostLabel(session.totalCostUSD)),
+    costBasis: costBasisShares(session.turns.flatMap(turn => turn.assistantCalls)),
+    ...(session.retained ? { retained: session.retained } : {}),
+    ...(session.identity ? { identity: session.identity } : {}),
   })))
 }
 
@@ -74,7 +90,7 @@ export function renderJson(rows: SessionRow[]): string {
   return JSON.stringify(rows, null, 2)
 }
 
-type SessionColumnKey = 'started' | 'session' | 'children' | 'project' | 'provider' | 'models' | 'cost' | 'saved' | 'calls' | 'turns'
+type SessionColumnKey = 'started' | 'session' | 'children' | 'project' | 'provider' | 'models' | 'cost' | 'cache' | 'saved' | 'calls' | 'turns'
 type SessionColumn = {
   key: SessionColumnKey
   header: string
@@ -106,7 +122,7 @@ function fitColumns(columns: SessionColumn[], available: number, dropOrder?: Ses
   const fitted = columns.map(col => ({ ...col }))
 
   // Remove low-value columns before squeezing names into unreadable slivers.
-  for (const key of dropOrder ?? ['turns', 'saved', 'provider', 'calls'] as SessionColumnKey[]) {
+  for (const key of dropOrder ?? ['turns', 'saved', 'provider', 'calls', 'cache'] as SessionColumnKey[]) {
     if (frameWidth(fitted) <= available) break
     const index = fitted.findIndex(col => col.key === key && col.optional)
     if (index >= 0) fitted.splice(index, 1)
@@ -185,7 +201,7 @@ export function sessionModelLabel(models: string[]): string {
 
 function cellValue(row: SessionRow, key: SessionColumnKey): string {
   switch (key) {
-    case 'started': return row.startedAt ? row.startedAt.replace('T', ' ').slice(0, 16) : '-'
+    case 'started': return (row.startedAt ? row.startedAt.replace('T', ' ').slice(0, 16) : '-') + (row.retained ? RETAINED_MARK : '')
     case 'session': return sessionDisplayName(row)
     // Only the work-unit view carries a Children column, and it renders
     // through workUnitCell; a bare SessionRow has no child count.
@@ -194,6 +210,7 @@ function cellValue(row: SessionRow, key: SessionColumnKey): string {
     case 'provider': return row.provider
     case 'models': return sessionModelLabel(row.models)
     case 'cost': return markEstimated(sessionCostLabel(row.cost), row.isEstimated)
+    case 'cache': return cacheHitLabel(row.cacheHitPercent)
     case 'saved': return `$${row.savingsUSD.toFixed(2)}`
     case 'calls': return row.calls.toLocaleString('en-US')
     case 'turns': return row.turns.toLocaleString('en-US')
@@ -242,14 +259,18 @@ function sessionColumns(hasSavings: boolean, childrenColumn: boolean): SessionCo
     { key: 'provider', header: 'Provider', width: 9, minWidth: 8, optional: true },
     { key: 'models', header: 'Models', width: 22, minWidth: 10, flex: 2 },
     { key: 'cost', header: 'Cost', width: 9, minWidth: 7, right: true },
+    { key: 'cache', header: 'Cache', width: 6, minWidth: 6, right: true, optional: true },
     ...(hasSavings ? [{ key: 'saved' as const, header: 'Saved', width: 9, minWidth: 7, right: true, optional: true }] : []),
     { key: 'calls', header: 'Calls', width: 7, minWidth: 5, right: true, optional: true },
     { key: 'turns', header: 'Turns', width: 7, minWidth: 5, right: true, optional: true },
   ]
 }
 
+const RETAINED_MARK = '*'
+
 function estimatedLegend(rows: SessionRow[]): string {
-  return rows.some(row => row.isEstimated) ? `\n${ESTIMATED_COST_LEGEND}` : ''
+  return (rows.some(row => row.isEstimated) ? `\n${ESTIMATED_COST_LEGEND}` : '')
+    + (rows.some(row => row.retained) ? `\n${RETAINED_MARK} kept from the cache after the tool removed its transcript` : '')
 }
 
 export function renderTable(rows: SessionRow[], opts: SessionTableOptions = {}): string {
@@ -321,6 +342,9 @@ function groupWorkUnitRows<T extends SessionRow>(rows: T[], resolution: WorkUnit
     }
     const cost = sum(member => member.cost)
     const estimatedCost = sum(member => member.estimatedCost)
+    const inputTokens = sum(member => member.inputTokens)
+    const cacheReadTokens = sum(member => member.cacheReadTokens)
+    const cacheWriteTokens = sum(member => member.cacheWriteTokens)
     entries.push({
       row: {
         ...root,
@@ -328,13 +352,16 @@ function groupWorkUnitRows<T extends SessionRow>(rows: T[], resolution: WorkUnit
         cost,
         estimatedCost,
         isEstimated: isEstimatedCost(cost, estimatedCost, sessionCostLabel(cost)),
+        costBasis: costBasisShares(members.flatMap(member => Object.entries(member.costBasis ?? {})
+          .map(([basis, share]) => ({ costBasis: basis as CostBasis, costUSD: share * member.cost })))),
         savingsUSD: sum(member => member.savingsUSD),
         calls: sum(member => member.calls),
         turns: sum(member => member.turns),
-        inputTokens: sum(member => member.inputTokens),
+        inputTokens,
         outputTokens: sum(member => member.outputTokens),
-        cacheReadTokens: sum(member => member.cacheReadTokens),
-        cacheWriteTokens: sum(member => member.cacheWriteTokens),
+        cacheReadTokens,
+        cacheWriteTokens,
+        cacheHitPercent: sessionCacheHitPercent(inputTokens, cacheReadTokens, cacheWriteTokens),
         startedAt,
         endedAt,
         durationMs: durationMs(startedAt, endedAt),
@@ -392,7 +419,7 @@ export function renderWorkUnitTable(rows: SessionRow[], resolution: WorkUnitReso
   const totalCost = entries.reduce((total, entry) => total + entry.display.row.cost, 0)
   const unitCount = entries.filter(entry => entry.display.childCount > 0).length
   const footer = `${rows.length.toLocaleString('en-US')} sessions  \u2022  ${unitCount.toLocaleString('en-US')} work unit${unitCount === 1 ? '' : 's'}  \u2022  $${totalCost.toFixed(2)} total  \u2022  newest first${estimatedLegend(displays.map(d => d.row))}`
-  return renderSessionGrid(sessionColumns(hasSavings, true), displays, workUnitCell, footer, available, ['children', 'turns', 'saved', 'provider', 'calls'])
+  return renderSessionGrid(sessionColumns(hasSavings, true), displays, workUnitCell, footer, available, ['children', 'turns', 'saved', 'provider', 'calls', 'cache'])
 }
 
 /// `sessions --by-work-unit --format json`: an add-only envelope. `sessions`

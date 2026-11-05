@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
-import { aggregateByBranch, aggregateSessions, attributeSessionPrSpend, renderJson, renderTable } from '../src/sessions-report.js'
+import { aggregateByBranch, aggregateSessions, attributeSessionPrSpend, foldSubagentRows, renderJson, renderTable, sessionCacheHitPercent } from '../src/sessions-report.js'
+import { workUnitSessionKey } from '../src/work-units.js'
 import type { ClassifiedTurn, ParsedApiCall, ProjectSummary, SessionSummary } from '../src/types.js'
 
 function makeProject(): ProjectSummary {
@@ -24,6 +25,7 @@ function makeProject(): ProjectSummary {
         webSearchRequests: 0,
       },
       costUSD: 0.12,
+      costBasis: 'calculated',
       tools: [],
       mcpTools: [],
       skills: [],
@@ -90,12 +92,28 @@ describe('sessions JSON emitter', () => {
       outputTokens: 20,
       cacheReadTokens: 400,
       cacheWriteTokens: 30,
+      cacheHitPercent: 400 / 530 * 100,
       startedAt: '2026-07-10T10:00:00.000Z',
       endedAt: '2026-07-10T10:05:00.000Z',
       durationMs: 300_000,
       estimatedCost: 0,
       isEstimated: false,
+      costBasis: { calculated: 1 },
     }])
+  })
+
+  it('weights a folded parent costBasis by each member cost', () => {
+    const [parent] = aggregateSessions([makeProject()])
+    const child = { ...parent!, sessionId: 'child-1', cost: 0.36, costBasis: { recorded: 0.5, estimated: 0.5 } }
+    const [folded] = foldSubagentRows([parent!, child], {
+      units: [{ workUnitId: 'u', rootSessionId: 'session-1', childSessionIds: ['child-1'], roles: { 'session-1': 'root', 'child-1': 'child' } }],
+      bySession: new Map([[workUnitSessionKey('claude', 'session-1'), 'u'], [workUnitSessionKey('claude', 'child-1'), 'u']]),
+    })
+
+    expect(folded!.costBasis!.calculated).toBeCloseTo(0.25)
+    expect(folded!.costBasis!.recorded).toBeCloseTo(0.375)
+    expect(folded!.costBasis!.estimated).toBeCloseTo(0.375)
+    expect(folded!.subagents![0]!.costBasis).toEqual({ recorded: 0.5, estimated: 0.5 })
   })
 
   it('marks an estimated session row and explains the marker under the table', () => {
@@ -107,6 +125,17 @@ describe('sessions JSON emitter', () => {
     expect(output).toContain('~$0.12')
     expect(output.split('\n').at(-1)).toBe('~ estimated cost (priced from estimated tokens)')
     expect(renderTable(aggregateSessions([makeProject()]), { terminalWidth: 120 })).not.toContain('estimated')
+  })
+
+  it('carries the retained marker into JSON rows and the table', () => {
+    const project = makeProject()
+    project.sessions[0]!.retained = { since: '2026-09-25' }
+    const rows = aggregateSessions([project])
+    expect(JSON.parse(renderJson(rows))[0].retained).toEqual({ since: '2026-09-25' })
+    const output = renderTable(rows, { terminalWidth: 120 })
+    expect(output).toContain('2026-07-10 10:00*')
+    expect(output.split('\n').at(-1)).toBe('* kept from the cache after the tool removed its transcript')
+    expect(renderTable(aggregateSessions([makeProject()]), { terminalWidth: 120 })).not.toContain('*')
   })
 
   it('does not mark a fully estimated session whose cost prints as $0.00', () => {
@@ -126,6 +155,22 @@ describe('sessions JSON emitter', () => {
     expect(output).toContain('session-1')
     expect(output).toContain('Sonnet 4.5')
     expect(output).toContain('1 sessions')
+  })
+
+  it('shows each session cache hit rate, and a dash when cache use is unmeasured', () => {
+    const rows = aggregateSessions([makeProject()])
+    const unmeasured = { ...rows[0]!, sessionId: 'no-cache', cacheReadTokens: 0, cacheWriteTokens: 0, cacheHitPercent: null }
+    const lines = renderTable([rows[0]!, unmeasured], { terminalWidth: 140 }).split('\n')
+
+    expect(lines[1]).toMatch(/│ +Cache │/)
+    expect(lines.find(line => line.includes('session-1'))).toMatch(/│ +75% │/)
+    expect(lines.find(line => line.includes('no-cache'))).toMatch(/│ +— │/)
+  })
+
+  it('computes the cache hit rate as reads over the whole prompt', () => {
+    expect(sessionCacheHitPercent(100, 400, 30)).toBeCloseTo(75.47, 2)
+    expect(sessionCacheHitPercent(100, 300, 0)).toBe(75)
+    expect(sessionCacheHitPercent(500, 0, 0)).toBeNull()
   })
 
   it('hides home-directory slugs and renders compact agent/worktree names', () => {

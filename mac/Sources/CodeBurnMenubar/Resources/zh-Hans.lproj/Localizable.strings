@@ -226,8 +226,9 @@
 "Change accent color" = "更改主题色";
 "Copy update command to clipboard" = "将更新命令复制到剪贴板";
 "Enjoying CodeBurn?" = "喜欢 CodeBurn 吗？";
-"Star us on GitHub" = "在 GitHub 上点个 Star";
-"Hide this banner" = "隐藏此横幅";
+"If it has been helping you, a star on GitHub would mean a lot. It keeps the project free and open." = "如果它对您有帮助，在 GitHub 上点个 Star 对我们意义重大。这能让项目保持免费和开源。";
+"Not now" = "以后再说";
+"Star on GitHub" = "在 GitHub 上点 Star";
 "CSV (folder)" = "CSV（文件夹）";
 "JSON" = "JSON";
 "Export" = "导出";
@@ -425,6 +426,7 @@
 "%@%% in deficit" = "超出 %@%%";
 "%@%% in reserve" = "结余 %@%%";
 "%1$@ · hits 100%% %2$@" = "%1$@ · %2$@达到 100%%";
+"%@ · lasts until reset" = "%@ · 可撑到重置";
 "%1$@ · %2$@ at reset" = "%1$@ · 重置时 %2$@";
 "On pace: %1$@ at reset · hits 100%% %2$@" = "符合节奏：重置时 %1$@ · %2$@达到 100%%";
 "Based on last cycle: %@" = "按上一周期估算：%@";
@@ -642,6 +644,7 @@
 "%@ today" = "今日 %@";
 "%@ tok today" = "今日 %@ tok";
 "%lld%% left" = "剩余 %lld%%";
+"out %@" = "%@ 用尽";
 
 /* MARK: Codex credit limit */
 "Monthly" = "每月";
@@ -715,9 +718,12 @@
 "Input tokens reused from this provider's prompt cache today — not fresh input (arrow.down), not cache writes, and already priced at the cache-read rate inside the burned figure." = "今天从该服务商提示缓存中复用的输入 Token。不是新的输入（arrow.down），也不是缓存写入，并且已按缓存读取费率计入已消耗金额。";
 
 /* MARK: Quota crossing notifications */
-"%1$@ · %2$@ at 80%%" = "%1$@ · %2$@ 已达 80%%";
+"%1$@ · %2$@ at %3$lld%%" = "%1$@ · %2$@ 已达 %3$lld%%";
 "%1$@ · %2$@ limit reached" = "%1$@ · %2$@ 已达上限";
+"%1$@ %2$@ runs out at %3$@" = "%1$@ %2$@ 将在 %3$@ 用尽";
+"At this pace. Resets %@." = "按此速度。%@ 重置。";
 "Quota crossings (%1$lld%% and %2$lld%%)" = "配额跨越（%1$lld%% 与 %2$lld%%）";
+"Warn at" = "提醒阈值";
 
 /* MARK: Privacy */
 "Privacy" = "隐私";
@@ -729,6 +735,7 @@
 "Synced from cursor.com %@" = "已从 cursor.com 同步（%@）";
 "Not synced from cursor.com yet" = "尚未从 cursor.com 同步";
 "Cursor login expired, open Cursor to sign in again" = "Cursor 登录已过期，请打开 Cursor 重新登录";
+"Cursor encrypted its app session. Run codeburn import cursor --sync in Terminal, then allow the Cursor Safe Storage keychain prompt." = "Cursor 已加密其会话。请在终端运行 codeburn import cursor --sync，然后允许 Cursor Safe Storage 钥匙串提示。";
 "Couldn't reach cursor.com, will retry" = "无法连接到 cursor.com，将重试";
 "Couldn't read the usage export from cursor.com, will retry" = "无法读取 cursor.com 的用量导出，将重试";
 "Sync Cursor usage from cursor.com" = "从 cursor.com 同步 Cursor 用量";

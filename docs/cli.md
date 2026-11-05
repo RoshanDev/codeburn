@@ -193,6 +193,12 @@ codeburn today --format json | jq '.overview.cost'
 
 For lighter output, use `status --format json` (today and month totals only), `optimize --format json` (setup health, findings, and copy-paste fixes), `yield --format json` (productive/reverted/abandoned/ambiguous spend), or file exports (`export -f json`).
 
+Every dollar says where it came from. Each record in `export -f json` and `records.csv` has a `costBasis`: `recorded` is the tool's own figure, `calculated` is measured tokens at published prices, `estimated` is tokens guessed from content length, `included` is $0 a subscription already paid for, and `unpriced` is $0 for a model with no known price. Sessions and days in the JSON export, `sessions --format json` rows and their `subagents`, and the MCP `get_usage` totals carry `costBasis` as the share of cost that is `recorded`, `calculated` or `estimated`, from 0 to 1, with zero shares left out. Keys like this can be added under the same schema string, so read fields by name.
+
+Since `codeburn.export.v3` the JSON export uses fixed camelCase keys on every row (`period`, `date`, `cost`, `saved`, `apiCalls`, `sessions`, `inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `share`, ...), and money keys carry no unit: the values are in the active currency, stated once at the top in `currency.code`. The CSV headers are unchanged. A v2 consumer must rename its keys, for example `Cost (USD)` to `cost` and `API Calls` to `apiCalls`. New keys can still appear under v3.
+
+When a tool deletes a session's transcript, the session's spend stays in every total through the daily cache. The session itself stays in `codeburn sessions` and the per-PR report only when it had PR links (copilot and quickdesk keep theirs for 90 days), and it is marked retained: `sessions --format json` rows carry `retained.since`, the date CodeBurn first found the transcript missing, the table puts `*` after the start time, and `export` adds a `retained` column to records and sessions.
+
 ## Diagnosing detection
 
 When a tool shows zero (or a number that looks wrong), `codeburn doctor` explains why. It runs fully offline and read-only, and never writes to caches or config.

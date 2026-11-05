@@ -754,7 +754,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         case (false, false):
             break
         }
-        await store.quotaCrossingMonitor.record(windows: store.quotaWindows)
+        await store.quotaCrossingMonitor.record(windows: store.recordQuotaReadings())
         return true
     }
 
@@ -1722,6 +1722,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
                 popover.contentViewController = makePopoverContent()
             }
             store.menuPopoverVisible = true
+            StarNudge.countOpen()
             Telemetry.shared.track("popover_open")
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             if let window = popover.contentViewController?.view.window {
